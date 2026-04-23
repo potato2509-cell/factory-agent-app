@@ -31,19 +31,14 @@ async function getKnowledge(role) {
 }
 
 
-// ─── Claude API (텍스트 그대로 반환) ─────────────────────────────────────────
+// ─── Claude API (Netlify Function 경유) ──────────────────────────────────────
 async function callClaudeRaw(system, userMsg) {
   let res;
   try {
-    res = await fetch("https://api.anthropic.com/v1/messages", {
+    res = await fetch("/.netlify/functions/claude", {
       method: "POST",
       headers: { "Content-Type": "application/json" },
-      body: JSON.stringify({
-        model: "claude-sonnet-4-20250514",
-        max_tokens: 1000,
-        system,
-        messages: [{ role: "user", content: userMsg }],
-      }),
+      body: JSON.stringify({ system, userMsg, max_tokens: 1000 }),
     });
   } catch (e) { throw new Error(`네트워크 오류: ${e.message}`); }
   if (!res.ok) {
@@ -51,7 +46,7 @@ async function callClaudeRaw(system, userMsg) {
     throw new Error(`HTTP ${res.status}: ${t.slice(0, 100)}`);
   }
   const data = await res.json();
-  if (data.error) throw new Error(`API 오류: ${data.error.message}`);
+  if (data.error) throw new Error(`API 오류: ${data.error}`);
   return (data.content || []).map(i => i.text || "").join("").trim();
 }
 

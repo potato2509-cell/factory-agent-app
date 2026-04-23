@@ -251,10 +251,10 @@ JSON만 출력: {"msg":"기술 관점 의견 (60자이내)","action":"Cell_TE �
 
 // Step E: 합의 및 추가 논의
 async function fetchConsensus(issueSummary, pe, me, te) {
-  const sys = `AZS Cell 라인 엔지니어 3자 논의 조율자. 한국어.
-JSON만 출력: {"pe_reply":"Cell_PE 추가 발언(40자이내)","me_reply":"Cell_ME 추가 발언(40자이내)","te_reply":"Cell_TE 추가 발언(40자이내)","next_meeting":"차기 일정"}`;
+  const sys = `3자 논의 조율. 한국어. JSON만 출력:
+{"pe_reply":"30자이내","me_reply":"30자이내","te_reply":"30자이내","next_meeting":"일정"}`;
   const raw = await callClaudeRaw(sys,
-    `이슈: ${issueSummary}\nCell_PE의견: ${pe.msg}\nCell_ME의견: ${me.msg}\nCell_TE의견: ${te.msg}\n합의점을 도출하세요.`);
+    `이슈:${issueSummary.slice(0,50)}\nPE:${pe.msg.slice(0,40)}\nME:${me.msg.slice(0,40)}\nTE:${te.msg.slice(0,40)}\n합의점 도출`);
   return safeParseJSON(raw);
 }
 
@@ -425,9 +425,18 @@ export default function App() {
       setTeView(te);
 
       setProgress(p => [...p, "합의점 도출 중..."]);
-      cons = await fetchConsensus(iss.issue_summary, pe, me, te);
+      try {
+        cons = await fetchConsensus(iss.issue_summary, pe, me, te);
+      } catch {
+        // 합의 실패 시 기본값으로 대체
+        cons = {
+          pe_reply: pe.action || "추가 분석 진행 예정",
+          me_reply: me.action || "설비 점검 진행 예정",
+          te_reply: te.action || "기술 검토 진행 예정",
+          next_meeting: "익일 현장 미팅",
+        };
+      }
       setConsensus(cons);
-
       setStep(3);
     } catch(e) { setError(e.message); }
     finally { setRunning(false); }

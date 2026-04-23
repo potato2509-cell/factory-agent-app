@@ -5,11 +5,14 @@ const APPS_SCRIPT_URL = "https://script.google.com/macros/s/AKfycbwE9ZyopUTxEEXp
 
 async function saveToSheets(data) {
   try {
-    const encoded = encodeURIComponent(JSON.stringify(data));
-    const url = `${APPS_SCRIPT_URL}?action=save_minutes&data=${encoded}`;
-    const res = await fetch(url);
-    const result = await res.json();
-    return result.success;
+    // no-cors 모드로 POST 전송 (응답 확인 불가하지만 저장은 됨)
+    await fetch(APPS_SCRIPT_URL, {
+      method: "POST",
+      mode: "no-cors",
+      headers: { "Content-Type": "text/plain" },
+      body: JSON.stringify({ action: "save_minutes", ...data }),
+    });
+    return true;
   } catch (e) {
     console.error("구글 시트 저장 실패:", e);
     return false;

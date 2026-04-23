@@ -309,8 +309,8 @@ function Spinner() {
 }
 
 function ChatBubble({ role, msg, idx }) {
-  const r = ROLES[role];
-  const isRight = role === "ME";
+  const r = ROLES[role] || { label: role, color: "#64748b", bg: "rgba(100,116,139,0.12)", icon: "👤" };
+  const isRight = role === "Cell_ME";
   return (
     <div style={{
       display:"flex",gap:8,marginBottom:12,
@@ -415,14 +415,17 @@ export default function App() {
       setProgress(p => [...p, "Cell_PE 의견 생성 중..."]);
       pe = await fetchPEView(shortSummary, iss.issue_summary, kb.pe);
       setPeView(pe);
+      await new Promise(r => setTimeout(r, 1000));
 
       setProgress(p => [...p, "Cell_ME 의견 생성 중..."]);
       me = await fetchMEView(shortSummary, iss.issue_summary, kb.me);
       setMeView(me);
+      await new Promise(r => setTimeout(r, 1000));
 
       setProgress(p => [...p, "Cell_TE 의견 생성 중..."]);
       te = await fetchTEView(shortSummary, iss.issue_summary, kb.te);
       setTeView(te);
+      await new Promise(r => setTimeout(r, 1000));
 
       setProgress(p => [...p, "합의점 도출 중..."]);
       try {
@@ -711,12 +714,12 @@ export default function App() {
               background:"rgba(4,8,16,0.7)",border:"1px solid rgba(51,65,85,0.3)",
               borderRadius:12,padding:"16px 14px",marginBottom:14,
             }}>
-              <ChatBubble role="PE" msg={peView.msg} idx={0}/>
-              <ChatBubble role="ME" msg={meView.msg} idx={1}/>
-              <ChatBubble role="TE" msg={teView.msg} idx={2}/>
-              <ChatBubble role="PE" msg={consensus.pe_reply} idx={3}/>
-              <ChatBubble role="ME" msg={consensus.me_reply} idx={4}/>
-              <ChatBubble role="TE" msg={consensus.te_reply} idx={5}/>
+              <ChatBubble role="Cell_PE" msg={peView.msg} idx={0}/>
+              <ChatBubble role="Cell_ME" msg={meView.msg} idx={1}/>
+              <ChatBubble role="Cell_TE" msg={teView.msg} idx={2}/>
+              <ChatBubble role="Cell_PE" msg={consensus.pe_reply} idx={3}/>
+              <ChatBubble role="Cell_ME" msg={consensus.me_reply} idx={4}/>
+              <ChatBubble role="Cell_TE" msg={consensus.te_reply} idx={5}/>
               <div ref={chatRef}/>
             </div>
 
@@ -727,9 +730,9 @@ export default function App() {
             }}>
               <div style={{fontSize:10,color:"#34d399",fontWeight:800,marginBottom:10}}>✅ 액션 아이템</div>
               {[
-                {role:"PE",action:peView.action},
-                {role:"ME",action:meView.action},
-                {role:"TE",action:teView.action},
+                {role:"Cell_PE",action:peView.action},
+                {role:"Cell_ME",action:meView.action},
+                {role:"Cell_TE",action:teView.action},
               ].map((a,i)=>{
                 const r=ROLES[a.role];
                 return (

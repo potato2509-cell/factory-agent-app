@@ -3,6 +3,26 @@ import { useState, useRef, useEffect } from "react";
 // ─── Google Sheets 연동 ───────────────────────────────────────────────────────
 const APPS_SCRIPT_URL = "https://script.google.com/macros/s/AKfycbwE9ZyopUTxEEXpt3UjWjfgDljEiGodgbunj_UnXYc-1RlrXgNiDzAiikXoEP4g9_E/exec";
 
+async function loadKnowledge(role) {
+  try {
+    const res = await fetch(`${APPS_SCRIPT_URL}?action=get_knowledge&role=${role}`);
+    const data = await res.json();
+    if (data.success && data.data.length > 0) {
+      return data.data.map(k => `[${k.category}] ${k.content}`).join("\n");
+    }
+    return "";
+  } catch { return ""; }
+}
+
+async function loadAllKnowledge() {
+  const [pe, me, te] = await Promise.all([
+    loadKnowledge("Cell_PE"),
+    loadKnowledge("Cell_ME"),
+    loadKnowledge("Cell_TE"),
+  ]);
+  return { pe, me, te };
+}
+
 async function saveToSheets(data) {
   try {
     // no-cors 모드로 POST 전송 (응답 확인 불가하지만 저장은 됨)
@@ -179,55 +199,62 @@ function buildShortSummary(date, classified) {
   return s.slice(0, 800);
 }
 
+// AZS Cell 라인 전용 에이전트
 const ROLES = {
-  PE: { label: "생산 엔지니어", color: "#3b82f6", bg: "rgba(59,130,246,0.12)", icon: "🔵" },
-  ME: { label: "설비 엔지니어", color: "#f97316", bg: "rgba(249,115,22,0.12)", icon: "🟠" },
-  TE: { label: "기술 엔지니어", color: "#22d3ee", bg: "rgba(34,211,238,0.12)", icon: "🟢" },
+  Cell_PE: { label: "생산 엔지니어", color: "#3b82f6", bg: "rgba(59,130,246,0.12)", icon: "🔵",
+    focus: "Cell 라인 생산 목표 달성, 납기, 공정 안정화, OEE 관리" },
+  Cell_ME: { label: "설비 엔지니어", color: "#f97316", bg: "rgba(249,115,22,0.12)", icon: "🟠",
+    focus: "Cell 설비 가동률, 예방보전, 고장 원인, MTBF/MTTR 관리" },
+  Cell_TE: { label: "기술 엔지니어", color: "#22d3ee", bg: "rgba(34,211,238,0.12)", icon: "🟢",
+    focus: "Cell 공정 기술, 품질 원인 분석, 조건 최적화, 재발 방지" },
 };
 
 // ─── API 호출 함수들 (각각 독립적으로 짧게) ──────────────────────────────────
 
 // Step A: 이슈 요약만
 async function fetchIssueSummary(shortSummary) {
-  const sys = `현장 데이터 요약. 한국어. 아래 JSON만 출력. 각 문자열은 50자 이내.
+  const sys = `AZS Cell 라인 현장 데이터 요약. 한국어. 아래 JSON만 출력. 각 문자열은 50자 이내.
 {"issue_summary":"핵심요약50자이내","top_issues":["이슈1(30자이내)","이슈2(30자이내)","이슈3(30자이내)"]}`;
-  const raw = await callClaudeRaw(sys, `다음 현장 데이터의 핵심만 요약하세요:\n${shortSummary}`);
+  const raw = await callClaudeRaw(sys, `다음 AZS Cell 라인 현장 데이터의 핵심만 요약하세요:\n${shortSummary}`);
   return safeParseJSON(raw);
 }
 
-// Step B: PE 의견
-async function fetchPEView(shortSummary, issueSummary) {
-  const sys = `당신은 배터리 공장 생산 엔지니어(PE). 한국어로 답변.
-JSON만 출력: {"msg":"생산 관점 의견 (60자이내)","action":"PE 할 일 (30자이내)"}`;
+// Step B: Cell_PE 의견
+async function fetchPEView(shortSummary, issueSummary, peKB="") {
+  const kbText = peKB ? `\n\n[Cell_PE 학습 내용]\n${peKB}` : "";
+  const sys = `당신은 AZS 배터리 공장 Cell 라인 생산 엔지니어(Cell_PE). 한국어로 답변.${kbText}
+JSON만 출력: {"msg":"생산 관점 의견 (60자이내)","action":"Cell_PE 할 일 (30자이내)"}`;
   const raw = await callClaudeRaw(sys,
-    `이슈: ${issueSummary}\n현장: ${shortSummary}\nPE 관점으로 의견과 액션 아이템을 제시하세요.`);
+    `이슈: ${issueSummary}\n현장: ${shortSummary}\nCell_PE 관점으로 의견과 액션 아이템을 제시하세요.`);
   return safeParseJSON(raw);
 }
 
-// Step C: ME 의견
-async function fetchMEView(shortSummary, issueSummary) {
-  const sys = `당신은 배터리 공장 설비 엔지니어(ME). 한국어로 답변.
-JSON만 출력: {"msg":"설비 관점 의견 (60자이내)","action":"ME 할 일 (30자이내)"}`;
+// Step C: Cell_ME 의견
+async function fetchMEView(shortSummary, issueSummary, meKB="") {
+  const kbText = meKB ? `\n\n[Cell_ME 학습 내용]\n${meKB}` : "";
+  const sys = `당신은 AZS 배터리 공장 Cell 라인 설비 엔지니어(Cell_ME). 한국어로 답변.${kbText}
+JSON만 출력: {"msg":"설비 관점 의견 (60자이내)","action":"Cell_ME 할 일 (30자이내)"}`;
   const raw = await callClaudeRaw(sys,
-    `이슈: ${issueSummary}\n현장: ${shortSummary}\nME 관점으로 의견과 액션 아이템을 제시하세요.`);
+    `이슈: ${issueSummary}\n현장: ${shortSummary}\nCell_ME 관점으로 의견과 액션 아이템을 제시하세요.`);
   return safeParseJSON(raw);
 }
 
-// Step D: TE 의견
-async function fetchTEView(shortSummary, issueSummary) {
-  const sys = `당신은 배터리 공장 기술 엔지니어(TE). 한국어로 답변.
-JSON만 출력: {"msg":"기술 관점 의견 (60자이내)","action":"TE 할 일 (30자이내)"}`;
+// Step D: Cell_TE 의견
+async function fetchTEView(shortSummary, issueSummary, teKB="") {
+  const kbText = teKB ? `\n\n[Cell_TE 학습 내용]\n${teKB}` : "";
+  const sys = `당신은 AZS 배터리 공장 Cell 라인 기술 엔지니어(Cell_TE). 한국어로 답변.${kbText}
+JSON만 출력: {"msg":"기술 관점 의견 (60자이내)","action":"Cell_TE 할 일 (30자이내)"}`;
   const raw = await callClaudeRaw(sys,
-    `이슈: ${issueSummary}\n현장: ${shortSummary}\nTE 관점으로 의견과 액션 아이템을 제시하세요.`);
+    `이슈: ${issueSummary}\n현장: ${shortSummary}\nCell_TE 관점으로 의견과 액션 아이템을 제시하세요.`);
   return safeParseJSON(raw);
 }
 
 // Step E: 합의 및 추가 논의
 async function fetchConsensus(issueSummary, pe, me, te) {
-  const sys = `배터리 공장 엔지니어 3자 논의 조율자. 한국어.
-JSON만 출력: {"pe_reply":"PE 추가 발언(40자이내)","me_reply":"ME 추가 발언(40자이내)","te_reply":"TE 추가 발언(40자이내)","next_meeting":"차기 일정"}`;
+  const sys = `AZS Cell 라인 엔지니어 3자 논의 조율자. 한국어.
+JSON만 출력: {"pe_reply":"Cell_PE 추가 발언(40자이내)","me_reply":"Cell_ME 추가 발언(40자이내)","te_reply":"Cell_TE 추가 발언(40자이내)","next_meeting":"차기 일정"}`;
   const raw = await callClaudeRaw(sys,
-    `이슈: ${issueSummary}\nPE의견: ${pe.msg}\nME의견: ${me.msg}\nTE의견: ${te.msg}\n합의점을 도출하세요.`);
+    `이슈: ${issueSummary}\nCell_PE의견: ${pe.msg}\nCell_ME의견: ${me.msg}\nCell_TE의견: ${te.msg}\n합의점을 도출하세요.`);
   return safeParseJSON(raw);
 }
 
@@ -378,20 +405,23 @@ export default function App() {
     setRunning(true); setError(""); setProgress([]);
     let iss, pe, me, te, cons;
     try {
-      setProgress(["이슈 분석 중..."]);
+      setProgress(["학습 내용 로드 중..."]);
+      const kb = await loadAllKnowledge();
+
+      setProgress(p => [...p, "이슈 분석 중..."]);
       iss = await fetchIssueSummary(shortSummary);
       setIssueSummary(iss);
 
-      setProgress(p => [...p, "PE 의견 생성 중..."]);
-      pe = await fetchPEView(shortSummary, iss.issue_summary);
+      setProgress(p => [...p, "Cell_PE 의견 생성 중..."]);
+      pe = await fetchPEView(shortSummary, iss.issue_summary, kb.pe);
       setPeView(pe);
 
-      setProgress(p => [...p, "ME 의견 생성 중..."]);
-      me = await fetchMEView(shortSummary, iss.issue_summary);
+      setProgress(p => [...p, "Cell_ME 의견 생성 중..."]);
+      me = await fetchMEView(shortSummary, iss.issue_summary, kb.me);
       setMeView(me);
 
-      setProgress(p => [...p, "TE 의견 생성 중..."]);
-      te = await fetchTEView(shortSummary, iss.issue_summary);
+      setProgress(p => [...p, "Cell_TE 의견 생성 중..."]);
+      te = await fetchTEView(shortSummary, iss.issue_summary, kb.te);
       setTeView(te);
 
       setProgress(p => [...p, "합의점 도출 중..."]);
@@ -488,8 +518,8 @@ export default function App() {
           display:"flex",alignItems:"center",justifyContent:"center",fontSize:17,
         }}>🏭</div>
         <div>
-          <div style={{fontSize:13,fontWeight:800,color:"#f1f5f9"}}>현장 이슈 분석 · 엔지니어 논의 · 회의록</div>
-          <div style={{fontSize:9,color:"#22d3ee",letterSpacing:2,fontWeight:700}}>PE · ME · TE  |  WhatsApp 기반</div>
+          <div style={{fontSize:13,fontWeight:800,color:"#f1f5f9"}}>AZS Cell 라인 · 이슈 분석 · 회의록</div>
+          <div style={{fontSize:9,color:"#22d3ee",letterSpacing:2,fontWeight:700}}>Cell_PE · Cell_ME · Cell_TE  |  AZS</div>
         </div>
         {step>0 && (
           <button onClick={()=>{setStep(0);setAllMsgs([]);}} style={{
@@ -623,7 +653,7 @@ export default function App() {
                 background:"rgba(15,23,42,0.7)",border:"1px solid rgba(51,65,85,0.3)",
                 borderRadius:10,padding:"14px 16px",marginBottom:14,
               }}>
-                {["이슈 분석 중...","PE 의견 생성 중...","ME 의견 생성 중...","TE 의견 생성 중...","합의점 도출 중..."].map((label,i)=>(
+                {["학습 내용 로드 중...","이슈 분석 중...","Cell_PE 의견 생성 중...","Cell_ME 의견 생성 중...","Cell_TE 의견 생성 중...","합의점 도출 중..."].map((label,i)=>(
                   <ProgressStep key={i} label={label}
                     done={progress.length > i+1 || (!running && progress.length > i)}
                     active={running && progress.length === i+1}

@@ -1,16 +1,41 @@
 import { useState, useRef, useEffect } from "react";
 
-// ─── Google Sheets 연동 ───────────────────────────────────────────────────────
+// ─── 설정 ─────────────────────────────────────────────────────────────────────
 const APPS_SCRIPT_URL = "https://script.google.com/macros/s/AKfycbwE9ZyopUTxEEXpt3UjWjfgDljEiGodgbunj_UnXYc-1RlrXgNiDzAiikXoEP4g9_E/exec";
+const MAX_ISSUES = 10; // 긴급+중요 최대 처리 건수
+
+// ─── 보고서 종류 ───────────────────────────────────────────────────────────────
+const REPORT_TYPES = [
+  { id:"daily",   icon:"📋", label:"일일 생산 보고서",  desc:"당일 생산 실적·이슈·KPI 요약" },
+  { id:"meeting", icon:"🗂️", label:"회의록",           desc:"논의 내용·결정사항·액션아이템" },
+  { id:"defect",  icon:"⚠️", label:"불량/이슈 보고서", desc:"불량 내역·원인분석·대책 수립" },
+  { id:"weekly",  icon:"📊", label:"주간 요약 보고서",  desc:"주간 트렌드·KPI·개선 과제" },
+];
+
+const REPORT_FOCUS = {
+  daily:   "당일 생산 실적과 이슈 전반을 검토하고 내일 계획을 수립하는 관점으로",
+  meeting: "결정사항과 액션아이템 도출에 집중하는 관점으로",
+  defect:  "불량 원인 파악·4M 분석·재발 방지 대책 수립에 집중하는 관점으로",
+  weekly:  "주간 트렌드·KPI 달성 현황·개선 과제 도출에 집중하는 관점으로",
+};
+
+// ─── Google Sheets ─────────────────────────────────────────────────────────────
+async function saveToSheets(data) {
+  try {
+    await fetch(APPS_SCRIPT_URL, {
+      method: "POST", mode: "no-cors",
+      headers: { "Content-Type": "text/plain" },
+      body: JSON.stringify({ action: "save_minutes", ...data }),
+    });
+    return true;
+  } catch { return false; }
+}
 
 async function loadKnowledge(role) {
   try {
     const res = await fetch(`${APPS_SCRIPT_URL}?action=get_knowledge&role=${role}`);
     const data = await res.json();
-    if (data.success && data.data.length > 0) {
-      return data.data.map(k => `[${k.category}] ${k.content}`).join("\n");
-    }
-    return "";
+    return data.success ? data.data.map(k => `[${k.category}] ${k.content}`).join("\n") : "";
   } catch { return ""; }
 }
 
@@ -20,52 +45,20 @@ async function loadAllKnowledge() {
     loadKnowledge("Cell_ME"),
     loadKnowledge("Cell_TE"),
   ]);
-
-  const [peResult, meResult, teResult] = results;
-  const pe = peResult.status === "fulfilled" ? peResult.value : "";
-  const me = meResult.status === "fulfilled" ? meResult.value : "";
-  const te = teResult.status === "fulfilled" ? teResult.value : "";
-
-  // 로드 통계
+  const [peR, meR, teR] = results;
+  const pe = peR.status === "fulfilled" ? peR.value : "";
+  const me = meR.status === "fulfilled" ? meR.value : "";
+  const te = teR.status === "fulfilled" ? teR.value : "";
   const stats = {
-    pe: pe ? pe.split("\n").length : 0,
-    me: me ? me.split("\n").length : 0,
-    te: te ? te.split("\n").length : 0,
+    pe: pe ? pe.split("\n").filter(Boolean).length : 0,
+    me: me ? me.split("\n").filter(Boolean).length : 0,
+    te: te ? te.split("\n").filter(Boolean).length : 0,
     failed: results.filter(r => r.status === "rejected").length,
   };
-
   return { pe, me, te, stats };
 }
 
-async function saveToSheets(data) {
-  try {
-    // no-cors 모드로 POST 전송 (응답 확인 불가하지만 저장은 됨)
-    await fetch(APPS_SCRIPT_URL, {
-      method: "POST",
-      mode: "no-cors",
-      headers: { "Content-Type": "text/plain" },
-      body: JSON.stringify({ action: "save_minutes", ...data }),
-    });
-    return true;
-  } catch (e) {
-    console.error("구글 시트 저장 실패:", e);
-    return false;
-  }
-}
-
-async function getKnowledge(role) {
-  try {
-    const res = await fetch(`${APPS_SCRIPT_URL}?action=get_knowledge&role=${role}`);
-    const result = await res.json();
-    return result.success ? result.data : [];
-  } catch (e) {
-    console.error("지식 베이스 로드 실패:", e);
-    return [];
-  }
-}
-
-
-// ─── Claude API (Netlify Function 경유) ──────────────────────────────────────
+// ─── Claude API ────────────────────────────────────────────────────────────────
 async function callClaudeRaw(system, userMsg) {
   let res;
   try {
@@ -84,57 +77,27 @@ async function callClaudeRaw(system, userMsg) {
   return (data.content || []).map(i => i.text || "").join("").trim();
 }
 
-// JSON 파싱 헬퍼 - 잘린 JSON도 복구 시도
-function safeParseJSON(raw) {
-  // 코드블록 제거
-  let cleaned = raw.replace(/```json/gi, "").replace(/```/g, "").trim();
-  
-  // { 시작 위치 찾기
-  const s = cleaned.indexOf("{");
-  if (s === -1) throw new Error("JSON 구조 없음: " + cleaned.slice(0, 100));
-  cleaned = cleaned.slice(s);
-  
-  // 완전한 JSON 시도
-  const e = cleaned.lastIndexOf("}");
-  if (e !== -1) {
-    try { return JSON.parse(cleaned.slice(0, e + 1)); } catch {}
+function safeJSON(raw) {
+  const cleaned = raw.replace(/```json|```/gi, "").trim();
+  const s = cleaned.indexOf("{"), e = cleaned.lastIndexOf("}");
+  if (s === -1 || e === -1) throw new Error("JSON 없음");
+  // 잘린 JSON 복구 시도
+  let jsonStr = cleaned.slice(s, e + 1);
+  try { return JSON.parse(jsonStr); }
+  catch {
+    jsonStr = jsonStr.replace(/,\s*"[^"]*$/, "").replace(/,\s*\{[^}]*$/, "");
+    let ob = 0, cb = 0, oq = 0, cq = 0;
+    for (const c of jsonStr) {
+      if (c==="{") ob++; if (c==="}") cb++;
+      if (c==="[") oq++; if (c==="]") cq++;
+    }
+    for (let i=0; i<oq-cq; i++) jsonStr += "]";
+    for (let i=0; i<ob-cb; i++) jsonStr += "}";
+    return JSON.parse(jsonStr);
   }
-  
-  // 잘린 경우 - 배열 닫기 시도
-  let fixed = cleaned;
-  // 열린 배열/객체 닫기
-  let openBrackets = 0, openBraces = 0;
-  let inString = false, escape = false;
-  for (const ch of fixed) {
-    if (escape) { escape = false; continue; }
-    if (ch === "\\") { escape = true; continue; }
-    if (ch === '"' && !escape) { inString = !inString; continue; }
-    if (inString) continue;
-    if (ch === "[") openBrackets++;
-    if (ch === "]") openBrackets--;
-    if (ch === "{") openBraces++;
-    if (ch === "}") openBraces--;
-  }
-  // 마지막 불완전한 문자열 제거
-  fixed = fixed.replace(/,\s*"[^"]*$/, "");
-  fixed = fixed.replace(/,\s*\{[^}]*$/, "");
-  // 닫기
-  for (let i = 0; i < openBrackets; i++) fixed += "]";
-  for (let i = 0; i < openBraces; i++) fixed += "}";
-  
-  try { return JSON.parse(fixed); }
-  catch (err) { throw new Error("파싱 실패: " + err.message + "\n원문: " + cleaned.slice(0, 200)); }
 }
 
-// ─── 보고서 종류 ─────────────────────────────────────────────────────────────
-const REPORT_TYPES = [
-  { id:"daily",   icon:"📋", label:"일일 생산 보고서",  desc:"당일 생산 실적·이슈·KPI 요약" },
-  { id:"meeting", icon:"🗂️", label:"회의록",           desc:"논의 내용·결정사항·액션아이템" },
-  { id:"defect",  icon:"⚠️", label:"불량/이슈 보고서", desc:"불량 내역·원인분석·대책 수립" },
-  { id:"weekly",  icon:"📊", label:"주간 요약 보고서",  desc:"주간 트렌드·개선 과제 정리" },
-];
-
-// ─── WhatsApp 파서 ────────────────────────────────────────────────────────────
+// ─── WhatsApp 파서 ─────────────────────────────────────────────────────────────
 function parseWhatsApp(text) {
   const lines = text.split("\n");
   const msgRe = /^(\d{2}\/\d{1,2}\/\d{1,2})\s+(\d{1,2}:\d{2})\s+-\s+([^:]+):\s*(.*)/;
@@ -144,7 +107,7 @@ function parseWhatsApp(text) {
     const m = line.match(msgRe);
     if (m) {
       if (cur) msgs.push(cur);
-      cur = { date: m[1], time: m[2], sender: m[3].trim(), text: m[4] };
+      cur = { date: m[1], time: m[2], hour: parseInt(m[2].split(":")[0]), sender: m[3].trim(), text: m[4] };
     } else if (cur && line.trim()) {
       cur.text += "\n" + line;
     }
@@ -159,13 +122,58 @@ function parseWhatsApp(text) {
   );
 }
 
+// 06시 기준 생산일 계산
+function getProductionDate(date, hour) {
+  if (hour < 6) {
+    // 전날 생산분
+    const parts = date.split("/").map(Number);
+    const d = new Date(2000 + parts[0], parts[1] - 1, parts[2]);
+    d.setDate(d.getDate() - 1);
+    const yy = String(d.getFullYear()).slice(-2);
+    const mm = d.getMonth() + 1;
+    const dd = d.getDate();
+    return `${yy}/${mm}/${dd}`;
+  }
+  return date;
+}
+
+// 날짜에서 해당 주 월~일 반환
+function getWeekDates(dateStr) {
+  const parts = dateStr.split("/").map(Number);
+  const d = new Date(2000 + parts[0], parts[1] - 1, parts[2]);
+  const day = d.getDay(); // 0=일, 1=월
+  const monday = new Date(d);
+  monday.setDate(d.getDate() - (day === 0 ? 6 : day - 1));
+  const dates = [];
+  for (let i = 0; i < 7; i++) {
+    const cur = new Date(monday);
+    cur.setDate(monday.getDate() + i);
+    const yy = String(cur.getFullYear()).slice(-2);
+    const mm = cur.getMonth() + 1;
+    const dd = cur.getDate();
+    dates.push(`${yy}/${mm}/${dd}`);
+  }
+  return dates;
+}
+
 function getUniqueDates(msgs) {
-  return [...new Set(msgs.map(m => m.date))].sort((a, b) => {
+  const prodDates = msgs.map(m => getProductionDate(m.date, m.hour));
+  return [...new Set(prodDates)].sort((a, b) => {
     const pa = a.split("/").map(Number);
     const pb = b.split("/").map(Number);
     for (let i = 0; i < 3; i++) if (pa[i] !== pb[i]) return pa[i] - pb[i];
     return 0;
   });
+}
+
+function filterByDates(msgs, dates) {
+  return msgs.filter(m => dates.includes(getProductionDate(m.date, m.hour)));
+}
+
+// ─── 이슈 파싱 ─────────────────────────────────────────────────────────────────
+function extractField(text, fieldName) {
+  const re = new RegExp(`\\*?${fieldName}\\*?[:\\s]+\\*?\\n?-?\\s*([^\\n]+)`, "i");
+  return text.match(re)?.[1]?.replace(/\*/g, "").trim() || "";
 }
 
 function classifyMessages(msgs) {
@@ -194,24 +202,16 @@ function classifyMessages(msgs) {
   return { downtime, equipment, general };
 }
 
-// 우선순위 분류 함수
 function classifyPriority(downtime) {
-  const urgent = [], important = [], normal = [];
-  
-  // 같은 설비 반복 카운트
-  const equipCount = {};
-  // 같은 부품 반복 카운트
-  const partCount = {};
-  
+  const equipCount = {}, partCount = {};
   downtime.forEach(d => {
     const eq = extractField(d.text, "Equipment");
     const part = extractField(d.text, "Part Replacement");
     if (eq) equipCount[eq] = (equipCount[eq] || 0) + 1;
-    if (part && part !== "-" && part.length > 2) {
-      partCount[part] = (partCount[part] || 0) + 1;
-    }
+    if (part && part !== "-" && part.length > 2) partCount[part] = (partCount[part] || 0) + 1;
   });
 
+  const urgent = [], important = [], normal = [];
   downtime.forEach(d => {
     const result = extractField(d.text, "Result").toLowerCase();
     const durStr = extractField(d.text, "Duration");
@@ -226,272 +226,240 @@ function classifyPriority(downtime) {
     const isFullStop = stopStatus.includes("full_stop");
     const isRepeatPart = part && part !== "-" && part.length > 2 && partCount[part] >= 2;
 
+    const eq_ = extractField(d.text, "Equipment");
+    const prob = extractField(d.text, "Problem");
+    const cause = extractField(d.text, "Cause");
+    const result_ = extractField(d.text, "Result");
+    const pic = extractField(d.text, "PIC");
+    const issueInfo = { ...d, eq: eq_, prob, cause, result: result_, pic, durMin, reasons: [] };
+
     if (isUnsolved || isLong) {
-      urgent.push({ ...d, reasons: [isUnsolved && "미해결", isLong && `${durMin}분 이상`].filter(Boolean) });
+      issueInfo.reasons = [isUnsolved && "미해결", isLong && `${durMin}분 이상`].filter(Boolean);
+      urgent.push(issueInfo);
     } else if (isRepeat || isFullStop || isRepeatPart) {
-      important.push({ ...d, reasons: [isRepeat && "반복 고장", isFullStop && "완전 정지", isRepeatPart && "부품 반복 교체"].filter(Boolean) });
+      issueInfo.reasons = [isRepeat && "반복 고장", isFullStop && "완전 정지", isRepeatPart && "부품 반복 교체"].filter(Boolean);
+      important.push(issueInfo);
     } else {
-      normal.push(d);
+      normal.push(issueInfo);
     }
   });
-
   return { urgent, important, normal };
 }
 
-// 핵심 이슈만 짧게 추출 - *bold* 형식 처리
-function extractField(text, fieldName) {
-  const re = new RegExp(String.raw`\*?${fieldName}\*?[:\s]+\*?\n?-?\s*([^\n]+)`, "i");
-  return text.match(re)?.[1]?.replace(/\*/g, "").trim() || "";
+// 심층 논의 대상 이슈 선택 (긴급+중요 최대 10건)
+function selectKeyIssues(priority) {
+  const all = [...priority.urgent, ...priority.important];
+  return all.slice(0, MAX_ISSUES);
 }
 
-function buildShortSummary(date, classified) {
-  const { downtime, equipment } = classified;
-  const pri = classifyPriority(downtime);
-  let s = `날짜: ${date}\n`;
-  s += `다운타임: ${downtime.length}건 (긴급:${pri.urgent.length} 중요:${pri.important.length} 일반:${pri.normal.length}), 설비경고: ${equipment.length}건\n\n`;
+// ─── AI 분석 함수들 ────────────────────────────────────────────────────────────
 
-  // 긴급 이슈 먼저
-  [...pri.urgent, ...pri.important].slice(0, 5).forEach((d, i) => {
-    const eq   = extractField(d.text, "Equipment");
-    const dur  = extractField(d.text, "Duration");
-    const prob = extractField(d.text, "Problem");
-    const cause= extractField(d.text, "Cause");
-    const pic  = extractField(d.text, "PIC");
-    const tag  = pri.urgent.includes(d) ? "[긴급]" : "[중요]";
-    s += `${tag} 설비:${eq} / ${dur} / 문제:${prob} / 원인:${cause} / 담당:${pic}\n`;
-  });
+// 개별 이슈 심층 분석 (PE·ME·TE)
+async function analyzeIssueDeep(issue, kb, reportType, issueNum, totalIssues) {
+  const issueCtx = `
+설비: ${issue.eq}
+발생시간: ${issue.time}
+다운타임: ${issue.durMin}분
+문제: ${issue.prob}
+원인: ${issue.cause}
+결과: ${issue.result}
+담당자: ${issue.pic}
+우선순위: ${issue.reasons?.join(", ")}
+`.trim();
 
-  equipment.slice(0, 3).forEach((e, i) => {
-    s += `[경고${i+1}] ${e.text.slice(0, 80)}\n`;
-  });
-
-  return s.slice(0, 800);
-}
-
-// AZS Cell 라인 전용 에이전트
-const ROLES = {
-  Cell_PE: { label: "생산 엔지니어", color: "#3b82f6", bg: "rgba(59,130,246,0.12)", icon: "🔵",
-    focus: "Cell 라인 생산 목표 달성, 납기, 공정 안정화, OEE 관리" },
-  Cell_ME: { label: "설비 엔지니어", color: "#f97316", bg: "rgba(249,115,22,0.12)", icon: "🟠",
-    focus: "Cell 설비 가동률, 예방보전, 고장 원인, MTBF/MTTR 관리" },
-  Cell_TE: { label: "기술 엔지니어", color: "#22d3ee", bg: "rgba(34,211,238,0.12)", icon: "🟢",
-    focus: "Cell 공정 기술, 품질 원인 분석, 조건 최적화, 재발 방지" },
-};
-
-// ─── API 호출 함수들 (각각 독립적으로 짧게) ──────────────────────────────────
-
-// Step A: 이슈 요약만
-async function fetchIssueSummary(shortSummary) {
-  const sys = `AZS Cell 라인 현장 데이터 요약. 한국어. 아래 JSON만 출력. 각 문자열은 50자 이내.
-{"issue_summary":"핵심요약50자이내","top_issues":["이슈1(30자이내)","이슈2(30자이내)","이슈3(30자이내)"]}`;
-  const raw = await callClaudeRaw(sys, `다음 AZS Cell 라인 현장 데이터의 핵심만 요약하세요:\n${shortSummary}`);
-  return safeParseJSON(raw);
-}
-
-// 보고서별 논의 포인트
-const REPORT_FOCUS = {
-  daily:   "오늘 생산 실적·이슈 전반을 검토하고 내일 계획을 수립하는 관점으로",
-  meeting: "결정사항과 액션아이템 도출에 집중하는 관점으로",
-  defect:  "불량 원인 파악·4M 분석·재발 방지 대책 수립에 집중하는 관점으로",
-  weekly:  "주간 트렌드·KPI 달성 현황·개선 과제 도출에 집중하는 관점으로",
-};
-
-// Step B: Cell_PE 의견
-async function fetchPEView(shortSummary, issueSummary, peKB="", reportType="meeting") {
-  const kbText = peKB ? `\n\n[Cell_PE 학습 내용]\n${peKB}` : "";
   const focus = REPORT_FOCUS[reportType] || REPORT_FOCUS.meeting;
-  const sys = `당신은 AZS 배터리 공장 Cell 라인 생산 엔지니어(Cell_PE). 한국어로 답변.${kbText}
-${focus} 의견을 제시하세요.
-JSON만 출력: {"msg":"생산 관점 의견 (60자이내)","action":"Cell_PE 할 일 (30자이내)"}`;
-  const raw = await callClaudeRaw(sys,
-    `이슈: ${issueSummary}\n현장: ${shortSummary}\nCell_PE 관점으로 의견과 액션 아이템을 제시하세요.`);
-  return safeParseJSON(raw);
-}
 
-// Step C: Cell_ME 의견
-async function fetchMEView(shortSummary, issueSummary, meKB="", reportType="meeting") {
-  const kbText = meKB ? `\n\n[Cell_ME 학습 내용]\n${meKB}` : "";
-  const focus = REPORT_FOCUS[reportType] || REPORT_FOCUS.meeting;
-  const sys = `당신은 AZS 배터리 공장 Cell 라인 설비 엔지니어(Cell_ME). 한국어로 답변.${kbText}
-${focus} 의견을 제시하세요.
-JSON만 출력: {"msg":"설비 관점 의견 (60자이내)","action":"Cell_ME 할 일 (30자이내)"}`;
-  const raw = await callClaudeRaw(sys,
-    `이슈: ${issueSummary}\n현장: ${shortSummary}\nCell_ME 관점으로 의견과 액션 아이템을 제시하세요.`);
-  return safeParseJSON(raw);
-}
-
-// Step D: Cell_TE 의견
-async function fetchTEView(shortSummary, issueSummary, teKB="", reportType="meeting") {
-  const kbText = teKB ? `\n\n[Cell_TE 학습 내용]\n${teKB}` : "";
-  const focus = REPORT_FOCUS[reportType] || REPORT_FOCUS.meeting;
-  const sys = `당신은 AZS 배터리 공장 Cell 라인 기술 엔지니어(Cell_TE). 한국어로 답변.${kbText}
-${focus} 의견을 제시하세요.
-JSON만 출력: {"msg":"기술 관점 의견 (60자이내)","action":"Cell_TE 할 일 (30자이내)"}`;
-  const raw = await callClaudeRaw(sys,
-    `이슈: ${issueSummary}\n현장: ${shortSummary}\nCell_TE 관점으로 의견과 액션 아이템을 제시하세요.`);
-  return safeParseJSON(raw);
-}
-
-// Step E: 합의 및 추가 논의
-async function fetchConsensus(issueSummary, pe, me, te) {
-  const sys = `3자 논의 조율. 한국어. JSON만 출력:
-{"pe_reply":"30자이내","me_reply":"30자이내","te_reply":"30자이내","next_meeting":"일정"}`;
-  const raw = await callClaudeRaw(sys,
-    `이슈:${issueSummary.slice(0,50)}\nPE:${pe.msg.slice(0,40)}\nME:${me.msg.slice(0,40)}\nTE:${te.msg.slice(0,40)}\n합의점 도출`);
-  return safeParseJSON(raw);
-}
-
-// Step F: 회의록
-// 보고서 종류별 섹션 정의
-const REPORT_SECTIONS = {
-  daily: [
-    '{"heading":"1. 생산 현황 요약","items":["항목(40자이내)","항목","항목"]}',
-    '{"heading":"2. 주요 이슈 분석","items":["이슈1(40자)","이슈2(40자)","이슈3(40자)"]}',
-    '{"heading":"3. 엔지니어별 분석","items":["PE: 내용","ME: 내용","TE: 내용"]}',
-    '{"heading":"4. 조치 및 결정사항","items":["조치1(40자)","조치2(40자)"]}',
-    '{"heading":"5. 익일 계획","items":["계획1(40자)","계획2(40자)"]}',
-  ],
-  meeting: [
-    '{"heading":"1. 회의 개요","items":["항목(40자이내)","항목","항목"]}',
-    '{"heading":"2. 주요 논의 내용","items":["논의1(40자)","논의2(40자)","논의3(40자)"]}',
-    '{"heading":"3. 결정 사항","items":["결정1(40자)","결정2(40자)"]}',
-    '{"heading":"4. 담당자별 액션 아이템","items":["PE: 액션(30자)","ME: 액션(30자)","TE: 액션(30자)"]}',
-    '{"heading":"5. 차기 일정","items":["일정(40자)"]}',
-  ],
-  defect: [
-    '{"heading":"1. 불량/이슈 개요","items":["항목(40자이내)","항목","항목"]}',
-    '{"heading":"2. 불량 현황 및 분류","items":["불량1(40자)","불량2(40자)","불량3(40자)"]}',
-    '{"heading":"3. 원인 분석 (4M 기반)","items":["원인1(40자)","원인2(40자)","원인3(40자)"]}',
-    '{"heading":"4. 즉시 조치 사항","items":["조치1(40자)","조치2(40자)"]}',
-    '{"heading":"5. 재발 방지 대책","items":["대책1(40자)","대책2(40자)"]}',
-  ],
-  weekly: [
-    '{"heading":"1. 주간 생산 실적 요약","items":["항목(40자이내)","항목","항목"]}',
-    '{"heading":"2. 주요 이슈 및 조치","items":["이슈1(40자)","이슈2(40자)","이슈3(40자)"]}',
-    '{"heading":"3. KPI 달성 현황","items":["KPI1(40자)","KPI2(40자)"]}',
-    '{"heading":"4. 개선 과제","items":["과제1(40자)","과제2(40자)"]}',
-    '{"heading":"5. 차주 계획","items":["계획1(40자)","계획2(40자)"]}',
-  ],
-};
-
-const REPORT_TITLES = {
-  daily:   "일일 생산 보고서",
-  meeting: "회의록",
-  defect:  "불량/이슈 보고서",
-  weekly:  "주간 요약 보고서",
-};
-
-async function fetchMinutesSection(prompt, sectionTemplate, reportType) {
-  const sys = `AZS 배터리 공장 ${reportType} 작성. 한국어. JSON만 출력: ${sectionTemplate}`;
-  const raw = await callClaudeRaw(sys, prompt);
-  return safeParseJSON(raw);
-}
-
-async function fetchMinutes(date, shortSummary, issueSummary, pe, me, te, consensus, reportType="meeting") {
-  const ctx = `날짜:${date} | 이슈:${issueSummary} | PE:${pe.msg}/${pe.action} | ME:${me.msg}/${me.action} | TE:${te.msg}/${te.action}`;
-  const templates = REPORT_SECTIONS[reportType] || REPORT_SECTIONS.meeting;
-  const headings = ["1.","2.","3.","4.","5."];
-
-  const sections = [];
-  for (let i = 0; i < 5; i++) {
+  const analyses = {};
+  for (const [role, roleKB, roleLabel] of [
+    ["Cell_PE", kb.pe, "생산 엔지니어"],
+    ["Cell_ME", kb.me, "설비 엔지니어"],
+    ["Cell_TE", kb.te, "기술 엔지니어"],
+  ]) {
+    const kbText = roleKB ? `\n\n[학습 내용]\n${roleKB.slice(0, 500)}` : "";
+    const sys = `당신은 AZS 배터리 공장 Cell 라인 ${roleLabel}(${role}). 한국어.${kbText}
+${focus} 아래 이슈를 상세 분석하세요.
+JSON만 출력:
+{"analysis":"이슈 원인 및 영향 상세 분석 (100자이내)","action":"즉시 조치사항 (60자이내)","prevention":"재발방지 방안 (60자이내)"}`;
     try {
-      await new Promise(r => setTimeout(r, 500));
-      const sec = await fetchMinutesSection(ctx, templates[i], REPORT_TITLES[reportType]);
-      sections.push(sec);
+      await new Promise(r => setTimeout(r, 800));
+      const raw = await callClaudeRaw(sys, `[이슈 ${issueNum}/${totalIssues}] ${issueCtx}\n${role} 관점으로 상세 분석하세요.`);
+      analyses[role] = safeJSON(raw);
     } catch {
-      sections.push({ heading: headings[i], items: ["-"] });
+      analyses[role] = { analysis: "분석 중 오류", action: "-", prevention: "-" };
     }
   }
+  return { issue, analyses };
+}
 
-  const dtCount = shortSummary.match(/다운타임: (\d+)건/)?.[1] || "";
+// 전체 종합 및 회의록 생성
+async function generateReport(date, dates, keyIssues, issueAnalyses, priority, reportType, kb) {
+  const focus = REPORT_FOCUS[reportType] || REPORT_FOCUS.meeting;
+  const reportTitle = REPORT_TYPES.find(r => r.id === reportType)?.label || "회의록";
+
+  // 이슈별 분석 요약
+  const issuesSummary = issueAnalyses.map((ia, i) => {
+    const { issue, analyses } = ia;
+    return `[이슈${i+1}] ${issue.eq} (${issue.durMin}분, ${issue.reasons?.join(",")})
+문제: ${issue.prob} | 원인: ${issue.cause} | 결과: ${issue.result}
+PE분석: ${analyses.Cell_PE?.analysis} | PE조치: ${analyses.Cell_PE?.action}
+ME분석: ${analyses.Cell_ME?.analysis} | ME조치: ${analyses.Cell_ME?.action}
+TE분석: ${analyses.Cell_TE?.analysis} | TE조치: ${analyses.Cell_TE?.action}`;
+  }).join("\n\n");
+
+  // 보고서 생성 (섹션별로 나눠서 호출)
+  const dateStr = dates.length > 1 ? `${dates[0]} ~ ${dates[dates.length-1]}` : date;
+  const ctx = `날짜: ${dateStr}
+보고서 종류: ${reportTitle}
+긴급이슈: ${priority.urgent.length}건 / 중요이슈: ${priority.important.length}건 / 일반: ${priority.normal.length}건
+심층분석 대상: ${issueAnalyses.length}건
+
+${issuesSummary}`;
+
+  const sections = [];
+
+  // 섹션 1: 전체 현황 요약
+  try {
+    await new Promise(r => setTimeout(r, 500));
+    const sys1 = `AZS 배터리 공장 ${reportTitle} 작성. 한국어. JSON만:
+{"heading":"1. 전체 현황 요약","items":["항목1 (구체적 수치 포함, 60자이내)","항목2","항목3","항목4"]}`;
+    const raw1 = await callClaudeRaw(sys1, ctx);
+    sections.push(safeJSON(raw1));
+  } catch { sections.push({ heading:"1. 전체 현황 요약", items:["-"] }); }
+
+  // 섹션 2: 긴급 이슈별 상세
+  try {
+    await new Promise(r => setTimeout(r, 500));
+    const urgentSummary = issueAnalyses
+      .filter(ia => priority.urgent.includes(ia.issue))
+      .map((ia, i) => `이슈${i+1}: ${ia.issue.eq} - PE:${ia.analyses.Cell_PE?.action} ME:${ia.analyses.Cell_ME?.action} TE:${ia.analyses.Cell_TE?.action}`)
+      .join(" / ");
+    const sys2 = `AZS 배터리 공장 ${reportTitle} 작성. 한국어. JSON만:
+{"heading":"2. 긴급 이슈 상세 분석 및 조치","items":["[설비명] 문제·원인·조치 (80자이내)","항목2","항목3"]}`;
+    const raw2 = await callClaudeRaw(sys2, `${ctx}\n\n긴급이슈 분석:\n${urgentSummary}`);
+    sections.push(safeJSON(raw2));
+  } catch { sections.push({ heading:"2. 긴급 이슈 상세 분석 및 조치", items:["-"] }); }
+
+  // 섹션 3: 중요 이슈별 상세
+  try {
+    await new Promise(r => setTimeout(r, 500));
+    const importantSummary = issueAnalyses
+      .filter(ia => priority.important.includes(ia.issue))
+      .map((ia, i) => `이슈${i+1}: ${ia.issue.eq} - ${ia.analyses.Cell_PE?.action}`)
+      .join(" / ");
+    const sys3 = `AZS 배터리 공장 ${reportTitle} 작성. 한국어. JSON만:
+{"heading":"3. 중요 이슈 분석 및 조치","items":["[설비명] 문제·원인·조치 (80자이내)","항목2","항목3"]}`;
+    const raw3 = await callClaudeRaw(sys3, `${ctx}\n\n중요이슈 분석:\n${importantSummary}`);
+    sections.push(safeJSON(raw3));
+  } catch { sections.push({ heading:"3. 중요 이슈 분석 및 조치", items:["-"] }); }
+
+  // 섹션 4: 엔지니어별 합의 액션 아이템
+  try {
+    await new Promise(r => setTimeout(r, 500));
+    const sys4 = `AZS 배터리 공장 ${reportTitle} 작성. 한국어. JSON만:
+{"heading":"4. 담당자별 액션 아이템","items":["[Cell_PE] 조치사항 (60자이내)","[Cell_ME] 조치사항 (60자이내)","[Cell_TE] 조치사항 (60자이내)","기타 조치사항"]}`;
+    const raw4 = await callClaudeRaw(sys4, ctx);
+    sections.push(safeJSON(raw4));
+  } catch { sections.push({ heading:"4. 담당자별 액션 아이템", items:["-"] }); }
+
+  // 섹션 5: 재발방지 및 차기 계획
+  try {
+    await new Promise(r => setTimeout(r, 500));
+    const sys5 = `AZS 배터리 공장 ${reportTitle} 작성. 한국어. JSON만:
+{"heading":"5. 재발방지 대책 및 차기 계획","items":["재발방지 대책 (60자이내)","항목2","항목3","차기 일정"]}`;
+    const raw5 = await callClaudeRaw(sys5, ctx);
+    sections.push(safeJSON(raw5));
+  } catch { sections.push({ heading:"5. 재발방지 대책 및 차기 계획", items:["-"] }); }
+
   return {
-    title: `${date} ${REPORT_TITLES[reportType]}`,
-    date,
+    title: `${dateStr} ${reportTitle}`,
+    date: dateStr,
     attendees: "Cell_PE(생산), Cell_ME(설비), Cell_TE(기술)",
-    agenda: `${date} 다운타임 ${dtCount}건 분석 및 대책`,
+    agenda: `다운타임 ${priority.urgent.length + priority.important.length + priority.normal.length}건 분석 및 대책 수립`,
     sections,
+    issueAnalyses, // 건별 분석 데이터
   };
 }
 
+// ─── UI 컴포넌트 ───────────────────────────────────────────────────────────────
+const ROLES = {
+  Cell_PE: { label:"생산 엔지니어", color:"#3b82f6", bg:"rgba(59,130,246,0.12)", icon:"🔵" },
+  Cell_ME: { label:"설비 엔지니어", color:"#f97316", bg:"rgba(249,115,22,0.12)", icon:"🟠" },
+  Cell_TE: { label:"기술 엔지니어", color:"#22d3ee", bg:"rgba(34,211,238,0.12)", icon:"🟢" },
+};
 
-
-// ─── UI 컴포넌트 ──────────────────────────────────────────────────────────────
 function Spinner() {
   return <span style={{
-    display:"inline-block",width:13,height:13,
+    display:"inline-block", width:13, height:13,
     border:"2px solid rgba(255,255,255,0.2)",
-    borderTop:"2px solid currentColor",borderRadius:"50%",
+    borderTop:"2px solid currentColor", borderRadius:"50%",
     animation:"spin 0.7s linear infinite",
   }}/>;
 }
 
-function ChatBubble({ role, msg, idx }) {
-  const r = ROLES[role] || { label: role, color: "#64748b", bg: "rgba(100,116,139,0.12)", icon: "👤" };
-  const isRight = role === "Cell_ME";
+function BackBtn({ onClick, label="← 이전" }) {
   return (
-    <div style={{
-      display:"flex",gap:8,marginBottom:12,
-      flexDirection:isRight?"row-reverse":"row",
-      animation:`fadeUp 0.2s ease ${idx*0.06}s both`,
-    }}>
-      <div style={{
-        width:30,height:30,borderRadius:"50%",flexShrink:0,
-        background:r.bg,border:`1.5px solid ${r.color}44`,
-        display:"flex",alignItems:"center",justifyContent:"center",
-        fontSize:14,marginTop:2,
-      }}>{r.icon}</div>
-      <div style={{maxWidth:"76%"}}>
-        <div style={{fontSize:9.5,color:r.color,fontWeight:800,marginBottom:3,
-          textAlign:isRight?"right":"left"}}>{r.label}</div>
-        <div style={{
-          background:r.bg,border:`1px solid ${r.color}28`,
-          borderRadius:isRight?"12px 3px 12px 12px":"3px 12px 12px 12px",
-          padding:"9px 13px",fontSize:12.5,color:"#dde6f0",lineHeight:1.75,
-        }}>{msg}</div>
-      </div>
+    <button onClick={onClick} style={{
+      padding:"9px 16px",
+      background:"transparent", border:"1.5px solid rgba(51,65,85,0.4)",
+      borderRadius:8, color:"#475569", fontSize:12, cursor:"pointer",
+    }}>{label}</button>
+  );
+}
+
+function StepBar({ step }) {
+  const STEPS = ["업로드","날짜","보고서","이슈 확인","논의 중","문서 생성"];
+  return (
+    <div style={{ display:"flex", borderBottom:"1px solid rgba(51,65,85,0.3)", background:"rgba(3,6,13,0.85)", overflowX:"auto" }}>
+      {STEPS.map((s,i) => (
+        <div key={i} style={{
+          flex:"1 0 auto", padding:"10px 6px", textAlign:"center",
+          background: step===i ? "rgba(34,211,238,0.08)" : "transparent",
+          borderBottom:`2px solid ${step===i ? "#22d3ee" : step>i ? "#34d399" : "transparent"}`,
+          fontSize:9, fontWeight:800,
+          color: step===i ? "#22d3ee" : step>i ? "#34d399" : "#374151",
+        }}>
+          <div style={{ fontSize:9, marginBottom:2 }}>{i+1}</div>
+          {s}
+        </div>
+      ))}
     </div>
   );
 }
 
-function ProgressStep({ label, done, active }) {
-  return (
-    <div style={{display:"flex",alignItems:"center",gap:8,marginBottom:8}}>
-      <div style={{
-        width:20,height:20,borderRadius:"50%",flexShrink:0,
-        background:done?"#34d399":active?"#3b82f6":"rgba(51,65,85,0.4)",
-        display:"flex",alignItems:"center",justifyContent:"center",
-        fontSize:10,color:"#fff",fontWeight:800,
-      }}>{done?"✓":active?<Spinner/>:""}</div>
-      <span style={{fontSize:12,color:done?"#34d399":active?"#93c5fd":"#374151"}}>{label}</span>
-    </div>
-  );
-}
-
-// ─── 메인 ────────────────────────────────────────────────────────────────────
+// ─── 메인 앱 ──────────────────────────────────────────────────────────────────
 export default function App() {
-  const [step, setStep]       = useState(0);
-  const [allMsgs, setAllMsgs] = useState([]);
-  const [dates, setDates]     = useState([]);
-  const [selDate, setSelDate] = useState("");
+  const [step, setStep]           = useState(0);
+  const [allMsgs, setAllMsgs]     = useState([]);
+  const [dates, setDates]         = useState([]);
+  const [selDates, setSelDates]   = useState([]); // 다중 선택
+  const [reportType, setReportType] = useState("meeting");
   const [classified, setClassified] = useState(null);
-  const [shortSummary, setShortSummary] = useState("");
-
-  // 논의 결과
-  const [issueSummary, setIssueSummary] = useState(null);
-  const [peView, setPeView]   = useState(null);
-  const [meView, setMeView]   = useState(null);
-  const [teView, setTeView]   = useState(null);
-  const [consensus, setConsensus] = useState(null);
-  const [minutes, setMinutes] = useState(null);
-
-  // 진행 상태
-  const [progress, setProgress] = useState([]);
-  const [running, setRunning] = useState(false);
-  const [error, setError]     = useState("");
+  const [priority, setPriority]   = useState(null);
+  const [kbStats, setKbStats]     = useState(null);
+  const [issueAnalyses, setIssueAnalyses] = useState([]);
+  const [minutes, setMinutes]     = useState(null);
+  const [progress, setProgress]   = useState([]);
+  const [running, setRunning]     = useState(false);
+  const [error, setError]         = useState("");
+  const [sheetSaved, setSheetSaved] = useState(false);
   const fileRef = useRef();
-  const chatRef = useRef();
 
-  useEffect(() => { chatRef.current?.scrollIntoView({behavior:"smooth"}); }, [consensus]);
+  // 날짜 선택 토글
+  const toggleDate = (d) => {
+    setSelDates(prev =>
+      prev.includes(d) ? prev.filter(x => x !== d) : [...prev, d]
+    );
+  };
+
+  // 주간 요약 선택 시 해당 주 전체 자동 선택
+  const handleReportTypeSelect = (rt) => {
+    setReportType(rt);
+    if (rt === "weekly" && selDates.length > 0) {
+      const weekDates = getWeekDates(selDates[0]);
+      const available = weekDates.filter(d => dates.includes(d));
+      setSelDates(available);
+    }
+  };
 
   const handleFile = async (e) => {
     const f = e.target.files[0];
@@ -501,199 +469,164 @@ export default function App() {
     const ds = getUniqueDates(msgs);
     setAllMsgs(msgs);
     setDates(ds);
-    setSelDate(ds[ds.length - 1] || "");
+    setSelDates([ds[ds.length-1]]);
     setStep(1);
+    setError("");
   };
 
-  const [priority, setPriority] = useState(null);
-  const [kbStats, setKbStats] = useState(null);
-  const [reportType, setReportType] = useState("meeting");
+  const handleDateConfirm = () => {
+    if (selDates.length === 0) return;
+    setStep(2);
+    setError("");
+  };
 
-  const handleDateSelect = () => {
-    const dayMsgs = allMsgs.filter(m => m.date === selDate);
+  const handleReportConfirm = () => {
+    const dayMsgs = filterByDates(allMsgs, selDates);
     const cl = classifyMessages(dayMsgs);
-    const sm = buildShortSummary(selDate, cl);
     const pri = classifyPriority(cl.downtime);
     setClassified(cl);
-    setShortSummary(sm);
     setPriority(pri);
-    setStep(2);  // 보고서 선택 단계로
+    setStep(3);
     setError("");
-    setIssueSummary(null); setPeView(null); setMeView(null);
-    setTeView(null); setConsensus(null); setMinutes(null);
-    setProgress([]);
   };
 
-  const runDiscussion = async () => {
+  const runAnalysis = async () => {
     setRunning(true); setError(""); setProgress([]);
-    let iss, pe, me, te, cons;
+    setIssueAnalyses([]); setMinutes(null); setSheetSaved(false);
+
     try {
+      // 학습 내용 로드
       setProgress(["학습 내용 로드 중..."]);
       let kb;
       try {
         kb = await loadAllKnowledge();
         setKbStats(kb.stats);
-        if (kb.stats.failed > 0) {
-          setProgress(p => [...p, `⚠️ 일부 학습 내용 로드 실패 (${kb.stats.failed}개 에이전트)`]);
-        } else {
-          setProgress(p => [...p, `✅ 학습 내용 로드 완료 (PE:${kb.stats.pe}건 ME:${kb.stats.me}건 TE:${kb.stats.te}건)`]);
-        }
-      } catch(e) {
+        setProgress(p => [...p, `✅ 학습 내용 로드 완료 (PE:${kb.stats.pe}건 ME:${kb.stats.me}건 TE:${kb.stats.te}건)`]);
+      } catch {
         kb = { pe:"", me:"", te:"", stats:{pe:0,me:0,te:0,failed:3} };
         setKbStats(kb.stats);
         setProgress(p => [...p, "⚠️ 학습 내용 로드 실패 — 기본 역할로 진행"]);
       }
 
-      setProgress(p => [...p, "이슈 분석 중..."]);
-      iss = await fetchIssueSummary(shortSummary);
-      setIssueSummary(iss);
+      // 심층 분석 대상 선택
+      const keyIssues = selectKeyIssues(priority);
+      setProgress(p => [...p, `🔍 심층 분석 대상: ${keyIssues.length}건 (긴급 ${priority.urgent.length} + 중요 ${priority.important.length})`]);
 
-      setProgress(p => [...p, "Cell_PE 의견 생성 중..."]);
-      pe = await fetchPEView(shortSummary, iss.issue_summary, kb.pe, reportType);
-      setPeView(pe);
-      await new Promise(r => setTimeout(r, 1000));
-
-      setProgress(p => [...p, "Cell_ME 의견 생성 중..."]);
-      me = await fetchMEView(shortSummary, iss.issue_summary, kb.me, reportType);
-      setMeView(me);
-      await new Promise(r => setTimeout(r, 1000));
-
-      setProgress(p => [...p, "Cell_TE 의견 생성 중..."]);
-      te = await fetchTEView(shortSummary, iss.issue_summary, kb.te, reportType);
-      setTeView(te);
-      await new Promise(r => setTimeout(r, 1000));
-
-      setProgress(p => [...p, "합의점 도출 중..."]);
-      try {
-        cons = await fetchConsensus(iss.issue_summary, pe, me, te);
-      } catch {
-        // 합의 실패 시 기본값으로 대체
-        cons = {
-          pe_reply: pe.action || "추가 분석 진행 예정",
-          me_reply: me.action || "설비 점검 진행 예정",
-          te_reply: te.action || "기술 검토 진행 예정",
-          next_meeting: "익일 현장 미팅",
-        };
+      // 건별 심층 분석
+      const analyses = [];
+      for (let i = 0; i < keyIssues.length; i++) {
+        const issue = keyIssues[i];
+        setProgress(p => [...p, `🔵🟠🟢 [${i+1}/${keyIssues.length}] ${issue.eq} 심층 분석 중...`]);
+        const result = await analyzeIssueDeep(issue, kb, reportType, i+1, keyIssues.length);
+        analyses.push(result);
+        setIssueAnalyses([...analyses]);
       }
-      setConsensus(cons);
-      setStep(4);
-    } catch(e) { setError(e.message); }
-    finally { setRunning(false); }
-  };
 
-  const [sheetSaved, setSheetSaved] = useState(false);
+      // 보고서 생성
+      setProgress(p => [...p, "📄 보고서 생성 중..."]);
+      const dateStr = selDates.length > 1 ? `${selDates[0]}~${selDates[selDates.length-1]}` : selDates[0];
+      const report = await generateReport(dateStr, selDates, keyIssues, analyses, priority, reportType, kb);
+      setMinutes(report);
 
-  const runMinutes = async () => {
-    setRunning(true); setError(""); setSheetSaved(false);
-    try {
-      const mins = await fetchMinutes(
-        selDate, shortSummary, issueSummary.issue_summary,
-        peView, meView, teView, consensus, reportType
-      );
-      setMinutes(mins);
-      setStep(5);
-
-      // 구글 시트 자동 저장
-      const discussion_text = [
-        `PE: ${peView.msg}`,
-        `ME: ${meView.msg}`,
-        `TE: ${teView.msg}`,
-        `PE: ${consensus.pe_reply}`,
-        `ME: ${consensus.me_reply}`,
-        `TE: ${consensus.te_reply}`,
-      ].join(" | ");
-
-      const action_text = [
-        `PE: ${peView.action}`,
-        `ME: ${meView.action}`,
-        `TE: ${teView.action}`,
-      ].join(" | ");
-
-      const minutes_full = (mins.sections || [])
-        .map(s => s.heading + ": " + (s.items || []).join(", "))
-        .join(" / ");
+      // 구글 시트 저장
+      setProgress(p => [...p, "💾 구글 시트 저장 중..."]);
+      const issueText = analyses.map(ia =>
+        `${ia.issue.eq}(${ia.issue.durMin}분): PE-${ia.analyses.Cell_PE?.action} ME-${ia.analyses.Cell_ME?.action} TE-${ia.analyses.Cell_TE?.action}`
+      ).join(" | ");
 
       const saved = await saveToSheets({
-        date: selDate,
-        agenda: mins.agenda || "",
-        issue_summary: issueSummary.issue_summary || "",
-        pe_opinion: `${peView.msg} / 액션: ${peView.action}`,
-        me_opinion: `${meView.msg} / 액션: ${meView.action}`,
-        te_opinion: `${teView.msg} / 액션: ${teView.action}`,
-        discussion: discussion_text,
-        action_items: action_text,
-        minutes_full,
+        date: dateStr,
+        agenda: report.agenda,
+        issue_summary: `긴급${priority.urgent.length}건 중요${priority.important.length}건 일반${priority.normal.length}건`,
+        pe_opinion: analyses.map(ia => ia.analyses.Cell_PE?.action).join(" / "),
+        me_opinion: analyses.map(ia => ia.analyses.Cell_ME?.action).join(" / "),
+        te_opinion: analyses.map(ia => ia.analyses.Cell_TE?.action).join(" / "),
+        discussion: issueText,
+        action_items: report.sections[3]?.items?.join(" | ") || "",
+        minutes_full: report.sections.map(s => `${s.heading}: ${s.items?.join(", ")}`).join(" / "),
       });
       setSheetSaved(saved);
+      setStep(4); // 논의 결과 화면이 아닌 바로 문서 화면으로
+      setProgress(p => [...p, "✅ 완료!"]);
+
     } catch(e) { setError(e.message); }
     finally { setRunning(false); }
   };
 
   const downloadTxt = () => {
     if (!minutes) return;
-    let t = `${"═".repeat(50)}\n${minutes.title}\n${"═".repeat(50)}\n`;
+    let t = `${"═".repeat(52)}\n${minutes.title}\n${"═".repeat(52)}\n`;
     t += `일시: ${minutes.date}\n참석: ${minutes.attendees}\n안건: ${minutes.agenda}\n`;
+
+    // 건별 심층 분석 추가
+    if (issueAnalyses.length > 0) {
+      t += `\n${"═".repeat(52)}\n건별 심층 분석\n${"═".repeat(52)}\n`;
+      issueAnalyses.forEach((ia, i) => {
+        t += `\n[이슈 ${i+1}] ${ia.issue.eq} (${ia.issue.durMin}분)\n`;
+        t += `문제: ${ia.issue.prob}\n원인: ${ia.issue.cause}\n결과: ${ia.issue.result}\n`;
+        t += `PE 분석: ${ia.analyses.Cell_PE?.analysis}\nPE 조치: ${ia.analyses.Cell_PE?.action}\n`;
+        t += `ME 분석: ${ia.analyses.Cell_ME?.analysis}\nME 조치: ${ia.analyses.Cell_ME?.action}\n`;
+        t += `TE 분석: ${ia.analyses.Cell_TE?.analysis}\nTE 조치: ${ia.analyses.Cell_TE?.action}\n`;
+        t += `${"─".repeat(40)}\n`;
+      });
+    }
+
+    // 보고서 섹션
+    t += `\n${"═".repeat(52)}\n보고서\n${"═".repeat(52)}\n`;
     for (const s of minutes.sections||[]) {
       t += `\n${s.heading}\n${"─".repeat(28)}\n`;
       for (const item of s.items||[]) t += `  · ${item}\n`;
     }
-    t += `\n${"─".repeat(50)}\n※ AI 생성 회의록`;
+    t += `\n${"─".repeat(52)}\n※ AI 생성 보고서`;
     Object.assign(document.createElement("a"), {
-      href: URL.createObjectURL(new Blob([t], {type:"text/plain;charset=utf-8"})),
+      href: URL.createObjectURL(new Blob([t], { type:"text/plain;charset=utf-8" })),
       download:`${minutes.title}.txt`,
     }).click();
   };
 
-  const STEPS = ["① 업로드","② 날짜","③ 보고서 선택","④ 이슈 확인","⑤ 논의","⑥ 문서 생성"];
+  const reset = () => {
+    setStep(0); setAllMsgs([]); setDates([]); setSelDates([]);
+    setClassified(null); setPriority(null); setKbStats(null);
+    setIssueAnalyses([]); setMinutes(null); setProgress([]);
+    setError(""); setSheetSaved(false); setReportType("meeting");
+  };
 
   return (
     <div style={{
       minHeight:"100vh",
       background:"linear-gradient(150deg,#03060d,#060d1c 55%,#040810)",
-      fontFamily:"'Noto Sans KR','Malgun Gothic',sans-serif",
-      color:"#e2e8f0",
+      fontFamily:"'Noto Sans KR','Malgun Gothic',sans-serif", color:"#e2e8f0",
     }}>
       {/* Header */}
       <div style={{
-        background:"rgba(3,6,13,0.96)",backdropFilter:"blur(12px)",
+        background:"rgba(3,6,13,0.96)", backdropFilter:"blur(12px)",
         borderBottom:"1px solid rgba(34,211,238,0.12)",
-        padding:"12px 20px",position:"sticky",top:0,zIndex:100,
-        display:"flex",alignItems:"center",gap:12,
+        padding:"12px 20px", position:"sticky", top:0, zIndex:100,
+        display:"flex", alignItems:"center", gap:12,
       }}>
         <div style={{
-          width:34,height:34,borderRadius:8,
+          width:34, height:34, borderRadius:8,
           background:"linear-gradient(135deg,#3b82f6,#22d3ee)",
-          display:"flex",alignItems:"center",justifyContent:"center",fontSize:17,
+          display:"flex", alignItems:"center", justifyContent:"center", fontSize:17,
         }}>🏭</div>
         <div>
-          <div style={{fontSize:13,fontWeight:800,color:"#f1f5f9"}}>AZS Cell 라인 · 이슈 분석 · 회의록</div>
+          <div style={{fontSize:13,fontWeight:800,color:"#f1f5f9"}}>AZS Cell 라인 · 이슈 분석 · 보고서</div>
           <div style={{fontSize:9,color:"#22d3ee",letterSpacing:2,fontWeight:700}}>Cell_PE · Cell_ME · Cell_TE  |  AZS</div>
         </div>
-        {step>0 && (
-          <button onClick={()=>{setStep(0);setAllMsgs([]);}} style={{
-            marginLeft:"auto",padding:"5px 12px",
-            background:"rgba(51,65,85,0.4)",border:"1px solid rgba(51,65,85,0.5)",
-            borderRadius:6,color:"#64748b",fontSize:11,cursor:"pointer",
+        {step > 0 && (
+          <button onClick={reset} style={{
+            marginLeft:"auto", padding:"5px 12px",
+            background:"rgba(51,65,85,0.4)", border:"1px solid rgba(51,65,85,0.5)",
+            borderRadius:6, color:"#64748b", fontSize:11, cursor:"pointer",
           }}>처음으로</button>
         )}
       </div>
 
-      {/* Step bar */}
-      <div style={{display:"flex",borderBottom:"1px solid rgba(51,65,85,0.3)",background:"rgba(3,6,13,0.85)"}}>
-        {STEPS.map((s,i)=>(
-          <div key={i} style={{
-            flex:1,padding:"10px 6px",textAlign:"center",
-            background:step===i?"rgba(34,211,238,0.08)":"transparent",
-            borderBottom:`2px solid ${step===i?"#22d3ee":step>i?"#34d399":"transparent"}`,
-            fontSize:10,fontWeight:800,
-            color:step===i?"#22d3ee":step>i?"#34d399":"#374151",
-          }}>{s}</div>
-        ))}
-      </div>
+      <StepBar step={step}/>
 
-      <div style={{maxWidth:700,margin:"0 auto",padding:"24px 18px 60px"}}>
+      <div style={{maxWidth:720, margin:"0 auto", padding:"24px 18px 60px"}}>
 
-        {/* STEP 0: 업로드 */}
+        {/* STEP 0: 파일 업로드 */}
         {step===0 && (
           <div>
             <div style={{marginBottom:20}}>
@@ -701,78 +634,121 @@ export default function App() {
               <div style={{fontSize:12,color:"#475569"}}>WhatsApp → 채팅 내보내기 → txt 파일</div>
             </div>
             <div onClick={()=>fileRef.current?.click()} style={{
-              border:"2px dashed rgba(34,211,238,0.3)",borderRadius:12,
-              padding:"48px 20px",textAlign:"center",cursor:"pointer",
-              background:"rgba(34,211,238,0.03)",marginBottom:20,
+              border:"2px dashed rgba(34,211,238,0.3)", borderRadius:12,
+              padding:"48px 20px", textAlign:"center", cursor:"pointer",
+              background:"rgba(34,211,238,0.03)", marginBottom:20,
             }}>
               <input ref={fileRef} type="file" accept=".txt" onChange={handleFile} style={{display:"none"}}/>
               <div style={{fontSize:40,marginBottom:12}}>📂</div>
               <div style={{fontSize:14,color:"#22d3ee",fontWeight:700}}>클릭하여 txt 파일 선택</div>
               <div style={{fontSize:11,color:"#374151",marginTop:4}}>WhatsApp 채팅 내보내기 (.txt)</div>
             </div>
-            <div style={{display:"flex",gap:8}}>
-              {Object.entries(ROLES).map(([k,r])=>(
-                <div key={k} style={{flex:1,background:r.bg,border:`1px solid ${r.color}28`,borderRadius:10,padding:"12px"}}>
-                  <div style={{fontSize:20,marginBottom:4}}>{r.icon}</div>
-                  <div style={{fontSize:11,fontWeight:800,color:r.color,marginBottom:2}}>{k}</div>
-                  <div style={{fontSize:10,color:"#475569"}}>{r.label}</div>
-                </div>
-              ))}
+            <div style={{
+              padding:"10px 14px", background:"rgba(34,211,238,0.05)",
+              border:"1px solid rgba(34,211,238,0.2)", borderRadius:8,
+              fontSize:11, color:"#22d3ee", lineHeight:1.7,
+            }}>
+              💡 날짜 기준: 06:00 이전 메시지는 전날 생산분으로 처리됩니다
             </div>
           </div>
         )}
 
-        {/* STEP 1: 날짜 */}
+        {/* STEP 1: 날짜 선택 (다중) */}
         {step===1 && (
           <div>
-            <div style={{marginBottom:20}}>
+            <div style={{marginBottom:16}}>
               <div style={{fontSize:17,fontWeight:800,color:"#f1f5f9",marginBottom:4}}>날짜 선택</div>
-              <div style={{fontSize:12,color:"#475569"}}>총 {dates.length}일치 데이터</div>
+              <div style={{fontSize:12,color:"#475569"}}>
+                총 {dates.length}일치 데이터 · 여러 날짜를 함께 선택할 수 있어요
+              </div>
             </div>
-            <div style={{fontSize:10,color:"#475569",fontWeight:800,letterSpacing:1.2,marginBottom:6}}>날짜</div>
-            <select value={selDate} onChange={e=>setSelDate(e.target.value)} style={{
-              width:"100%",background:"rgba(6,10,18,0.9)",
-              border:"1.5px solid rgba(34,211,238,0.25)",borderRadius:8,
-              color:"#e2e8f0",padding:"10px 13px",fontSize:13,outline:"none",marginBottom:20,
+
+            {/* 전체 선택/해제 */}
+            <div style={{display:"flex",gap:8,marginBottom:10}}>
+              <button onClick={()=>setSelDates([...dates])} style={{
+                padding:"5px 12px", background:"rgba(34,211,238,0.1)",
+                border:"1px solid rgba(34,211,238,0.3)", borderRadius:6,
+                color:"#22d3ee", fontSize:11, cursor:"pointer",
+              }}>전체 선택</button>
+              <button onClick={()=>setSelDates([])} style={{
+                padding:"5px 12px", background:"rgba(51,65,85,0.3)",
+                border:"1px solid rgba(51,65,85,0.4)", borderRadius:6,
+                color:"#64748b", fontSize:11, cursor:"pointer",
+              }}>전체 해제</button>
+              <span style={{fontSize:11,color:"#22d3ee",marginLeft:"auto",alignSelf:"center"}}>
+                {selDates.length}일 선택됨
+              </span>
+            </div>
+
+            {/* 날짜 목록 */}
+            <div style={{
+              maxHeight:320, overflowY:"auto",
+              background:"rgba(4,8,16,0.6)", border:"1px solid rgba(51,65,85,0.3)",
+              borderRadius:10, padding:"8px", marginBottom:16,
             }}>
-              {dates.map(d=>(
-                <option key={d} value={d} style={{background:"#0f172a"}}>
-                  {d} ({allMsgs.filter(m=>m.date===d).length}건)
-                </option>
-              ))}
-            </select>
-            <button onClick={handleDateSelect} style={{
-              width:"100%",padding:"12px",
-              background:"linear-gradient(135deg,#3b82f6,#22d3ee)",
-              border:"none",borderRadius:8,color:"#fff",fontSize:13,fontWeight:800,cursor:"pointer",
-            }}>분석 시작 →</button>
+              {[...dates].reverse().map(d => {
+                const count = allMsgs.filter(m => getProductionDate(m.date,m.hour)===d).length;
+                const isSelected = selDates.includes(d);
+                return (
+                  <div key={d} onClick={()=>toggleDate(d)} style={{
+                    display:"flex", alignItems:"center", gap:12,
+                    padding:"10px 12px", borderRadius:8, cursor:"pointer",
+                    background: isSelected ? "rgba(34,211,238,0.1)" : "transparent",
+                    border: `1px solid ${isSelected ? "rgba(34,211,238,0.3)" : "transparent"}`,
+                    marginBottom:4, transition:"all 0.15s",
+                  }}>
+                    <div style={{
+                      width:18, height:18, borderRadius:4,
+                      background: isSelected ? "#22d3ee" : "transparent",
+                      border:`2px solid ${isSelected ? "#22d3ee" : "rgba(51,65,85,0.6)"}`,
+                      display:"flex", alignItems:"center", justifyContent:"center",
+                      fontSize:11, color:"#fff", flexShrink:0,
+                    }}>{isSelected ? "✓" : ""}</div>
+                    <span style={{fontSize:13, color: isSelected ? "#22d3ee" : "#94a3b8", fontWeight: isSelected ? 700 : 400}}>
+                      {d}
+                    </span>
+                    <span style={{fontSize:11, color:"#475569", marginLeft:"auto"}}>{count}건</span>
+                  </div>
+                );
+              })}
+            </div>
+
+            <div style={{display:"flex",gap:10}}>
+              <BackBtn onClick={()=>setStep(0)} label="← 파일 재선택"/>
+              <button onClick={handleDateConfirm} disabled={selDates.length===0} style={{
+                flex:1, padding:"12px",
+                background:selDates.length>0?"linear-gradient(135deg,#3b82f6,#22d3ee)":"rgba(51,65,85,0.3)",
+                border:"none", borderRadius:8,
+                color:selDates.length>0?"#fff":"#374151",
+                fontSize:13, fontWeight:800,
+                cursor:selDates.length>0?"pointer":"not-allowed",
+              }}>보고서 종류 선택 →</button>
+            </div>
           </div>
         )}
 
         {/* STEP 2: 보고서 종류 선택 */}
         {step===2 && (
           <div>
-            <div style={{ marginBottom:20 }}>
-              <div style={{fontSize:17,fontWeight:800,color:"#f1f5f9",marginBottom:4}}>
-                어떤 문서를 만들까요?
-              </div>
+            <div style={{marginBottom:20}}>
+              <div style={{fontSize:17,fontWeight:800,color:"#f1f5f9",marginBottom:4}}>어떤 문서를 만들까요?</div>
               <div style={{fontSize:12,color:"#475569"}}>
                 선택한 보고서 종류에 맞게 AI가 논의를 진행합니다
+                {reportType==="weekly" && (
+                  <span style={{color:"#22d3ee"}}> · 주간 선택 시 해당 주 날짜 자동 선택</span>
+                )}
               </div>
             </div>
 
-            <div style={{display:"grid",gridTemplateColumns:"1fr 1fr",gap:12,marginBottom:24}}>
+            <div style={{display:"grid",gridTemplateColumns:"1fr 1fr",gap:12,marginBottom:16}}>
               {REPORT_TYPES.map(rt => (
-                <button key={rt.id} onClick={() => setReportType(rt.id)} style={{
+                <button key={rt.id} onClick={()=>handleReportTypeSelect(rt.id)} style={{
                   padding:"18px 16px", textAlign:"left",
-                  background: reportType===rt.id
-                    ? "rgba(167,139,250,0.15)" : "rgba(20,30,50,0.7)",
+                  background: reportType===rt.id ? "rgba(167,139,250,0.15)" : "rgba(20,30,50,0.7)",
                   border:`2px solid ${reportType===rt.id ? "#a78bfa" : "rgba(51,65,85,0.5)"}`,
-                  borderRadius:12,
-                  color: reportType===rt.id ? "#a78bfa" : "#64748b",
+                  borderRadius:12, color: reportType===rt.id ? "#a78bfa" : "#64748b",
                   cursor:"pointer", transition:"all 0.2s",
                   transform: reportType===rt.id ? "translateY(-2px)" : "none",
-                  boxShadow: reportType===rt.id ? "0 8px 24px rgba(167,139,250,0.15)" : "none",
                 }}>
                   <div style={{fontSize:28,marginBottom:8}}>{rt.icon}</div>
                   <div style={{fontSize:13,fontWeight:800,marginBottom:4}}>{rt.label}</div>
@@ -781,288 +757,284 @@ export default function App() {
               ))}
             </div>
 
-            <div style={{
-              background:"rgba(167,139,250,0.06)",
-              border:"1px solid rgba(167,139,250,0.2)",
-              borderRadius:10, padding:"12px 16px", marginBottom:20,
-              fontSize:11, color:"#a78bfa",
-            }}>
-              선택됨: {REPORT_TYPES.find(r=>r.id===reportType)?.icon} {REPORT_TYPES.find(r=>r.id===reportType)?.label}
-            </div>
+            {reportType==="weekly" && selDates.length > 1 && (
+              <div style={{
+                padding:"10px 14px", background:"rgba(34,211,238,0.06)",
+                border:"1px solid rgba(34,211,238,0.2)", borderRadius:8,
+                fontSize:11, color:"#22d3ee", marginBottom:16,
+              }}>
+                📅 해당 주 자동 선택: {selDates.join(", ")}
+              </div>
+            )}
 
             <div style={{display:"flex",gap:10}}>
-              <button onClick={()=>setStep(1)} style={{
-                flex:1, padding:"11px",
-                background:"transparent",
-                border:"1.5px solid rgba(51,65,85,0.4)",
-                borderRadius:8, color:"#475569", fontSize:13, cursor:"pointer",
-              }}>← 날짜 선택</button>
-              <button onClick={()=>setStep(3)} style={{
-                flex:3, padding:"11px",
+              <BackBtn onClick={()=>setStep(1)} label="← 날짜 선택"/>
+              <button onClick={handleReportConfirm} style={{
+                flex:1, padding:"12px",
                 background:"linear-gradient(135deg,#a78bfa,#7c3aed)",
-                border:"none", borderRadius:8,
-                color:"#fff", fontSize:13, fontWeight:800, cursor:"pointer",
+                border:"none", borderRadius:8, color:"#fff",
+                fontSize:13, fontWeight:800, cursor:"pointer",
               }}>이슈 확인 →</button>
             </div>
           </div>
         )}
 
-        {/* STEP 3: 이슈 확인 + 논의 */}
-        {step===3 && classified && (
+        {/* STEP 3: 이슈 확인 */}
+        {step===3 && classified && priority && (
           <div>
-            <div style={{marginBottom:16}}>
-              <div style={{fontSize:17,fontWeight:800,color:"#f1f5f9",marginBottom:4}}>{selDate} 이슈 현황</div>
+            <div style={{marginBottom:14}}>
+              <div style={{fontSize:17,fontWeight:800,color:"#f1f5f9",marginBottom:4}}>
+                {selDates.length > 1 ? `${selDates[0]} ~ ${selDates[selDates.length-1]}` : selDates[0]} 이슈 현황
+              </div>
             </div>
 
-            {/* 통계 */}
-            <div style={{display:"flex",gap:10,marginBottom:16}}>
-              {[
-                {label:"다운타임",count:classified.downtime.length,color:"#ef4444",icon:"⚡"},
-                {label:"설비 경고",count:classified.equipment.length,color:"#f97316",icon:"⚠️"},
-                {label:"일반 메시지",count:classified.general.length,color:"#22d3ee",icon:"💬"},
-              ].map(s=>(
-                <div key={s.label} style={{
-                  flex:1,background:"rgba(15,23,42,0.7)",
-                  border:`1px solid ${s.color}30`,borderRadius:10,padding:"12px",textAlign:"center",
-                }}>
-                  <div style={{fontSize:22,marginBottom:4}}>{s.icon}</div>
-                  <div style={{fontSize:20,fontWeight:800,color:s.color}}>{s.count}</div>
-                  <div style={{fontSize:10,color:"#475569"}}>{s.label}</div>
-                </div>
-              ))}
-            </div>
-
-            {/* KB 로드 현황 */}
+            {/* KB 상태 */}
             {kbStats && (
               <div style={{
-                background: kbStats.failed > 0 ? "rgba(245,158,11,0.06)" : "rgba(52,211,153,0.06)",
-                border: `1px solid ${kbStats.failed > 0 ? "rgba(245,158,11,0.25)" : "rgba(52,211,153,0.25)"}`,
+                background: kbStats.failed>0 ? "rgba(245,158,11,0.06)" : "rgba(52,211,153,0.06)",
+                border:`1px solid ${kbStats.failed>0 ? "rgba(245,158,11,0.25)" : "rgba(52,211,153,0.25)"}`,
                 borderRadius:8, padding:"8px 12px", marginBottom:12,
                 fontSize:10, display:"flex", gap:16, alignItems:"center",
               }}>
-                <span style={{color: kbStats.failed > 0 ? "#f59e0b" : "#34d399", fontWeight:800}}>
-                  {kbStats.failed > 0 ? "⚠️ 학습 내용 일부 로드 실패" : "✅ 학습 내용 로드 완료"}
+                <span style={{color:kbStats.failed>0?"#f59e0b":"#34d399",fontWeight:800}}>
+                  {kbStats.failed>0?"⚠️ 학습 내용 일부 로드 실패":"✅ 학습 내용 로드 완료"}
                 </span>
-                <span style={{color:"#3b82f6"}}>Cell_PE: {kbStats.pe}건</span>
-                <span style={{color:"#f97316"}}>Cell_ME: {kbStats.me}건</span>
-                <span style={{color:"#22d3ee"}}>Cell_TE: {kbStats.te}건</span>
+                <span style={{color:"#3b82f6"}}>PE:{kbStats.pe}건</span>
+                <span style={{color:"#f97316"}}>ME:{kbStats.me}건</span>
+                <span style={{color:"#22d3ee"}}>TE:{kbStats.te}건</span>
               </div>
             )}
 
             {/* 우선순위 요약 */}
-            {priority && (
+            <div style={{display:"flex",gap:10,marginBottom:14}}>
+              {[
+                {label:"🔴 긴급",count:priority.urgent.length,color:"#ef4444",bg:"rgba(239,68,68,0.08)",border:"rgba(239,68,68,0.25)"},
+                {label:"🟡 중요",count:priority.important.length,color:"#f59e0b",bg:"rgba(245,158,11,0.08)",border:"rgba(245,158,11,0.25)"},
+                {label:"🟢 일반",count:priority.normal.length,color:"#22c55e",bg:"rgba(34,197,94,0.08)",border:"rgba(34,197,94,0.25)"},
+              ].map(p => (
+                <div key={p.label} style={{
+                  flex:1, background:p.bg, border:`1px solid ${p.border}`,
+                  borderRadius:8, padding:"10px", textAlign:"center",
+                }}>
+                  <div style={{fontSize:20,fontWeight:800,color:p.color}}>{p.count}</div>
+                  <div style={{fontSize:10,color:p.color,fontWeight:700}}>{p.label}</div>
+                </div>
+              ))}
+            </div>
+
+            {/* 심층분석 대상 */}
+            <div style={{
+              background:"rgba(167,139,250,0.06)", border:"1px solid rgba(167,139,250,0.2)",
+              borderRadius:10, padding:"12px 14px", marginBottom:12,
+            }}>
+              <div style={{fontSize:10,color:"#a78bfa",fontWeight:800,marginBottom:8}}>
+                🔍 심층 분석 대상 (최대 {MAX_ISSUES}건)
+              </div>
+              <div style={{fontSize:11,color:"#cbd5e1"}}>
+                긴급 {priority.urgent.length}건 + 중요 {priority.important.length}건 =&nbsp;
+                <span style={{color:"#a78bfa",fontWeight:800}}>
+                  {Math.min(priority.urgent.length + priority.important.length, MAX_ISSUES)}건 심층 분석 예정
+                </span>
+              </div>
+              <div style={{fontSize:9,color:"#475569",marginTop:4}}>
+                예상 소요 시간: 약 {Math.ceil(Math.min(priority.urgent.length + priority.important.length, MAX_ISSUES) * 2.5 + 3)}~{Math.ceil(Math.min(priority.urgent.length + priority.important.length, MAX_ISSUES) * 3.5 + 5)}분
+              </div>
+            </div>
+
+            {/* 긴급 이슈 목록 */}
+            {priority.urgent.length > 0 && (
               <div style={{
-                display:"flex", gap:10, marginBottom:14,
+                background:"rgba(239,68,68,0.05)", border:"1px solid rgba(239,68,68,0.2)",
+                borderRadius:10, padding:"12px 14px", marginBottom:10,
               }}>
-                {[
-                  {label:"🔴 긴급", count:priority.urgent.length, color:"#ef4444", bg:"rgba(239,68,68,0.08)", border:"rgba(239,68,68,0.25)"},
-                  {label:"🟡 중요", count:priority.important.length, color:"#f59e0b", bg:"rgba(245,158,11,0.08)", border:"rgba(245,158,11,0.25)"},
-                  {label:"🟢 일반", count:priority.normal.length, color:"#22c55e", bg:"rgba(34,197,94,0.08)", border:"rgba(34,197,94,0.25)"},
-                ].map(p => (
-                  <div key={p.label} style={{
-                    flex:1, background:p.bg, border:`1px solid ${p.border}`,
-                    borderRadius:8, padding:"10px", textAlign:"center",
-                  }}>
-                    <div style={{fontSize:18, fontWeight:800, color:p.color}}>{p.count}</div>
-                    <div style={{fontSize:10, color:p.color, fontWeight:700}}>{p.label}</div>
+                <div style={{fontSize:10,color:"#ef4444",fontWeight:800,marginBottom:8}}>
+                  🔴 긴급 이슈 ({priority.urgent.length}건)
+                </div>
+                {priority.urgent.map((d,i) => (
+                  <div key={i} style={{fontSize:11,color:"#fca5a5",marginBottom:5}}>
+                    <span style={{color:"#ef4444",fontWeight:700}}>[{d.time}] {d.eq}</span>
+                    <span style={{color:"#94a3b8"}}> · {d.durMin}분 · {d.prob}</span>
+                    <span style={{color:"#ef4444",fontSize:9,marginLeft:6}}>({d.reasons?.join(", ")})</span>
                   </div>
                 ))}
               </div>
             )}
 
-            {/* 긴급 이슈 */}
-            {priority && priority.urgent.length > 0 && (
-              <div style={{
-                background:"rgba(239,68,68,0.05)", border:"1px solid rgba(239,68,68,0.25)",
-                borderRadius:10, padding:"12px 14px", marginBottom:10,
-              }}>
-                <div style={{fontSize:10, color:"#ef4444", fontWeight:800, marginBottom:8}}>
-                  🔴 긴급 이슈 ({priority.urgent.length}건) — 논의 최우선
-                </div>
-                {priority.urgent.map((d,i) => {
-                  const eq = extractField(d.text,"Equipment");
-                  const dur = extractField(d.text,"Duration");
-                  const prob = extractField(d.text,"Problem");
-                  return (
-                    <div key={i} style={{fontSize:11, color:"#fca5a5", marginBottom:5}}>
-                      <span style={{color:"#ef4444", fontWeight:700}}>[{d.time}] {eq}</span>
-                      <span style={{color:"#94a3b8"}}> · {dur} · {prob}</span>
-                      <span style={{color:"#ef4444", fontSize:9, marginLeft:6}}>
-                        ({d.reasons?.join(", ")})
-                      </span>
-                    </div>
-                  );
-                })}
-              </div>
-            )}
-
-            {/* 중요 이슈 */}
-            {priority && priority.important.length > 0 && (
+            {/* 중요 이슈 목록 */}
+            {priority.important.length > 0 && (
               <div style={{
                 background:"rgba(245,158,11,0.05)", border:"1px solid rgba(245,158,11,0.2)",
-                borderRadius:10, padding:"12px 14px", marginBottom:10,
+                borderRadius:10, padding:"12px 14px", marginBottom:14,
               }}>
-                <div style={{fontSize:10, color:"#f59e0b", fontWeight:800, marginBottom:8}}>
-                  🟡 중요 이슈 ({priority.important.length}건) — 오늘 중 처리
+                <div style={{fontSize:10,color:"#f59e0b",fontWeight:800,marginBottom:8}}>
+                  🟡 중요 이슈 ({priority.important.length}건)
                 </div>
-                {priority.important.slice(0,3).map((d,i) => {
-                  const eq = extractField(d.text,"Equipment");
-                  const dur = extractField(d.text,"Duration");
-                  const prob = extractField(d.text,"Problem");
-                  return (
-                    <div key={i} style={{fontSize:11, color:"#fcd34d", marginBottom:5}}>
-                      <span style={{color:"#f59e0b", fontWeight:700}}>[{d.time}] {eq}</span>
-                      <span style={{color:"#94a3b8"}}> · {dur} · {prob}</span>
-                      <span style={{color:"#f59e0b", fontSize:9, marginLeft:6}}>
-                        ({d.reasons?.join(", ")})
-                      </span>
-                    </div>
-                  );
-                })}
-                {priority.important.length > 3 && (
-                  <div style={{fontSize:10, color:"#78716c"}}>외 {priority.important.length-3}건</div>
+                {priority.important.slice(0,5).map((d,i) => (
+                  <div key={i} style={{fontSize:11,color:"#fcd34d",marginBottom:5}}>
+                    <span style={{color:"#f59e0b",fontWeight:700}}>[{d.time}] {d.eq}</span>
+                    <span style={{color:"#94a3b8"}}> · {d.durMin}분 · {d.prob}</span>
+                    <span style={{color:"#f59e0b",fontSize:9,marginLeft:6}}>({d.reasons?.join(", ")})</span>
+                  </div>
+                ))}
+                {priority.important.length > 5 && (
+                  <div style={{fontSize:10,color:"#78716c"}}>외 {priority.important.length-5}건</div>
                 )}
               </div>
             )}
 
-            {/* 일반 이슈 */}
-            {priority && priority.normal.length > 0 && (
-              <div style={{
-                background:"rgba(34,197,94,0.03)", border:"1px solid rgba(34,197,94,0.15)",
-                borderRadius:10, padding:"10px 14px", marginBottom:10,
-              }}>
-                <div style={{fontSize:10, color:"#22c55e", fontWeight:800}}>
-                  🟢 일반 이슈 ({priority.normal.length}건) — 모니터링
-                </div>
-              </div>
-            )}
+            {/* 선택된 보고서 종류 */}
+            <div style={{
+              background:"rgba(167,139,250,0.06)", border:"1px solid rgba(167,139,250,0.2)",
+              borderRadius:8, padding:"10px 14px", marginBottom:14,
+              display:"flex", alignItems:"center", justifyContent:"space-between",
+            }}>
+              <span style={{fontSize:11,color:"#a78bfa",fontWeight:700}}>
+                {REPORT_TYPES.find(r=>r.id===reportType)?.icon} {REPORT_TYPES.find(r=>r.id===reportType)?.label}
+              </span>
+              <button onClick={()=>setStep(2)} style={{
+                background:"transparent", border:"1px solid rgba(167,139,250,0.3)",
+                borderRadius:5, color:"#a78bfa", fontSize:10, cursor:"pointer", padding:"2px 8px",
+              }}>변경</button>
+            </div>
 
-            {/* 진행 상태 */}
+            {/* 진행 상황 */}
             {progress.length > 0 && (
               <div style={{
-                background:"rgba(15,23,42,0.7)",border:"1px solid rgba(51,65,85,0.3)",
-                borderRadius:10,padding:"14px 16px",marginBottom:14,
+                background:"rgba(15,23,42,0.7)", border:"1px solid rgba(51,65,85,0.3)",
+                borderRadius:10, padding:"14px 16px", marginBottom:14,
+                maxHeight:200, overflowY:"auto",
               }}>
-                {["학습 내용 로드 중...","학습 내용 로드 완료","이슈 분석 중...","Cell_PE 의견 생성 중...","Cell_ME 의견 생성 중...","Cell_TE 의견 생성 중...","합의점 도출 중..."].map((label,i)=>(
-                  <ProgressStep key={i} label={label}
-                    done={progress.length > i+1 || (!running && progress.length > i)}
-                    active={running && progress.length === i+1}
-                  />
+                {progress.map((p,i) => (
+                  <div key={i} style={{
+                    fontSize:11, color: p.startsWith("✅") ? "#34d399" : p.startsWith("⚠️") ? "#f59e0b" : "#94a3b8",
+                    marginBottom:6, display:"flex", alignItems:"center", gap:8,
+                  }}>
+                    {i === progress.length-1 && running && <Spinner/>}
+                    {p}
+                  </div>
                 ))}
               </div>
             )}
 
             {error && (
               <div style={{
-                padding:"10px 14px",background:"rgba(239,68,68,0.08)",
-                border:"1px solid rgba(239,68,68,0.25)",borderRadius:8,
-                fontSize:11,color:"#fca5a5",marginBottom:12,
-                wordBreak:"break-all",lineHeight:1.6,whiteSpace:"pre-wrap",
+                padding:"10px 14px", background:"rgba(239,68,68,0.08)",
+                border:"1px solid rgba(239,68,68,0.25)", borderRadius:8,
+                fontSize:11, color:"#fca5a5", marginBottom:12,
+                wordBreak:"break-all", lineHeight:1.6, whiteSpace:"pre-wrap",
               }}>❌ {error}</div>
             )}
 
-            <button onClick={runDiscussion} disabled={running} style={{
-              width:"100%",padding:"12px",
-              background:running?"rgba(51,65,85,0.3)":"linear-gradient(135deg,#f97316,#fb923c)",
-              border:"none",borderRadius:8,color:running?"#374151":"#fff",
-              fontSize:13,fontWeight:800,cursor:running?"not-allowed":"pointer",
-              display:"flex",alignItems:"center",justifyContent:"center",gap:8,
-            }}>
-              {running?<><Spinner/>진행 중...</>:"🤝 3자 엔지니어 논의 시작 →"}
-            </button>
+            <div style={{display:"flex",gap:10}}>
+              <BackBtn onClick={()=>setStep(2)} label="← 보고서 변경"/>
+              <button onClick={runAnalysis} disabled={running} style={{
+                flex:1, padding:"12px",
+                background:running?"rgba(51,65,85,0.3)":"linear-gradient(135deg,#3b82f6,#22d3ee)",
+                border:"none", borderRadius:8,
+                color:running?"#374151":"#fff",
+                fontSize:13, fontWeight:800,
+                cursor:running?"not-allowed":"pointer",
+                display:"flex", alignItems:"center", justifyContent:"center", gap:8,
+              }}>
+                {running?<><Spinner/>분석 진행 중...</>:"🔍 심층 분석 및 보고서 생성 →"}
+              </button>
+            </div>
           </div>
         )}
 
-        {/* STEP 4: 논의 결과 */}
-        {step===4 && peView && meView && teView && consensus && (
+        {/* STEP 4: 문서 생성 완료 */}
+        {step===4 && minutes && (
           <div>
             <div style={{marginBottom:14}}>
-              <div style={{fontSize:17,fontWeight:800,color:"#f1f5f9",marginBottom:8}}>엔지니어 논의</div>
-              <div style={{
-                background:"rgba(239,68,68,0.07)",border:"1px solid rgba(239,68,68,0.2)",
-                borderRadius:8,padding:"9px 13px",fontSize:12,color:"#fca5a5",
-              }}>
-                <span style={{color:"#ef4444",fontWeight:800}}>⚡ </span>
-                {issueSummary?.issue_summary}
-              </div>
-            </div>
-
-            {/* 채팅 형식 논의 */}
-            <div style={{
-              background:"rgba(4,8,16,0.7)",border:"1px solid rgba(51,65,85,0.3)",
-              borderRadius:12,padding:"16px 14px",marginBottom:14,
-            }}>
-              <ChatBubble role="Cell_PE" msg={peView.msg} idx={0}/>
-              <ChatBubble role="Cell_ME" msg={meView.msg} idx={1}/>
-              <ChatBubble role="Cell_TE" msg={teView.msg} idx={2}/>
-              <ChatBubble role="Cell_PE" msg={consensus.pe_reply} idx={3}/>
-              <ChatBubble role="Cell_ME" msg={consensus.me_reply} idx={4}/>
-              <ChatBubble role="Cell_TE" msg={consensus.te_reply} idx={5}/>
-              <div ref={chatRef}/>
-            </div>
-
-            {/* 액션 아이템 */}
-            <div style={{
-              background:"rgba(52,211,153,0.05)",border:"1px solid rgba(52,211,153,0.2)",
-              borderRadius:10,padding:"13px 15px",marginBottom:14,
-            }}>
-              <div style={{fontSize:10,color:"#34d399",fontWeight:800,marginBottom:10}}>✅ 액션 아이템</div>
-              {[
-                {role:"Cell_PE",action:peView.action},
-                {role:"Cell_ME",action:meView.action},
-                {role:"Cell_TE",action:teView.action},
-              ].map((a,i)=>{
-                const r=ROLES[a.role];
-                return (
-                  <div key={i} style={{display:"flex",gap:10,marginBottom:7,alignItems:"flex-start"}}>
-                    <span style={{
-                      background:r.bg,border:`1px solid ${r.color}40`,color:r.color,
-                      borderRadius:4,padding:"1px 7px",fontSize:10,fontWeight:800,flexShrink:0,
-                    }}>{a.role}</span>
-                    <span style={{fontSize:12.5,color:"#cbd5e1",lineHeight:1.6}}>{a.action}</span>
-                  </div>
-                );
-              })}
-              {consensus.next_meeting && (
-                <div style={{marginTop:8,fontSize:11,color:"#475569"}}>📅 {consensus.next_meeting}</div>
+              <div style={{fontSize:17,fontWeight:800,color:"#f1f5f9",marginBottom:4}}>보고서 완성</div>
+              {sheetSaved && (
+                <div style={{fontSize:11,color:"#34d399"}}>✅ 구글 시트에 자동 저장 완료</div>
               )}
             </div>
 
-            {error && (
-              <div style={{
-                padding:"10px 14px",background:"rgba(239,68,68,0.08)",
-                border:"1px solid rgba(239,68,68,0.25)",borderRadius:8,
-                fontSize:11,color:"#fca5a5",marginBottom:12,wordBreak:"break-all",
-              }}>❌ {error}</div>
+            {/* 건별 심층 분석 결과 */}
+            {issueAnalyses.length > 0 && (
+              <div style={{marginBottom:16}}>
+                <div style={{
+                  fontSize:12, fontWeight:800, color:"#f1f5f9", marginBottom:10,
+                  padding:"8px 14px", background:"rgba(167,139,250,0.1)",
+                  border:"1px solid rgba(167,139,250,0.2)", borderRadius:8,
+                }}>
+                  🔍 건별 심층 분석 ({issueAnalyses.length}건)
+                </div>
+                {issueAnalyses.map((ia, idx) => {
+                  const isPriUrgent = priority.urgent.some(u => u.eq === ia.issue.eq && u.time === ia.issue.time);
+                  return (
+                    <div key={idx} style={{
+                      background:"rgba(15,23,42,0.7)",
+                      border:`1px solid ${isPriUrgent ? "rgba(239,68,68,0.3)" : "rgba(245,158,11,0.3)"}`,
+                      borderRadius:10, padding:"14px 16px", marginBottom:10,
+                    }}>
+                      <div style={{
+                        display:"flex", justifyContent:"space-between",
+                        alignItems:"center", marginBottom:10,
+                      }}>
+                        <div>
+                          <span style={{
+                            fontSize:11, fontWeight:800,
+                            color: isPriUrgent ? "#ef4444" : "#f59e0b",
+                          }}>
+                            {isPriUrgent ? "🔴" : "🟡"} [{ia.issue.time}] {ia.issue.eq}
+                          </span>
+                          <span style={{fontSize:10,color:"#475569",marginLeft:8}}>
+                            {ia.issue.durMin}분 · {ia.issue.prob}
+                          </span>
+                        </div>
+                        <span style={{fontSize:9,color:"#374151"}}>
+                          {ia.issue.reasons?.join(", ")}
+                        </span>
+                      </div>
+                      {Object.entries({
+                        Cell_PE: ia.analyses.Cell_PE,
+                        Cell_ME: ia.analyses.Cell_ME,
+                        Cell_TE: ia.analyses.Cell_TE,
+                      }).map(([role, analysis]) => {
+                        const r = ROLES[role];
+                        return (
+                          <div key={role} style={{
+                            background: r.bg, borderRadius:8,
+                            padding:"10px 12px", marginBottom:6,
+                          }}>
+                            <div style={{fontSize:10,color:r.color,fontWeight:800,marginBottom:5}}>
+                              {r.icon} {r.label}
+                            </div>
+                            <div style={{fontSize:11,color:"#cbd5e1",lineHeight:1.6,marginBottom:4}}>
+                              📊 분석: {analysis?.analysis}
+                            </div>
+                            <div style={{fontSize:11,color:"#94a3b8",lineHeight:1.6,marginBottom:4}}>
+                              ⚡ 조치: {analysis?.action}
+                            </div>
+                            <div style={{fontSize:11,color:"#94a3b8",lineHeight:1.6}}>
+                              🛡️ 재발방지: {analysis?.prevention}
+                            </div>
+                          </div>
+                        );
+                      })}
+                    </div>
+                  );
+                })}
+              </div>
             )}
 
-            <button onClick={runMinutes} disabled={running} style={{
-              width:"100%",padding:"12px",
-              background:running?"rgba(51,65,85,0.3)":"linear-gradient(135deg,#a78bfa,#7c3aed)",
-              border:"none",borderRadius:8,color:running?"#374151":"#fff",
-              fontSize:13,fontWeight:800,cursor:running?"not-allowed":"pointer",
-              display:"flex",alignItems:"center",justifyContent:"center",gap:8,
-            }}>
-              {running?<><Spinner/>회의록 작성 중...</>:"📄 회의록 생성 →"}
-            </button>
-          </div>
-        )}
-
-        {/* STEP 5: 회의록 */}
-        {step===5 && minutes && (
-          <div>
-            <div style={{marginBottom:14}}>
-              <div style={{fontSize:17,fontWeight:800,color:"#f1f5f9",marginBottom:4}}>회의록 완성</div>
-            </div>
+            {/* 보고서 */}
             <div style={{
-              background:"rgba(248,250,252,0.97)",borderRadius:12,
-              color:"#1e293b",padding:"28px 32px",marginBottom:14,
+              background:"rgba(248,250,252,0.97)", borderRadius:12,
+              color:"#1e293b", padding:"28px 32px", marginBottom:14,
               boxShadow:"0 20px 60px rgba(0,0,0,0.5)",
               fontFamily:"'Noto Sans KR','Malgun Gothic',sans-serif",
             }}>
               <div style={{borderBottom:"3px solid #1d4ed8",paddingBottom:14,marginBottom:18}}>
-                <div style={{fontSize:9,letterSpacing:3,color:"#3b82f6",fontWeight:800,marginBottom:5}}>MEETING MINUTES</div>
-                <div style={{fontSize:18,fontWeight:900,color:"#0f172a",marginBottom:8}}>{minutes.title}</div>
+                <div style={{fontSize:9,letterSpacing:3,color:"#3b82f6",fontWeight:800,marginBottom:5}}>
+                  {REPORT_TYPES.find(r=>r.id===reportType)?.label.toUpperCase()}
+                </div>
+                <div style={{fontSize:18,fontWeight:900,color:"#0f172a",marginBottom:8}}>
+                  {minutes.title}
+                </div>
                 <div style={{display:"flex",gap:16,fontSize:11,color:"#64748b",flexWrap:"wrap"}}>
                   <span>📅 {minutes.date}</span>
                   <span>👥 {minutes.attendees}</span>
@@ -1071,7 +1043,7 @@ export default function App() {
                   <span style={{fontWeight:700}}>안건: </span>{minutes.agenda}
                 </div>
               </div>
-              {(minutes.sections||[]).map((sec,i)=>(
+              {(minutes.sections||[]).map((sec,i) => (
                 <div key={i} style={{marginBottom:16}}>
                   <div style={{
                     fontSize:11,fontWeight:800,color:"#1d4ed8",
@@ -1079,7 +1051,7 @@ export default function App() {
                     borderRadius:5,marginBottom:8,display:"inline-block",
                   }}>{sec.heading}</div>
                   <ul style={{margin:0,padding:0,listStyle:"none"}}>
-                    {(sec.items||[]).map((item,j)=>(
+                    {(sec.items||[]).map((item,j) => (
                       <li key={j} style={{
                         fontSize:12,color:"#334155",lineHeight:1.8,
                         paddingLeft:14,position:"relative",
@@ -1090,39 +1062,32 @@ export default function App() {
                   </ul>
                 </div>
               ))}
-              <div style={{borderTop:"1px solid #e2e8f0",paddingTop:10,marginTop:4,fontSize:10,color:"#94a3b8",textAlign:"right"}}>
-                AI 생성 회의록 · {new Date().toLocaleString("ko-KR")}
+              <div style={{
+                borderTop:"1px solid #e2e8f0",paddingTop:10,marginTop:4,
+                fontSize:10,color:"#94a3b8",textAlign:"right",
+              }}>
+                AI 생성 보고서 · {new Date().toLocaleString("ko-KR")}
               </div>
             </div>
+
             <div style={{display:"flex",gap:10,marginBottom:10}}>
               <button onClick={downloadTxt} style={{
-                flex:1,padding:"11px",
+                flex:1, padding:"11px",
                 background:"linear-gradient(135deg,#3b82f6,#22d3ee)",
-                border:"none",borderRadius:8,color:"#fff",fontSize:13,fontWeight:800,cursor:"pointer",
+                border:"none", borderRadius:8, color:"#fff",
+                fontSize:13, fontWeight:800, cursor:"pointer",
               }}>📥 TXT 다운로드</button>
-              <button onClick={()=>{setStep(1);setMinutes(null);setDiscussion(null);setReportType("meeting");}} style={{
-                flex:1,padding:"11px",background:"transparent",
-                border:"1.5px solid rgba(59,130,246,0.35)",borderRadius:8,
-                color:"#93c5fd",fontSize:13,fontWeight:800,cursor:"pointer",
-              }}>🔄 다른 날짜</button>
+              <button onClick={()=>{setStep(3);setMinutes(null);setIssueAnalyses([]);setProgress([]);}} style={{
+                flex:1, padding:"11px", background:"transparent",
+                border:"1.5px solid rgba(167,139,250,0.35)", borderRadius:8,
+                color:"#a78bfa", fontSize:13, fontWeight:800, cursor:"pointer",
+              }}>🔄 다시 분석</button>
             </div>
-            {sheetSaved ? (
-              <div style={{
-                padding:"10px 14px",background:"rgba(52,211,153,0.08)",
-                border:"1px solid rgba(52,211,153,0.25)",borderRadius:8,
-                fontSize:11,color:"#34d399",lineHeight:1.6,
-              }}>
-                ✅ 구글 시트에 자동 저장 완료 — Meeting_Minutes 탭에서 확인하세요
-              </div>
-            ) : (
-              <div style={{
-                padding:"10px 14px",background:"rgba(245,158,11,0.06)",
-                border:"1px solid rgba(245,158,11,0.2)",borderRadius:8,
-                fontSize:11,color:"#fbbf24",lineHeight:1.6,
-              }}>
-                ⏳ 구글 시트 저장 중... 잠시 후 확인하세요
-              </div>
-            )}
+            <button onClick={()=>{setStep(1);setMinutes(null);setIssueAnalyses([]);setProgress([]);setReportType("meeting");}} style={{
+              width:"100%", padding:"10px", background:"transparent",
+              border:"1.5px solid rgba(51,65,85,0.4)", borderRadius:8,
+              color:"#475569", fontSize:12, cursor:"pointer",
+            }}>← 날짜 다시 선택</button>
           </div>
         )}
       </div>

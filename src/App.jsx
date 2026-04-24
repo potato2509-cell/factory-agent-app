@@ -15,12 +15,26 @@ async function loadKnowledge(role) {
 }
 
 async function loadAllKnowledge() {
-  const [pe, me, te] = await Promise.all([
+  const results = await Promise.allSettled([
     loadKnowledge("Cell_PE"),
     loadKnowledge("Cell_ME"),
     loadKnowledge("Cell_TE"),
   ]);
-  return { pe, me, te };
+
+  const [peResult, meResult, teResult] = results;
+  const pe = peResult.status === "fulfilled" ? peResult.value : "";
+  const me = meResult.status === "fulfilled" ? meResult.value : "";
+  const te = teResult.status === "fulfilled" ? teResult.value : "";
+
+  // 로드 통계
+  const stats = {
+    pe: pe ? pe.split("\n").length : 0,
+    me: me ? me.split("\n").length : 0,
+    te: te ? te.split("\n").length : 0,
+    failed: results.filter(r => r.status === "rejected").length,
+  };
+
+  return { pe, me, te, stats };
 }
 
 async function saveToSheets(data) {
@@ -436,6 +450,7 @@ export default function App() {
   };
 
   const [priority, setPriority] = useState(null);
+  const [kbStats, setKbStats] = useState(null);
 
   const handleDateSelect = () => {
     const dayMsgs = allMsgs.filter(m => m.date === selDate);
@@ -457,7 +472,20 @@ export default function App() {
     let iss, pe, me, te, cons;
     try {
       setProgress(["학습 내용 로드 중..."]);
-      const kb = await loadAllKnowledge();
+      let kb;
+      try {
+        kb = await loadAllKnowledge();
+        setKbStats(kb.stats);
+        if (kb.stats.failed > 0) {
+          setProgress(p => [...p, `⚠️ 일부 학습 내용 로드 실패 (${kb.stats.failed}개 에이전트)`]);
+        } else {
+          setProgress(p => [...p, `✅ 학습 내용 로드 완료 (PE:${kb.stats.pe}건 ME:${kb.stats.me}건 TE:${kb.stats.te}건)`]);
+        }
+      } catch(e) {
+        kb = { pe:"", me:"", te:"", stats:{pe:0,me:0,te:0,failed:3} };
+        setKbStats(kb.stats);
+        setProgress(p => [...p, "⚠️ 학습 내용 로드 실패 — 기본 역할로 진행"]);
+      }
 
       setProgress(p => [...p, "이슈 분석 중..."]);
       iss = await fetchIssueSummary(shortSummary);
@@ -689,6 +717,23 @@ export default function App() {
               ))}
             </div>
 
+            {/* KB 로드 현황 */}
+            {kbStats && (
+              <div style={{
+                background: kbStats.failed > 0 ? "rgba(245,158,11,0.06)" : "rgba(52,211,153,0.06)",
+                border: `1px solid ${kbStats.failed > 0 ? "rgba(245,158,11,0.25)" : "rgba(52,211,153,0.25)"}`,
+                borderRadius:8, padding:"8px 12px", marginBottom:12,
+                fontSize:10, display:"flex", gap:16, alignItems:"center",
+              }}>
+                <span style={{color: kbStats.failed > 0 ? "#f59e0b" : "#34d399", fontWeight:800}}>
+                  {kbStats.failed > 0 ? "⚠️ 학습 내용 일부 로드 실패" : "✅ 학습 내용 로드 완료"}
+                </span>
+                <span style={{color:"#3b82f6"}}>Cell_PE: {kbStats.pe}건</span>
+                <span style={{color:"#f97316"}}>Cell_ME: {kbStats.me}건</span>
+                <span style={{color:"#22d3ee"}}>Cell_TE: {kbStats.te}건</span>
+              </div>
+            )}
+
             {/* 우선순위 요약 */}
             {priority && (
               <div style={{
@@ -783,7 +828,7 @@ export default function App() {
                 background:"rgba(15,23,42,0.7)",border:"1px solid rgba(51,65,85,0.3)",
                 borderRadius:10,padding:"14px 16px",marginBottom:14,
               }}>
-                {["학습 내용 로드 중...","이슈 분석 중...","Cell_PE 의견 생성 중...","Cell_ME 의견 생성 중...","Cell_TE 의견 생성 중...","합의점 도출 중..."].map((label,i)=>(
+                {["학습 내용 로드 중...","학습 내용 로드 완료","이슈 분석 중...","Cell_PE 의견 생성 중...","Cell_ME 의견 생성 중...","Cell_TE 의견 생성 중...","합의점 도출 중..."].map((label,i)=>(
                   <ProgressStep key={i} label={label}
                     done={progress.length > i+1 || (!running && progress.length > i)}
                     active={running && progress.length === i+1}

@@ -126,6 +126,14 @@ function safeParseJSON(raw) {
   catch (err) { throw new Error("파싱 실패: " + err.message + "\n원문: " + cleaned.slice(0, 200)); }
 }
 
+// ─── 보고서 종류 ─────────────────────────────────────────────────────────────
+const REPORT_TYPES = [
+  { id:"daily",   icon:"📋", label:"일일 생산 보고서",  desc:"당일 생산 실적·이슈·KPI 요약" },
+  { id:"meeting", icon:"🗂️", label:"회의록",           desc:"논의 내용·결정사항·액션아이템" },
+  { id:"defect",  icon:"⚠️", label:"불량/이슈 보고서", desc:"불량 내역·원인분석·대책 수립" },
+  { id:"weekly",  icon:"📊", label:"주간 요약 보고서",  desc:"주간 트렌드·개선 과제 정리" },
+];
+
 // ─── WhatsApp 파서 ────────────────────────────────────────────────────────────
 function parseWhatsApp(text) {
   const lines = text.split("\n");
@@ -320,39 +328,73 @@ async function fetchConsensus(issueSummary, pe, me, te) {
 }
 
 // Step F: 회의록
-async function fetchMinutesSection(prompt, sectionNum) {
-  const sysMap = {
-    1: `JSON만: {"heading":"1. 이슈 개요","items":["항목1(40자이내)","항목2(40자이내)","항목3(40자이내)"]}`,
-    2: `JSON만: {"heading":"2. 엔지니어별 분석","items":["PE: 내용(40자)","ME: 내용(40자)","TE: 내용(40자)"]}`,
-    3: `JSON만: {"heading":"3. 결정 사항","items":["결정1(40자)","결정2(40자)"]}`,
-    4: `JSON만: {"heading":"4. 액션 아이템","items":["PE: 액션(30자)","ME: 액션(30자)","TE: 액션(30자)"]}`,
-    5: `JSON만: {"heading":"5. 차기 일정","items":["일정내용(40자)"]}`,
-  };
-  const raw = await callClaudeRaw(sysMap[sectionNum], prompt);
+// 보고서 종류별 섹션 정의
+const REPORT_SECTIONS = {
+  daily: [
+    '{"heading":"1. 생산 현황 요약","items":["항목(40자이내)","항목","항목"]}',
+    '{"heading":"2. 주요 이슈 분석","items":["이슈1(40자)","이슈2(40자)","이슈3(40자)"]}',
+    '{"heading":"3. 엔지니어별 분석","items":["PE: 내용","ME: 내용","TE: 내용"]}',
+    '{"heading":"4. 조치 및 결정사항","items":["조치1(40자)","조치2(40자)"]}',
+    '{"heading":"5. 익일 계획","items":["계획1(40자)","계획2(40자)"]}',
+  ],
+  meeting: [
+    '{"heading":"1. 회의 개요","items":["항목(40자이내)","항목","항목"]}',
+    '{"heading":"2. 주요 논의 내용","items":["논의1(40자)","논의2(40자)","논의3(40자)"]}',
+    '{"heading":"3. 결정 사항","items":["결정1(40자)","결정2(40자)"]}',
+    '{"heading":"4. 담당자별 액션 아이템","items":["PE: 액션(30자)","ME: 액션(30자)","TE: 액션(30자)"]}',
+    '{"heading":"5. 차기 일정","items":["일정(40자)"]}',
+  ],
+  defect: [
+    '{"heading":"1. 불량/이슈 개요","items":["항목(40자이내)","항목","항목"]}',
+    '{"heading":"2. 불량 현황 및 분류","items":["불량1(40자)","불량2(40자)","불량3(40자)"]}',
+    '{"heading":"3. 원인 분석 (4M 기반)","items":["원인1(40자)","원인2(40자)","원인3(40자)"]}',
+    '{"heading":"4. 즉시 조치 사항","items":["조치1(40자)","조치2(40자)"]}',
+    '{"heading":"5. 재발 방지 대책","items":["대책1(40자)","대책2(40자)"]}',
+  ],
+  weekly: [
+    '{"heading":"1. 주간 생산 실적 요약","items":["항목(40자이내)","항목","항목"]}',
+    '{"heading":"2. 주요 이슈 및 조치","items":["이슈1(40자)","이슈2(40자)","이슈3(40자)"]}',
+    '{"heading":"3. KPI 달성 현황","items":["KPI1(40자)","KPI2(40자)"]}',
+    '{"heading":"4. 개선 과제","items":["과제1(40자)","과제2(40자)"]}',
+    '{"heading":"5. 차주 계획","items":["계획1(40자)","계획2(40자)"]}',
+  ],
+};
+
+const REPORT_TITLES = {
+  daily:   "일일 생산 보고서",
+  meeting: "회의록",
+  defect:  "불량/이슈 보고서",
+  weekly:  "주간 요약 보고서",
+};
+
+async function fetchMinutesSection(prompt, sectionTemplate, reportType) {
+  const sys = `AZS 배터리 공장 ${reportType} 작성. 한국어. JSON만 출력: ${sectionTemplate}`;
+  const raw = await callClaudeRaw(sys, prompt);
   return safeParseJSON(raw);
 }
 
-async function fetchMinutes(date, shortSummary, issueSummary, pe, me, te, consensus) {
+async function fetchMinutes(date, shortSummary, issueSummary, pe, me, te, consensus, reportType="meeting") {
   const ctx = `날짜:${date} | 이슈:${issueSummary} | PE:${pe.msg}/${pe.action} | ME:${me.msg}/${me.action} | TE:${te.msg}/${te.action}`;
-  
-  // 섹션을 하나씩 생성
+  const templates = REPORT_SECTIONS[reportType] || REPORT_SECTIONS.meeting;
+  const headings = ["1.","2.","3.","4.","5."];
+
   const sections = [];
-  for (let i = 1; i <= 5; i++) {
+  for (let i = 0; i < 5; i++) {
     try {
-      const sec = await fetchMinutesSection(ctx, i);
+      await new Promise(r => setTimeout(r, 500));
+      const sec = await fetchMinutesSection(ctx, templates[i], REPORT_TITLES[reportType]);
       sections.push(sec);
     } catch {
-      // 실패한 섹션은 기본값
-      const headings = ["1. 이슈 개요","2. 엔지니어별 분석","3. 결정 사항","4. 액션 아이템","5. 차기 일정"];
-      sections.push({ heading: headings[i-1], items: ["-"] });
+      sections.push({ heading: headings[i], items: ["-"] });
     }
   }
-  
+
+  const dtCount = shortSummary.match(/다운타임: (\d+)건/)?.[1] || "";
   return {
-    title: `${date} 생산 현황 회의록`,
+    title: `${date} ${REPORT_TITLES[reportType]}`,
     date,
-    attendees: "PE(생산 엔지니어), ME(설비 엔지니어), TE(기술 엔지니어)",
-    agenda: `${date} 다운타임 ${shortSummary.match(/다운타임: (\d+)건/)?.[1]||""}건 분석 및 대책`,
+    attendees: "Cell_PE(생산), Cell_ME(설비), Cell_TE(기술)",
+    agenda: `${date} 다운타임 ${dtCount}건 분석 및 대책`,
     sections,
   };
 }
@@ -451,6 +493,7 @@ export default function App() {
 
   const [priority, setPriority] = useState(null);
   const [kbStats, setKbStats] = useState(null);
+  const [reportType, setReportType] = useState("meeting");
 
   const handleDateSelect = () => {
     const dayMsgs = allMsgs.filter(m => m.date === selDate);
@@ -531,7 +574,7 @@ export default function App() {
     try {
       const mins = await fetchMinutes(
         selDate, shortSummary, issueSummary.issue_summary,
-        peView, meView, teView, consensus
+        peView, meView, teView, consensus, reportType
       );
       setMinutes(mins);
       setStep(4);

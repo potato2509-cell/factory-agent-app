@@ -288,10 +288,20 @@ async function fetchIssueSummary(shortSummary) {
   return safeParseJSON(raw);
 }
 
+// 보고서별 논의 포인트
+const REPORT_FOCUS = {
+  daily:   "오늘 생산 실적·이슈 전반을 검토하고 내일 계획을 수립하는 관점으로",
+  meeting: "결정사항과 액션아이템 도출에 집중하는 관점으로",
+  defect:  "불량 원인 파악·4M 분석·재발 방지 대책 수립에 집중하는 관점으로",
+  weekly:  "주간 트렌드·KPI 달성 현황·개선 과제 도출에 집중하는 관점으로",
+};
+
 // Step B: Cell_PE 의견
-async function fetchPEView(shortSummary, issueSummary, peKB="") {
+async function fetchPEView(shortSummary, issueSummary, peKB="", reportType="meeting") {
   const kbText = peKB ? `\n\n[Cell_PE 학습 내용]\n${peKB}` : "";
+  const focus = REPORT_FOCUS[reportType] || REPORT_FOCUS.meeting;
   const sys = `당신은 AZS 배터리 공장 Cell 라인 생산 엔지니어(Cell_PE). 한국어로 답변.${kbText}
+${focus} 의견을 제시하세요.
 JSON만 출력: {"msg":"생산 관점 의견 (60자이내)","action":"Cell_PE 할 일 (30자이내)"}`;
   const raw = await callClaudeRaw(sys,
     `이슈: ${issueSummary}\n현장: ${shortSummary}\nCell_PE 관점으로 의견과 액션 아이템을 제시하세요.`);
@@ -299,9 +309,11 @@ JSON만 출력: {"msg":"생산 관점 의견 (60자이내)","action":"Cell_PE �
 }
 
 // Step C: Cell_ME 의견
-async function fetchMEView(shortSummary, issueSummary, meKB="") {
+async function fetchMEView(shortSummary, issueSummary, meKB="", reportType="meeting") {
   const kbText = meKB ? `\n\n[Cell_ME 학습 내용]\n${meKB}` : "";
+  const focus = REPORT_FOCUS[reportType] || REPORT_FOCUS.meeting;
   const sys = `당신은 AZS 배터리 공장 Cell 라인 설비 엔지니어(Cell_ME). 한국어로 답변.${kbText}
+${focus} 의견을 제시하세요.
 JSON만 출력: {"msg":"설비 관점 의견 (60자이내)","action":"Cell_ME 할 일 (30자이내)"}`;
   const raw = await callClaudeRaw(sys,
     `이슈: ${issueSummary}\n현장: ${shortSummary}\nCell_ME 관점으로 의견과 액션 아이템을 제시하세요.`);
@@ -309,9 +321,11 @@ JSON만 출력: {"msg":"설비 관점 의견 (60자이내)","action":"Cell_ME �
 }
 
 // Step D: Cell_TE 의견
-async function fetchTEView(shortSummary, issueSummary, teKB="") {
+async function fetchTEView(shortSummary, issueSummary, teKB="", reportType="meeting") {
   const kbText = teKB ? `\n\n[Cell_TE 학습 내용]\n${teKB}` : "";
+  const focus = REPORT_FOCUS[reportType] || REPORT_FOCUS.meeting;
   const sys = `당신은 AZS 배터리 공장 Cell 라인 기술 엔지니어(Cell_TE). 한국어로 답변.${kbText}
+${focus} 의견을 제시하세요.
 JSON만 출력: {"msg":"기술 관점 의견 (60자이내)","action":"Cell_TE 할 일 (30자이내)"}`;
   const raw = await callClaudeRaw(sys,
     `이슈: ${issueSummary}\n현장: ${shortSummary}\nCell_TE 관점으로 의견과 액션 아이템을 제시하세요.`);
@@ -503,7 +517,7 @@ export default function App() {
     setClassified(cl);
     setShortSummary(sm);
     setPriority(pri);
-    setStep(2);
+    setStep(2);  // 보고서 선택 단계로
     setError("");
     setIssueSummary(null); setPeView(null); setMeView(null);
     setTeView(null); setConsensus(null); setMinutes(null);
@@ -535,17 +549,17 @@ export default function App() {
       setIssueSummary(iss);
 
       setProgress(p => [...p, "Cell_PE 의견 생성 중..."]);
-      pe = await fetchPEView(shortSummary, iss.issue_summary, kb.pe);
+      pe = await fetchPEView(shortSummary, iss.issue_summary, kb.pe, reportType);
       setPeView(pe);
       await new Promise(r => setTimeout(r, 1000));
 
       setProgress(p => [...p, "Cell_ME 의견 생성 중..."]);
-      me = await fetchMEView(shortSummary, iss.issue_summary, kb.me);
+      me = await fetchMEView(shortSummary, iss.issue_summary, kb.me, reportType);
       setMeView(me);
       await new Promise(r => setTimeout(r, 1000));
 
       setProgress(p => [...p, "Cell_TE 의견 생성 중..."]);
-      te = await fetchTEView(shortSummary, iss.issue_summary, kb.te);
+      te = await fetchTEView(shortSummary, iss.issue_summary, kb.te, reportType);
       setTeView(te);
       await new Promise(r => setTimeout(r, 1000));
 
@@ -562,7 +576,7 @@ export default function App() {
         };
       }
       setConsensus(cons);
-      setStep(3);
+      setStep(4);
     } catch(e) { setError(e.message); }
     finally { setRunning(false); }
   };
@@ -577,7 +591,7 @@ export default function App() {
         peView, meView, teView, consensus, reportType
       );
       setMinutes(mins);
-      setStep(4);
+      setStep(5);
 
       // 구글 시트 자동 저장
       const discussion_text = [
@@ -630,7 +644,7 @@ export default function App() {
     }).click();
   };
 
-  const STEPS = ["① 업로드","② 날짜","③ 논의","④ 회의록"];
+  const STEPS = ["① 업로드","② 날짜","③ 보고서 선택","④ 이슈 확인","⑤ 논의","⑥ 문서 생성"];
 
   return (
     <div style={{
@@ -735,8 +749,66 @@ export default function App() {
           </div>
         )}
 
-        {/* STEP 2: 이슈 확인 + 논의 */}
-        {step===2 && classified && (
+        {/* STEP 2: 보고서 종류 선택 */}
+        {step===2 && (
+          <div>
+            <div style={{ marginBottom:20 }}>
+              <div style={{fontSize:17,fontWeight:800,color:"#f1f5f9",marginBottom:4}}>
+                어떤 문서를 만들까요?
+              </div>
+              <div style={{fontSize:12,color:"#475569"}}>
+                선택한 보고서 종류에 맞게 AI가 논의를 진행합니다
+              </div>
+            </div>
+
+            <div style={{display:"grid",gridTemplateColumns:"1fr 1fr",gap:12,marginBottom:24}}>
+              {REPORT_TYPES.map(rt => (
+                <button key={rt.id} onClick={() => setReportType(rt.id)} style={{
+                  padding:"18px 16px", textAlign:"left",
+                  background: reportType===rt.id
+                    ? "rgba(167,139,250,0.15)" : "rgba(20,30,50,0.7)",
+                  border:`2px solid ${reportType===rt.id ? "#a78bfa" : "rgba(51,65,85,0.5)"}`,
+                  borderRadius:12,
+                  color: reportType===rt.id ? "#a78bfa" : "#64748b",
+                  cursor:"pointer", transition:"all 0.2s",
+                  transform: reportType===rt.id ? "translateY(-2px)" : "none",
+                  boxShadow: reportType===rt.id ? "0 8px 24px rgba(167,139,250,0.15)" : "none",
+                }}>
+                  <div style={{fontSize:28,marginBottom:8}}>{rt.icon}</div>
+                  <div style={{fontSize:13,fontWeight:800,marginBottom:4}}>{rt.label}</div>
+                  <div style={{fontSize:10,opacity:0.7,lineHeight:1.5}}>{rt.desc}</div>
+                </button>
+              ))}
+            </div>
+
+            <div style={{
+              background:"rgba(167,139,250,0.06)",
+              border:"1px solid rgba(167,139,250,0.2)",
+              borderRadius:10, padding:"12px 16px", marginBottom:20,
+              fontSize:11, color:"#a78bfa",
+            }}>
+              선택됨: {REPORT_TYPES.find(r=>r.id===reportType)?.icon} {REPORT_TYPES.find(r=>r.id===reportType)?.label}
+            </div>
+
+            <div style={{display:"flex",gap:10}}>
+              <button onClick={()=>setStep(1)} style={{
+                flex:1, padding:"11px",
+                background:"transparent",
+                border:"1.5px solid rgba(51,65,85,0.4)",
+                borderRadius:8, color:"#475569", fontSize:13, cursor:"pointer",
+              }}>← 날짜 선택</button>
+              <button onClick={()=>setStep(3)} style={{
+                flex:3, padding:"11px",
+                background:"linear-gradient(135deg,#a78bfa,#7c3aed)",
+                border:"none", borderRadius:8,
+                color:"#fff", fontSize:13, fontWeight:800, cursor:"pointer",
+              }}>이슈 확인 →</button>
+            </div>
+          </div>
+        )}
+
+        {/* STEP 3: 이슈 확인 + 논의 */}
+        {step===3 && classified && (
           <div>
             <div style={{marginBottom:16}}>
               <div style={{fontSize:17,fontWeight:800,color:"#f1f5f9",marginBottom:4}}>{selDate} 이슈 현황</div>
@@ -901,8 +973,8 @@ export default function App() {
           </div>
         )}
 
-        {/* STEP 3: 논의 결과 */}
-        {step===3 && peView && meView && teView && consensus && (
+        {/* STEP 4: 논의 결과 */}
+        {step===4 && peView && meView && teView && consensus && (
           <div>
             <div style={{marginBottom:14}}>
               <div style={{fontSize:17,fontWeight:800,color:"#f1f5f9",marginBottom:8}}>엔지니어 논의</div>
@@ -976,8 +1048,8 @@ export default function App() {
           </div>
         )}
 
-        {/* STEP 4: 회의록 */}
-        {step===4 && minutes && (
+        {/* STEP 5: 회의록 */}
+        {step===5 && minutes && (
           <div>
             <div style={{marginBottom:14}}>
               <div style={{fontSize:17,fontWeight:800,color:"#f1f5f9",marginBottom:4}}>회의록 완성</div>
@@ -1028,7 +1100,7 @@ export default function App() {
                 background:"linear-gradient(135deg,#3b82f6,#22d3ee)",
                 border:"none",borderRadius:8,color:"#fff",fontSize:13,fontWeight:800,cursor:"pointer",
               }}>📥 TXT 다운로드</button>
-              <button onClick={()=>{setStep(1);setMinutes(null);setDiscussion(null);}} style={{
+              <button onClick={()=>{setStep(1);setMinutes(null);setDiscussion(null);setReportType("meeting");}} style={{
                 flex:1,padding:"11px",background:"transparent",
                 border:"1.5px solid rgba(59,130,246,0.35)",borderRadius:8,
                 color:"#93c5fd",fontSize:13,fontWeight:800,cursor:"pointer",

@@ -172,6 +172,50 @@ function classifyMessages(msgs) {
   return { downtime, equipment, general };
 }
 
+// 우선순위 분류 함수
+function classifyPriority(downtime) {
+  const urgent = [], important = [], normal = [];
+  
+  // 같은 설비 반복 카운트
+  const equipCount = {};
+  // 같은 부품 반복 카운트
+  const partCount = {};
+  
+  downtime.forEach(d => {
+    const eq = extractField(d.text, "Equipment");
+    const part = extractField(d.text, "Part Replacement");
+    if (eq) equipCount[eq] = (equipCount[eq] || 0) + 1;
+    if (part && part !== "-" && part.length > 2) {
+      partCount[part] = (partCount[part] || 0) + 1;
+    }
+  });
+
+  downtime.forEach(d => {
+    const result = extractField(d.text, "Result").toLowerCase();
+    const durStr = extractField(d.text, "Duration");
+    const durMin = parseInt(durStr) || 0;
+    const stopStatus = extractField(d.text, "Stop Status").toLowerCase();
+    const eq = extractField(d.text, "Equipment");
+    const part = extractField(d.text, "Part Replacement");
+
+    const isUnsolved = result.includes("not solved") || result.includes("unsolved") || result === "";
+    const isLong = durMin >= 60;
+    const isRepeat = eq && equipCount[eq] >= 2;
+    const isFullStop = stopStatus.includes("full_stop");
+    const isRepeatPart = part && part !== "-" && part.length > 2 && partCount[part] >= 2;
+
+    if (isUnsolved || isLong) {
+      urgent.push({ ...d, reasons: [isUnsolved && "미해결", isLong && `${durMin}분 이상`].filter(Boolean) });
+    } else if (isRepeat || isFullStop || isRepeatPart) {
+      important.push({ ...d, reasons: [isRepeat && "반복 고장", isFullStop && "완전 정지", isRepeatPart && "부품 반복 교체"].filter(Boolean) });
+    } else {
+      normal.push(d);
+    }
+  });
+
+  return { urgent, important, normal };
+}
+
 // 핵심 이슈만 짧게 추출 - *bold* 형식 처리
 function extractField(text, fieldName) {
   const re = new RegExp(String.raw`\*?${fieldName}\*?[:\s]+\*?\n?-?\s*([^\n]+)`, "i");
@@ -180,16 +224,19 @@ function extractField(text, fieldName) {
 
 function buildShortSummary(date, classified) {
   const { downtime, equipment } = classified;
+  const pri = classifyPriority(downtime);
   let s = `날짜: ${date}\n`;
-  s += `다운타임: ${downtime.length}건, 설비경고: ${equipment.length}건\n\n`;
+  s += `다운타임: ${downtime.length}건 (긴급:${pri.urgent.length} 중요:${pri.important.length} 일반:${pri.normal.length}), 설비경고: ${equipment.length}건\n\n`;
 
-  downtime.slice(0, 5).forEach((d, i) => {
+  // 긴급 이슈 먼저
+  [...pri.urgent, ...pri.important].slice(0, 5).forEach((d, i) => {
     const eq   = extractField(d.text, "Equipment");
     const dur  = extractField(d.text, "Duration");
     const prob = extractField(d.text, "Problem");
     const cause= extractField(d.text, "Cause");
     const pic  = extractField(d.text, "PIC");
-    s += `[다운타임${i+1}] 설비:${eq} / ${dur} / 문제:${prob} / 원인:${cause} / 담당:${pic}\n`;
+    const tag  = pri.urgent.includes(d) ? "[긴급]" : "[중요]";
+    s += `${tag} 설비:${eq} / ${dur} / 문제:${prob} / 원인:${cause} / 담당:${pic}\n`;
   });
 
   equipment.slice(0, 3).forEach((e, i) => {
@@ -388,12 +435,16 @@ export default function App() {
     setStep(1);
   };
 
+  const [priority, setPriority] = useState(null);
+
   const handleDateSelect = () => {
     const dayMsgs = allMsgs.filter(m => m.date === selDate);
     const cl = classifyMessages(dayMsgs);
     const sm = buildShortSummary(selDate, cl);
+    const pri = classifyPriority(cl.downtime);
     setClassified(cl);
     setShortSummary(sm);
+    setPriority(pri);
     setStep(2);
     setError("");
     setIssueSummary(null); setPeView(null); setMeView(null);
@@ -638,24 +689,91 @@ export default function App() {
               ))}
             </div>
 
-            {/* 다운타임 상위 3건 */}
-            {classified.downtime.slice(0,3).map((d,i)=>{
-              const eq = extractField(d.text,"Equipment");
-              const prob = extractField(d.text,"Problem");
-              const dur = extractField(d.text,"Duration");
-              return (
-                <div key={i} style={{
-                  background:"rgba(239,68,68,0.05)",border:"1px solid rgba(239,68,68,0.2)",
-                  borderRadius:8,padding:"10px 12px",marginBottom:8,fontSize:11,
-                }}>
-                  <span style={{color:"#ef4444",fontWeight:800}}>⚡ [{d.time}] {eq}</span>
-                  <span style={{color:"#94a3b8"}}> · {dur} · {prob}</span>
+            {/* 우선순위 요약 */}
+            {priority && (
+              <div style={{
+                display:"flex", gap:10, marginBottom:14,
+              }}>
+                {[
+                  {label:"🔴 긴급", count:priority.urgent.length, color:"#ef4444", bg:"rgba(239,68,68,0.08)", border:"rgba(239,68,68,0.25)"},
+                  {label:"🟡 중요", count:priority.important.length, color:"#f59e0b", bg:"rgba(245,158,11,0.08)", border:"rgba(245,158,11,0.25)"},
+                  {label:"🟢 일반", count:priority.normal.length, color:"#22c55e", bg:"rgba(34,197,94,0.08)", border:"rgba(34,197,94,0.25)"},
+                ].map(p => (
+                  <div key={p.label} style={{
+                    flex:1, background:p.bg, border:`1px solid ${p.border}`,
+                    borderRadius:8, padding:"10px", textAlign:"center",
+                  }}>
+                    <div style={{fontSize:18, fontWeight:800, color:p.color}}>{p.count}</div>
+                    <div style={{fontSize:10, color:p.color, fontWeight:700}}>{p.label}</div>
+                  </div>
+                ))}
+              </div>
+            )}
+
+            {/* 긴급 이슈 */}
+            {priority && priority.urgent.length > 0 && (
+              <div style={{
+                background:"rgba(239,68,68,0.05)", border:"1px solid rgba(239,68,68,0.25)",
+                borderRadius:10, padding:"12px 14px", marginBottom:10,
+              }}>
+                <div style={{fontSize:10, color:"#ef4444", fontWeight:800, marginBottom:8}}>
+                  🔴 긴급 이슈 ({priority.urgent.length}건) — 논의 최우선
                 </div>
-              );
-            })}
-            {classified.downtime.length > 3 && (
-              <div style={{fontSize:11,color:"#374151",marginBottom:12}}>
-                외 {classified.downtime.length-3}건 추가
+                {priority.urgent.map((d,i) => {
+                  const eq = extractField(d.text,"Equipment");
+                  const dur = extractField(d.text,"Duration");
+                  const prob = extractField(d.text,"Problem");
+                  return (
+                    <div key={i} style={{fontSize:11, color:"#fca5a5", marginBottom:5}}>
+                      <span style={{color:"#ef4444", fontWeight:700}}>[{d.time}] {eq}</span>
+                      <span style={{color:"#94a3b8"}}> · {dur} · {prob}</span>
+                      <span style={{color:"#ef4444", fontSize:9, marginLeft:6}}>
+                        ({d.reasons?.join(", ")})
+                      </span>
+                    </div>
+                  );
+                })}
+              </div>
+            )}
+
+            {/* 중요 이슈 */}
+            {priority && priority.important.length > 0 && (
+              <div style={{
+                background:"rgba(245,158,11,0.05)", border:"1px solid rgba(245,158,11,0.2)",
+                borderRadius:10, padding:"12px 14px", marginBottom:10,
+              }}>
+                <div style={{fontSize:10, color:"#f59e0b", fontWeight:800, marginBottom:8}}>
+                  🟡 중요 이슈 ({priority.important.length}건) — 오늘 중 처리
+                </div>
+                {priority.important.slice(0,3).map((d,i) => {
+                  const eq = extractField(d.text,"Equipment");
+                  const dur = extractField(d.text,"Duration");
+                  const prob = extractField(d.text,"Problem");
+                  return (
+                    <div key={i} style={{fontSize:11, color:"#fcd34d", marginBottom:5}}>
+                      <span style={{color:"#f59e0b", fontWeight:700}}>[{d.time}] {eq}</span>
+                      <span style={{color:"#94a3b8"}}> · {dur} · {prob}</span>
+                      <span style={{color:"#f59e0b", fontSize:9, marginLeft:6}}>
+                        ({d.reasons?.join(", ")})
+                      </span>
+                    </div>
+                  );
+                })}
+                {priority.important.length > 3 && (
+                  <div style={{fontSize:10, color:"#78716c"}}>외 {priority.important.length-3}건</div>
+                )}
+              </div>
+            )}
+
+            {/* 일반 이슈 */}
+            {priority && priority.normal.length > 0 && (
+              <div style={{
+                background:"rgba(34,197,94,0.03)", border:"1px solid rgba(34,197,94,0.15)",
+                borderRadius:10, padding:"10px 14px", marginBottom:10,
+              }}>
+                <div style={{fontSize:10, color:"#22c55e", fontWeight:800}}>
+                  🟢 일반 이슈 ({priority.normal.length}건) — 모니터링
+                </div>
               </div>
             )}
 

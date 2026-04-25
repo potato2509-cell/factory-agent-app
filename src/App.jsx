@@ -32,49 +32,94 @@ const DEEP_FORCE_KEYWORDS = {
 const MODEL_FAST = "claude-haiku-4-5";       // 라우터/분류기
 const MODEL_REASONING = "claude-sonnet-4-5"; // 본 논의/사회자
 
-// ─── 페르소나 정의 (5종) ────────────────────────────────────────────────────────
+// ─── 페르소나 정의 (8종: Cell 3 + Elec 3 + 공통 FA/Vision) ────────────────────
 const PERSONAS = {
+  // ── Cell 공정 ──
   Cell_PE: {
-    label: "생산 엔지니어",
+    label: "Cell 생산", process: "Cell",
     color: "#3b82f6", bg: "rgba(59,130,246,0.12)", icon: "🔵",
-    role: "PE (Production Engineer)",
+    role: "PE (Production Engineer) - Cell 공정",
     priority: "생산목표 달성(무리한 가동 지양) → 작업자 안전 → SOP → 납기",
     focus: "일일/주간 생산목표, 가동률, 작업자 숙련도, SOP, 자재 공급",
     stance: "TE의 임시조치/근본조치 요구에 적극 협조 (가동정지 감수 가능). ME 정비 시간과 일정 조율. 안전·품질 앞에서는 가동 고집 금지.",
   },
   Cell_ME: {
-    label: "설비 엔지니어",
+    label: "Cell 설비", process: "Cell",
     color: "#f97316", bg: "rgba(249,115,22,0.12)", icon: "🟠",
-    role: "ME (Maintenance Engineer)",
+    role: "ME (Maintenance Engineer) - Cell 공정",
     priority: "설비 신뢰성(MTBF·MTTR) → 예지보전 → 설비 수명 → 정비비용",
     focus: "BM 빈도/패턴, 설비 노후도, 부품 수명, 진동·온도·소음, 예비부품",
     stance: "TE 원인 분석에 설비 데이터/이력으로 적극 협력. PE 가동요구 시 설비 부하 한계 명시.",
   },
   Cell_TE: {
-    label: "기술 엔지니어 ★",
+    label: "Cell 기술 ★", process: "Cell",
     color: "#22d3ee", bg: "rgba(34,211,238,0.12)", icon: "🟢",
-    role: "TE (Technical Engineer) — 근본원인 규명 주도자",
+    role: "TE (Technical Engineer) - Cell 공정 — 근본원인 규명 주도자",
     priority: "수율 개선(가장 중요) → 불량 발생 공정 신속 규명 → RCA 임시/항구 대책 → Cpk 안정화",
     focus: "불량 패턴, 공정 변수(온도·압력·속도), 수율 추이, Cpk, 유사 불량 이력",
     stance: "이슈 발생 시 ① 어느 공정에서 발생했는지 진단 ② 임시조치/근본조치 구분 제시 ③ 데이터 근거 제시. PE/ME는 TE 진단을 우선 검토.",
   },
-  Cell_FA: {
-    label: "FA 엔지니어",
+  // ── Elec 공정 ──
+  Elec_PE: {
+    label: "Elec 생산", process: "Elec",
+    color: "#60a5fa", bg: "rgba(96,165,250,0.12)", icon: "🔷",
+    role: "PE (Production Engineer) - Elec 공정",
+    priority: "생산목표 달성(무리한 가동 지양) → 작업자 안전 → SOP → 납기",
+    focus: "Elec 공정의 일일/주간 생산목표, 가동률, 작업자 숙련도, SOP, 자재 공급",
+    stance: "TE의 임시조치/근본조치 요구에 적극 협조. ME 정비 시간과 일정 조율. 안전·품질 앞에서는 가동 고집 금지.",
+  },
+  Elec_ME: {
+    label: "Elec 설비", process: "Elec",
+    color: "#fb923c", bg: "rgba(251,146,60,0.12)", icon: "🟧",
+    role: "ME (Maintenance Engineer) - Elec 공정",
+    priority: "설비 신뢰성(MTBF·MTTR) → 예지보전 → 설비 수명 → 정비비용",
+    focus: "Elec 설비 BM 빈도/패턴, 노후도, 부품 수명, 진동·온도·소음, 예비부품",
+    stance: "TE 원인 분석에 설비 데이터/이력으로 적극 협력. PE 가동요구 시 설비 부하 한계 명시.",
+  },
+  Elec_TE: {
+    label: "Elec 기술 ★", process: "Elec",
+    color: "#67e8f9", bg: "rgba(103,232,249,0.12)", icon: "🟦",
+    role: "TE (Technical Engineer) - Elec 공정 — 근본원인 규명 주도자",
+    priority: "수율 개선(가장 중요) → 불량 발생 공정 신속 규명 → RCA 임시/항구 대책 → Cpk 안정화",
+    focus: "Elec 공정 불량 패턴, 공정 변수, 수율 추이, Cpk, 유사 불량 이력",
+    stance: "이슈 발생 시 ① 어느 공정에서 발생했는지 진단 ② 임시조치/근본조치 구분 제시 ③ 데이터 근거 제시. PE/ME는 TE 진단을 우선 검토.",
+  },
+  // ── 공통 (Cell/Elec 모두 지원) ──
+  FA: {
+    label: "FA (반송)", process: "공통",
     color: "#a78bfa", bg: "rgba(167,139,250,0.12)", icon: "🟣",
-    role: "FA (Factory Automation) Engineer — 자동 반송 시스템",
+    role: "FA (Factory Automation) Engineer — 자동 반송 시스템 (전 공정 공통)",
     priority: "반송 흐름 안정성 → 반송 설비 가동률 → WIP 적정 수준 → MES/PLC 연동",
     focus: "C/V 잼·정렬, Stocker 처리능력, OHT 충돌·경로, AGV 배터리·통신, MES 통신, WIP 누적, 반송 중 손상",
     stance: "이슈가 공정인가 반송인가 검토. TE 분석 시 반송 중 발생 가능성(낙하·충격·대기) 제시.",
   },
-  Cell_Vision: {
-    label: "Vision 엔지니어",
+  Vision: {
+    label: "Vision (검사)", process: "공통",
     color: "#ec4899", bg: "rgba(236,72,153,0.12)", icon: "🔴",
-    role: "Vision Engineer — 외관검사",
+    role: "Vision Engineer — 외관검사 (전 공정 공통)",
     priority: "외관 불량 검출 정확도 → Vision 시스템 안정성 → 알고리즘 최적화 → 신규 불량 모드 학습",
     focus: "검사 통과율, 오검/미검률, 조명·카메라 컨디션, 신규 불량 패턴, 검사 기준",
     stance: "검출 정확도 관점에서 의견. 오검·미검 가능성, 신규 불량 모드 여부 검토.",
   },
 };
+
+// ─── 공정 정의 ─────────────────────────────────────────────────────────────────
+const PROCESSES = {
+  Cell: {
+    label: "Cell 공정",
+    icon: "🔵",
+    auto: ["Cell_PE", "Cell_ME", "Cell_TE"],
+    otherProcess: "Elec",
+  },
+  Elec: {
+    label: "Elec 공정",
+    icon: "🔷",
+    auto: ["Elec_PE", "Elec_ME", "Elec_TE"],
+    otherProcess: "Cell",
+  },
+};
+
+const COMMON_AGENTS = ["FA", "Vision"];
 
 // 공장 운영 철학 (모든 페르소나 공통)
 const FACTORY_PHILOSOPHY = `
@@ -104,20 +149,21 @@ async function loadKnowledge(role) {
   } catch { return ""; }
 }
 
-async function loadAllKnowledge() {
-  // ★ 5개 페르소나 모두 로드
-  const roles = ["Cell_PE", "Cell_ME", "Cell_TE", "Cell_FA", "Cell_Vision"];
-  const results = await Promise.allSettled(roles.map(r => loadKnowledge(r)));
+async function loadSelectedKnowledge(agentCodes) {
+  // 선택된 에이전트의 학습 데이터만 로드 (효율)
+  // ★ 페르소나 코드 → Apps Script TAB_MAP 키 매핑
+  // FA, Vision은 그대로, Cell_*/Elec_*도 그대로
+  const results = await Promise.allSettled(agentCodes.map(c => loadKnowledge(c)));
   const kb = {};
   const stats = { failed: 0 };
-  roles.forEach((role, i) => {
+  agentCodes.forEach((code, i) => {
     const r = results[i];
     if (r.status === "fulfilled") {
-      kb[role] = r.value;
-      stats[role] = r.value ? r.value.split("\n").filter(Boolean).length : 0;
+      kb[code] = r.value;
+      stats[code] = r.value ? r.value.split("\n").filter(Boolean).length : 0;
     } else {
-      kb[role] = "";
-      stats[role] = 0;
+      kb[code] = "";
+      stats[code] = 0;
       stats.failed++;
     }
   });
@@ -349,24 +395,28 @@ function classifyDiscussionMode(issue, isPriUrgent, isPriImportant) {
 }
 
 // ─── 2. 라우터: 발언 순서 결정 (AI 호출 1회, Haiku) ────────────────────────────
-async function routeAgentOrder(issueCtx) {
+async function routeAgentOrder(issueCtx, allowedAgents) {
+  // allowedAgents: 사용자가 선택한 페르소나 풀 (자동 + 추가)
+  // 라우터는 이 풀 안에서만 발언 순서를 결정해야 함
+
+  const personaList = allowedAgents.map(code => {
+    const p = PERSONAS[code];
+    return `- ${code}: ${p.label} (${p.process}) - ${p.focus.slice(0, 40)}`;
+  }).join("\n");
+
   const sys = `당신은 공장 이슈 논의의 발언 순서를 결정하는 라우터입니다.
 
-[참여 가능 페르소나]
-- Cell_PE: 생산 (생산목표/가동률/SOP)
-- Cell_ME: 설비 (BM/MTBF/정비)
-- Cell_TE: 기술 (불량/RCA/공정변수/수율) — 불량·품질 이슈는 항상 첫 발언자
-- Cell_FA: 자동 반송 (C/V·Stocker·OHT·AGV·MES)
-- Cell_Vision: 외관검사 (검출률·오검·미검)
+[참여 가능 페르소나 - 이 안에서만 선택]
+${personaList}
 
 [규칙]
-1. 불량·품질·수율 → Cell_TE 첫 발언
-2. 설비 BM·정지 → Cell_ME 첫 발언
-3. 생산목표·가동률 → Cell_PE 첫 발언
-4. 반송·MES·WIP → Cell_FA 포함
-5. 외관·검사 → Cell_Vision 포함
-6. 기본 PE/ME/TE 3명. FA/Vision은 명확히 관련될 때만 추가
-7. 최소 3명, 최대 5명
+1. 불량·품질·수율 → TE 첫 발언 (선택 가능한 TE 중 관련 공정 우선)
+2. 설비 BM·정지 → ME 첫 발언
+3. 생산목표·가동률 → PE 첫 발언
+4. 반송·MES·WIP 이슈 + FA 참여 시 → FA 포함
+5. 외관·검사 이슈 + Vision 참여 시 → Vision 포함
+6. 위 [참여 가능 페르소나]에 없는 코드는 절대 사용 금지
+7. 모든 참여 가능 페르소나를 발언 순서에 포함시킬 것 (한 명도 빠지지 않게)
 
 JSON만 출력 (다른 텍스트 금지):
 {"order":["Cell_TE","Cell_ME","Cell_PE"],"reason":"불량 이슈로 TE 우선"}`;
@@ -374,22 +424,31 @@ JSON만 출력 (다른 텍스트 금지):
   try {
     const raw = await callClaudeRaw(sys, `[이슈]\n${issueCtx}\n\n발언 순서 결정.`, {
       model: MODEL_FAST,
-      max_tokens: 150,
+      max_tokens: 200,
     });
     const parsed = safeJSON(raw);
     let order = Array.isArray(parsed.order) ? parsed.order : [];
-    order = order.filter(p => PERSONAS[p]);
-    if (order.length < 3) {
-      // 폴백: 기본 PE/ME/TE
-      const fallback = ["Cell_TE", "Cell_ME", "Cell_PE"];
-      for (const f of fallback) if (!order.includes(f)) order.push(f);
-      order = order.slice(0, 5);
+    // ★ 풀에 없는 페르소나는 자동 제거 (라우터가 잘못 추가한 경우 방어)
+    order = order.filter(p => allowedAgents.includes(p));
+    // ★ 풀에 있는데 빠진 페르소나는 끝에 추가 (라우터가 빠뜨린 경우 방어)
+    for (const a of allowedAgents) {
+      if (!order.includes(a)) order.push(a);
     }
     return { order, reason: parsed.reason || "라우터 판단", source: "router" };
   } catch {
+    // 폴백: TE 우선 → ME → PE → 나머지
+    const fallbackPriority = (code) => {
+      if (code.endsWith("_TE")) return 0;
+      if (code.endsWith("_ME")) return 1;
+      if (code.endsWith("_PE")) return 2;
+      if (code === "FA") return 3;
+      if (code === "Vision") return 4;
+      return 5;
+    };
+    const order = [...allowedAgents].sort((a, b) => fallbackPriority(a) - fallbackPriority(b));
     return {
-      order: ["Cell_TE", "Cell_ME", "Cell_PE"],
-      reason: "라우터 실패 - 기본 순서",
+      order,
+      reason: "라우터 실패 - 기본 순서 (TE→ME→PE→FA→Vision)",
       source: "fallback",
     };
   }
@@ -407,7 +466,7 @@ async function callPersona(personaCode, issueCtx, prevOpinions, kbText, reportTy
 
   const sys = `${FACTORY_PHILOSOPHY}
 
-당신은 AZS 배터리 공장 Cell 라인 ${p.role}입니다.
+당신은 AZS 배터리 공장 ${p.role}입니다.
 
 [우선순위] ${p.priority}
 [관심 영역] ${p.focus}
@@ -520,7 +579,7 @@ JSON만 출력:
 }
 
 // ─── 7. 통합: 단일 이슈 모드별 논의 실행 ────────────────────────────────────────
-async function runIssueDiscussion(issue, modeInfo, kb, reportType, onProgress) {
+async function runIssueDiscussion(issue, modeInfo, kb, reportType, allowedAgents, onProgress) {
   const issueCtx = `설비: ${issue.eq}
 발생시간: ${issue.time}
 다운타임: ${issue.durMin}분
@@ -543,9 +602,9 @@ async function runIssueDiscussion(issue, modeInfo, kb, reportType, onProgress) {
   }
 
   // ─── DEEP / STANDARD: 라우터 → 순차 호출 → 사회자 ───
-  // [1] 라우터
-  onProgress?.(`🎯 라우터: 발언 순서 결정 중...`);
-  const router = await routeAgentOrder(issueCtx);
+  // [1] 라우터 (선택된 풀 안에서만 결정)
+  onProgress?.(`🎯 라우터: 발언 순서 결정 중... (${allowedAgents.length}명 풀)`);
+  const router = await routeAgentOrder(issueCtx, allowedAgents);
   onProgress?.(`🎯 발언 순서: ${router.order.map(o => PERSONAS[o]?.label).join(" → ")}`);
 
   // [2] 페르소나 순차 호출
@@ -569,7 +628,7 @@ async function runIssueDiscussion(issue, modeInfo, kb, reportType, onProgress) {
 // ═════════════════════════════════════════════════════════════════════════════
 // 시간/빈도 분석 (인수인계 문서 7번)
 // ═════════════════════════════════════════════════════════════════════════════
-function buildTimeFreqAnalysis(allIssues) {
+function buildTimeFreqAnalysis(allIssues, processName = "Cell") {
   // 시간대별
   const hourBuckets = new Array(24).fill(0);
   for (const issue of allIssues) {
@@ -586,14 +645,14 @@ function buildTimeFreqAnalysis(allIssues) {
     .sort((a, b) => b.count - a.count)
     .slice(0, 5);
 
-  // 카테고리(설비) × 라인 — Cell 라인 단일이므로 설비별 빈도
+  // 카테고리(설비) × 공정 빈도
   const eqCounter = new Map();
   for (const issue of allIssues) {
     const eq = (issue.eq || "미분류").trim();
     eqCounter.set(eq, (eqCounter.get(eq) || 0) + 1);
   }
   const categoryFreq = Array.from(eqCounter.entries())
-    .map(([eq, count]) => ({ key: `${eq} - Cell`, eq, line: "Cell", count }))
+    .map(([eq, count]) => ({ key: `${eq} - ${processName}`, eq, process: processName, count }))
     .sort((a, b) => b.count - a.count)
     .slice(0, 5);
 
@@ -603,13 +662,13 @@ function buildTimeFreqAnalysis(allIssues) {
 // ═════════════════════════════════════════════════════════════════════════════
 // 보고서 생성 (모드별 그룹핑 + 시간/빈도 분석 추가)
 // ═════════════════════════════════════════════════════════════════════════════
-async function generateReport(date, dates, discussions, priority, reportType, kb, allIssues) {
+async function generateReport(date, dates, discussions, priority, reportType, kb, allIssues, processName = "Cell") {
   const focus = REPORT_FOCUS[reportType] || REPORT_FOCUS.meeting;
   const reportTitle = REPORT_TYPES.find(r => r.id === reportType)?.label || "회의록";
   const dateStr = dates.length > 1 ? `${dates[0]} ~ ${dates[dates.length-1]}` : date;
 
   // 시간/빈도 분석 (모든 이슈 대상)
-  const analytics = buildTimeFreqAnalysis(allIssues);
+  const analytics = buildTimeFreqAnalysis(allIssues, processName);
 
   // 모드별 그룹핑
   const grouped = { DEEP: [], STANDARD: [], LITE: [] };
@@ -639,7 +698,7 @@ async function generateReport(date, dates, discussions, priority, reportType, kb
 [시간대별 발생 TOP 5]
 ${analytics.timeOfDay.map((t, i) => `${i+1}. ${t.label} ${t.count}건`).join("\n")}
 
-[빈도 TOP 5 (설비×라인)]
+[빈도 TOP 5 (설비×공정)]
 ${analytics.categoryFreq.map((c, i) => `${i+1}. ${c.key} ${c.count}건`).join("\n")}
 
 [건별 논의 결과]
@@ -684,7 +743,7 @@ ${discussionSummary}`;
   try {
     await new Promise(r => setTimeout(r, 500));
     const sys4 = `AZS 배터리 공장 ${reportTitle}. 한국어. JSON만:
-{"heading":"4. 담당자별 액션 아이템","items":["[Cell_PE] 조치 (60자이내)","[Cell_ME] 조치","[Cell_TE] 조치","[Cell_FA] 조치 (해당시)","[Cell_Vision] 조치 (해당시)"]}`;
+{"heading":"4. 담당자별 액션 아이템","items":["[PE] 조치 (60자이내)","[ME] 조치","[TE] 조치","[FA] 조치 (해당시)","[Vision] 조치 (해당시)"]}`;
     const raw4 = await callClaudeRaw(sys4, ctx, { model: MODEL_REASONING, max_tokens: 600 });
     sections.push(safeJSON(raw4));
   } catch { sections.push({ heading:"4. 담당자별 액션 아이템", items:["-"] }); }
@@ -701,7 +760,7 @@ ${discussionSummary}`;
   return {
     title: `${dateStr} ${reportTitle}`,
     date: dateStr,
-    attendees: "Cell_PE, Cell_ME, Cell_TE, Cell_FA, Cell_Vision (이슈별 자동 선정)",
+    attendees: "선택된 공정 PE/ME/TE + 추가 에이전트",
     agenda: `다운타임 ${priority.urgent.length + priority.important.length + priority.normal.length}건 분석 및 대책 수립`,
     sections,
     discussions,
@@ -772,6 +831,9 @@ export default function App() {
   const [running, setRunning]     = useState(false);
   const [error, setError]         = useState("");
   const [sheetSaved, setSheetSaved] = useState(false);
+  // ★ 공정/추가 에이전트 선택 state
+  const [selectedProcess, setSelectedProcess] = useState("Cell");
+  const [extraAgents, setExtraAgents] = useState([]);
   const fileRef = useRef();
 
   const toggleDate = (d) => {
@@ -823,29 +885,30 @@ export default function App() {
     setDiscussions([]); setMinutes(null); setSheetSaved(false);
 
     try {
-      // 학습 내용 로드 (5종)
-      setProgress(["📚 학습 내용 로드 중 (5종)..."]);
+      // ★ 선택된 페르소나 풀 구성: 공정 자동 + 추가 선택
+      const autoAgents = PROCESSES[selectedProcess].auto;
+      const allowedAgents = [...autoAgents, ...extraAgents];
+
+      setProgress([`🎯 참여 에이전트: ${allowedAgents.map(a => PERSONAS[a]?.label).join(", ")} (${allowedAgents.length}명)`]);
+
+      // 학습 내용 선별 로드 (선택된 페르소나만)
+      setProgress(p => [...p, `📚 학습 내용 로드 중 (${allowedAgents.length}종)...`]);
       let kbResult;
       try {
-        kbResult = await loadAllKnowledge();
+        kbResult = await loadSelectedKnowledge(allowedAgents);
         setKbStats(kbResult.stats);
-        const statsStr = ["Cell_PE", "Cell_ME", "Cell_TE", "Cell_FA", "Cell_Vision"]
-          .map(r => `${r.replace("Cell_","")}:${kbResult.stats[r]}`)
-          .join(" ");
+        const statsStr = allowedAgents.map(a => `${a}:${kbResult.stats[a] || 0}`).join(" ");
         setProgress(p => [...p, `✅ 학습 로드 완료 (${statsStr})`]);
       } catch {
-        kbResult = {
-          kb: { Cell_PE:"", Cell_ME:"", Cell_TE:"", Cell_FA:"", Cell_Vision:"" },
-          stats: { Cell_PE:0, Cell_ME:0, Cell_TE:0, Cell_FA:0, Cell_Vision:0, failed:5 }
-        };
+        kbResult = { kb: {}, stats: { failed: allowedAgents.length } };
+        allowedAgents.forEach(a => { kbResult.kb[a] = ""; kbResult.stats[a] = 0; });
         setKbStats(kbResult.stats);
         setProgress(p => [...p, "⚠️ 학습 로드 실패 — 기본 역할로 진행"]);
       }
 
       // 심층 분석 대상 (긴급+중요)
       const keyIssues = selectKeyIssues(priority);
-      // 일반 이슈는 LITE로 모두 처리 (옵션)
-      const liteIssues = priority.normal.slice(0, MAX_ISSUES); // 최대 10건만
+      const liteIssues = priority.normal.slice(0, MAX_ISSUES);
       const allTargets = [...keyIssues, ...liteIssues];
 
       setProgress(p => [...p, `🔍 심층 분석 대상: 긴급/중요 ${keyIssues.length}건 + 일반(LITE) ${liteIssues.length}건`]);
@@ -863,7 +926,7 @@ export default function App() {
 
         setProgress(p => [...p, `${mStyle.label} [${i+1}/${keyIssues.length}] ${issue.eq} (${modeInfo.reason})`]);
 
-        const result = await runIssueDiscussion(issue, modeInfo, kbResult.kb, reportType, (msg) => {
+        const result = await runIssueDiscussion(issue, modeInfo, kbResult.kb, reportType, allowedAgents, (msg) => {
           setProgress(p => [...p, `   ${msg}`]);
         });
         allDiscussions.push(result);
@@ -874,12 +937,11 @@ export default function App() {
       for (let i = 0; i < liteIssues.length; i++) {
         const issue = liteIssues[i];
         const modeInfo = classifyDiscussionMode(issue, false, false);
-        // 키워드 강제 DEEP인 경우 처리 분기
         if (modeInfo.mode === "DEEP") {
           setProgress(p => [...p, `🚨 LITE 후보였으나 키워드 감지로 DEEP 강제: ${issue.eq}`]);
         }
         setProgress(p => [...p, `${MODE_STYLE[modeInfo.mode].label} [LITE-${i+1}/${liteIssues.length}] ${issue.eq}`]);
-        const result = await runIssueDiscussion(issue, modeInfo, kbResult.kb, reportType);
+        const result = await runIssueDiscussion(issue, modeInfo, kbResult.kb, reportType, allowedAgents);
         allDiscussions.push(result);
         setDiscussions([...allDiscussions]);
       }
@@ -888,10 +950,13 @@ export default function App() {
       setProgress(p => [...p, "📄 보고서 생성 중..."]);
       const dateStr = selDates.length > 1 ? `${selDates[0]}~${selDates[selDates.length-1]}` : selDates[0];
       const allIssuesForAnalytics = [...priority.urgent, ...priority.important, ...priority.normal];
-      const report = await generateReport(dateStr, selDates, allDiscussions, priority, reportType, kbResult.kb, allIssuesForAnalytics);
+      const report = await generateReport(dateStr, selDates, allDiscussions, priority, reportType, kbResult.kb, allIssuesForAnalytics, selectedProcess);
+      // ★ 보고서에 공정/참여 에이전트 정보 추가
+      report.process = selectedProcess;
+      report.allowedAgents = allowedAgents;
       setMinutes(report);
 
-      // 시트 저장 (모드별 정리해서 저장)
+      // 시트 저장
       setProgress(p => [...p, "💾 구글 시트 저장 중..."]);
       const deepSummary = report.grouped.DEEP.map(d => `${d.issue.eq}: ${d.moderator.consensus}`).join(" | ");
       const stdSummary = report.grouped.STANDARD.map(d => `${d.issue.eq}: ${d.moderator.summary}`).join(" | ");
@@ -899,7 +964,7 @@ export default function App() {
 
       const saved = await saveToSheets({
         date: dateStr,
-        agenda: report.agenda,
+        agenda: `[${selectedProcess} 공정] ${report.agenda}`,
         issue_summary: `긴급${priority.urgent.length} 중요${priority.important.length} 일반${priority.normal.length} | DEEP${report.grouped.DEEP.length} STANDARD${report.grouped.STANDARD.length} LITE${report.grouped.LITE.length}`,
         pe_opinion: deepSummary.slice(0, 500),
         me_opinion: stdSummary.slice(0, 500),
@@ -907,6 +972,8 @@ export default function App() {
         discussion: report.sections.map(s => `${s.heading}: ${(s.items||[]).join(", ")}`).join(" / ").slice(0, 2000),
         action_items: report.sections[3]?.items?.join(" | ") || "",
         minutes_full: JSON.stringify({
+          process: selectedProcess,
+          agents: allowedAgents,
           analytics: report.analytics,
           modeStats: { DEEP: report.grouped.DEEP.length, STANDARD: report.grouped.STANDARD.length, LITE: report.grouped.LITE.length },
         }).slice(0, 1000),
@@ -923,6 +990,11 @@ export default function App() {
     if (!minutes) return;
     let t = `${"═".repeat(52)}\n${minutes.title}\n${"═".repeat(52)}\n`;
     t += `일시: ${minutes.date}\n참석: ${minutes.attendees}\n안건: ${minutes.agenda}\n`;
+    // ★ 공정/참여 에이전트 정보
+    if (minutes.process && minutes.allowedAgents) {
+      t += `대상 공정: ${PROCESSES[minutes.process]?.label || minutes.process}\n`;
+      t += `참여 에이전트 (${minutes.allowedAgents.length}명): ${minutes.allowedAgents.map(a => `${a}(${PERSONAS[a]?.label})`).join(", ")}\n`;
+    }
 
     // 시간/빈도 분석
     if (minutes.analytics) {
@@ -931,7 +1003,7 @@ export default function App() {
       minutes.analytics.timeOfDay.forEach((b, i) => {
         t += `  ${i+1}. ${b.label}  ${b.count}건\n`;
       });
-      t += `\n🔁 발생 빈도 TOP 5 (설비 × 라인)\n`;
+      t += `\n🔁 발생 빈도 TOP 5 (설비 × 공정)\n`;
       minutes.analytics.categoryFreq.forEach((c, i) => {
         t += `  ${i+1}. ${c.key}  ${c.count}건\n`;
       });
@@ -1004,6 +1076,7 @@ export default function App() {
     setClassified(null); setPriority(null); setKbStats(null);
     setDiscussions([]); setMinutes(null); setProgress([]);
     setError(""); setSheetSaved(false); setReportType("meeting");
+    setSelectedProcess("Cell"); setExtraAgents([]);
   };
 
   return (
@@ -1025,8 +1098,8 @@ export default function App() {
           display:"flex", alignItems:"center", justifyContent:"center", fontSize:17,
         }}>🏭</div>
         <div>
-          <div style={{fontSize:13,fontWeight:800,color:"#f1f5f9"}}>AZS Cell 라인 · 논의 시스템 v2 · 보고서</div>
-          <div style={{fontSize:9,color:"#22d3ee",letterSpacing:2,fontWeight:700}}>PE · ME · TE · FA · Vision  |  AZS</div>
+          <div style={{fontSize:13,fontWeight:800,color:"#f1f5f9"}}>AZS · 논의 시스템 v3 · 다중 공정 보고서</div>
+          <div style={{fontSize:9,color:"#22d3ee",letterSpacing:2,fontWeight:700}}>Cell · Elec · FA · Vision  |  AZS</div>
         </div>
         {step > 0 && (
           <button onClick={reset} style={{
@@ -1064,7 +1137,7 @@ export default function App() {
               fontSize:11, color:"#22d3ee", lineHeight:1.7,
             }}>
               💡 날짜 기준: 06:00 이전 메시지는 전날 생산분으로 처리됩니다<br/>
-              🆕 v2: TE 우선 발언 + 차등 논의 모드 + 5섹션 사회자 + 시간/빈도 분석
+              🆕 v3: 공정 선택(Cell/Elec) + 추가 에이전트 선택 + 차등 논의 + 시간/빈도 분석
             </div>
           </div>
         )}
@@ -1202,6 +1275,152 @@ export default function App() {
               </div>
             </div>
 
+            {/* ★ 공정 선택 */}
+            <div style={{
+              background:"rgba(34,211,238,0.06)",
+              border:"1px solid rgba(34,211,238,0.2)",
+              borderRadius:10, padding:"14px 16px", marginBottom:12,
+            }}>
+              <div style={{fontSize:11,color:"#22d3ee",fontWeight:800,marginBottom:10}}>
+                🏭 분석 대상 공정 선택
+              </div>
+              <div style={{display:"flex",gap:10}}>
+                {Object.entries(PROCESSES).map(([key, proc]) => (
+                  <button key={key} onClick={()=>{
+                    setSelectedProcess(key);
+                    // 공정 변경 시 같은 공정의 추가 선택은 자동 제거
+                    setExtraAgents(prev => prev.filter(a => !PROCESSES[key].auto.includes(a)));
+                  }} style={{
+                    flex:1, padding:"10px 14px",
+                    background: selectedProcess===key ? "rgba(34,211,238,0.2)" : "rgba(15,23,42,0.6)",
+                    border:`1.5px solid ${selectedProcess===key ? "#22d3ee" : "rgba(51,65,85,0.5)"}`,
+                    borderRadius:8,
+                    color: selectedProcess===key ? "#22d3ee" : "#94a3b8",
+                    fontSize:12, fontWeight:700, cursor:"pointer",
+                    textAlign:"left",
+                  }}>
+                    <div>{proc.icon} {proc.label}</div>
+                    <div style={{fontSize:9,opacity:0.8,marginTop:3}}>
+                      자동 참여: {proc.auto.map(a => a.replace(`${key}_`,"")).join(" / ")}
+                    </div>
+                  </button>
+                ))}
+              </div>
+            </div>
+
+            {/* ★ 자동 참여 표시 (변경 불가) */}
+            <div style={{
+              background:"rgba(15,23,42,0.5)",
+              border:"1px solid rgba(51,65,85,0.4)",
+              borderRadius:10, padding:"12px 14px", marginBottom:12,
+            }}>
+              <div style={{fontSize:10,color:"#94a3b8",fontWeight:700,marginBottom:8}}>
+                ✅ 자동 참여 (변경 불가)
+              </div>
+              <div style={{display:"flex",gap:6,flexWrap:"wrap"}}>
+                {PROCESSES[selectedProcess].auto.map(code => {
+                  const p = PERSONAS[code];
+                  return (
+                    <span key={code} style={{
+                      fontSize:11, padding:"4px 10px",
+                      background:p.bg, color:p.color, fontWeight:700,
+                      border:`1px solid ${p.color}`, borderRadius:14,
+                    }}>{p.icon} {p.label}</span>
+                  );
+                })}
+              </div>
+            </div>
+
+            {/* ★ 추가 참여 에이전트 선택 (그룹 분류) */}
+            <div style={{
+              background:"rgba(167,139,250,0.05)",
+              border:"1px solid rgba(167,139,250,0.2)",
+              borderRadius:10, padding:"12px 14px", marginBottom:14,
+            }}>
+              <div style={{fontSize:10,color:"#a78bfa",fontWeight:700,marginBottom:10}}>
+                ➕ 추가 참여 에이전트 선택 (선택사항)
+                {extraAgents.length > 0 && (
+                  <span style={{marginLeft:8,color:"#cbd5e1"}}>
+                    {extraAgents.length}명 추가됨
+                  </span>
+                )}
+              </div>
+
+              {/* 다른 공정 자문 */}
+              <div style={{marginBottom:10}}>
+                <div style={{fontSize:9,color:"#64748b",fontWeight:700,marginBottom:6}}>
+                  ── 다른 공정 자문 ({PROCESSES[PROCESSES[selectedProcess].otherProcess].label})
+                </div>
+                <div style={{display:"flex",gap:6,flexWrap:"wrap"}}>
+                  {PROCESSES[PROCESSES[selectedProcess].otherProcess].auto.map(code => {
+                    const p = PERSONAS[code];
+                    const checked = extraAgents.includes(code);
+                    return (
+                      <label key={code} style={{
+                        fontSize:11, padding:"4px 10px",
+                        background: checked ? p.bg : "rgba(15,23,42,0.4)",
+                        color: checked ? p.color : "#64748b",
+                        border:`1px solid ${checked ? p.color : "rgba(51,65,85,0.5)"}`,
+                        borderRadius:14, cursor:"pointer", fontWeight: checked ? 700 : 400,
+                        display:"flex", alignItems:"center", gap:5,
+                      }}>
+                        <input
+                          type="checkbox"
+                          checked={checked}
+                          onChange={() => {
+                            setExtraAgents(prev =>
+                              checked ? prev.filter(a => a !== code) : [...prev, code]
+                            );
+                          }}
+                          style={{margin:0, cursor:"pointer"}}
+                        />
+                        {p.icon} {p.label}
+                      </label>
+                    );
+                  })}
+                </div>
+              </div>
+
+              {/* 공통 에이전트 */}
+              <div>
+                <div style={{fontSize:9,color:"#64748b",fontWeight:700,marginBottom:6}}>
+                  ── 공통 에이전트
+                </div>
+                <div style={{display:"flex",gap:6,flexWrap:"wrap"}}>
+                  {COMMON_AGENTS.map(code => {
+                    const p = PERSONAS[code];
+                    const checked = extraAgents.includes(code);
+                    return (
+                      <label key={code} style={{
+                        fontSize:11, padding:"4px 10px",
+                        background: checked ? p.bg : "rgba(15,23,42,0.4)",
+                        color: checked ? p.color : "#64748b",
+                        border:`1px solid ${checked ? p.color : "rgba(51,65,85,0.5)"}`,
+                        borderRadius:14, cursor:"pointer", fontWeight: checked ? 700 : 400,
+                        display:"flex", alignItems:"center", gap:5,
+                      }}>
+                        <input
+                          type="checkbox"
+                          checked={checked}
+                          onChange={() => {
+                            setExtraAgents(prev =>
+                              checked ? prev.filter(a => a !== code) : [...prev, code]
+                            );
+                          }}
+                          style={{margin:0, cursor:"pointer"}}
+                        />
+                        {p.icon} {p.label}
+                      </label>
+                    );
+                  })}
+                </div>
+              </div>
+
+              <div style={{fontSize:9,color:"#475569",marginTop:8,lineHeight:1.5}}>
+                💡 추가한 에이전트는 모든 DEEP/STANDARD 이슈에 참여합니다. (LITE는 사회자 단독)
+              </div>
+            </div>
+
             {kbStats && (
               <div style={{
                 background: kbStats.failed>0 ? "rgba(245,158,11,0.06)" : "rgba(52,211,153,0.06)",
@@ -1212,9 +1431,12 @@ export default function App() {
                 <span style={{color:kbStats.failed>0?"#f59e0b":"#34d399",fontWeight:800}}>
                   {kbStats.failed>0?"⚠️ 학습 일부 로드 실패":"✅ 학습 로드 완료"}
                 </span>
-                {Object.entries(PERSONAS).map(([k, p]) => (
-                  <span key={k} style={{color:p.color}}>{p.icon}{k.replace("Cell_","")}:{kbStats[k] || 0}건</span>
-                ))}
+                {Object.entries(kbStats).filter(([k]) => PERSONAS[k]).map(([k, count]) => {
+                  const p = PERSONAS[k];
+                  return (
+                    <span key={k} style={{color:p.color}}>{p.icon}{k}:{count}건</span>
+                  );
+                })}
               </div>
             )}
 
@@ -1239,7 +1461,7 @@ export default function App() {
               borderRadius:10, padding:"12px 14px", marginBottom:12,
             }}>
               <div style={{fontSize:10,color:"#a78bfa",fontWeight:800,marginBottom:8}}>
-                🔍 차등 논의 모드 (예상)
+                🔍 차등 논의 모드 (예상) · 참여 {PROCESSES[selectedProcess].auto.length + extraAgents.length}명
               </div>
               <div style={{fontSize:11,color:"#cbd5e1",lineHeight:1.7}}>
                 🔴 DEEP: 긴급 {priority.urgent.length}건 (5섹션 풀 논의)<br/>
@@ -1360,6 +1582,33 @@ export default function App() {
                 <div style={{fontSize:11,color:"#34d399"}}>✅ 구글 시트에 자동 저장 완료</div>
               )}
             </div>
+
+            {/* ★ 공정 / 참여 에이전트 정보 */}
+            {minutes.process && minutes.allowedAgents && (
+              <div style={{
+                background:"rgba(34,211,238,0.06)",
+                border:"1px solid rgba(34,211,238,0.2)",
+                borderRadius:10, padding:"10px 14px", marginBottom:14,
+                display:"flex", gap:12, alignItems:"center", flexWrap:"wrap",
+              }}>
+                <span style={{fontSize:11,fontWeight:800,color:"#22d3ee"}}>
+                  {PROCESSES[minutes.process]?.icon} {PROCESSES[minutes.process]?.label}
+                </span>
+                <span style={{fontSize:10,color:"#94a3b8"}}>참여 {minutes.allowedAgents.length}명:</span>
+                <div style={{display:"flex",gap:4,flexWrap:"wrap"}}>
+                  {minutes.allowedAgents.map(code => {
+                    const p = PERSONAS[code];
+                    return (
+                      <span key={code} style={{
+                        fontSize:10, padding:"2px 8px",
+                        background:p.bg, color:p.color, fontWeight:700,
+                        borderRadius:10,
+                      }}>{p.icon} {code}</span>
+                    );
+                  })}
+                </div>
+              </div>
+            )}
 
             {/* 시간/빈도 분석 */}
             {minutes.analytics && (

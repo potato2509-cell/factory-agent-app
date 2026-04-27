@@ -1442,6 +1442,12 @@ export default function App() {
   const [extraAgents, setExtraAgents] = useState([]);
   // ★ 영역 5: 선정 기준 드롭다운 (평소 숨김)
   const [showCriteriaBox, setShowCriteriaBox] = useState(false);
+  // ★ 영역 6: PE 사전 큐레이션 결과 캐싱 + 사용자 선택 이슈 관리
+  const [preCuration, setPreCuration] = useState(null);          // 큐레이션 결과 (재사용 위해 캐싱)
+  const [preCategoryMsgs, setPreCategoryMsgs] = useState(null);  // 카테고리 메시지 (재사용)
+  const [autoSelectedIds, setAutoSelectedIds] = useState([]);    // 자동 선정된 이슈 id 목록 (TOP N)
+  const [selectedIssueIds, setSelectedIssueIds] = useState([]);  // 사용자가 최종 선택한 이슈 id 목록
+  const [curating, setCurating] = useState(false);               // 큐레이션 실행 중 플래그
   const fileRef = useRef();
 
   const toggleDate = (d) => {
@@ -1478,14 +1484,79 @@ export default function App() {
     setError("");
   };
 
-  const handleReportConfirm = () => {
+  // ★ 영역 6: 이슈 안정 ID (체크박스 추적용)
+  const getIssueId = (issue) => `${issue.date || "?"}_${issue.time || "?"}_${issue.eq || "?"}_${(issue.prob || "").slice(0, 20)}`;
+
+  const handleReportConfirm = async () => {
+    setError("");
     const dayMsgs = filterByDates(allMsgs, selDates);
     const cl = classifyMessages(dayMsgs);
     const pri = classifyPriority(cl.downtime);
     setClassified(cl);
     setPriority(pri);
-    setStep(3);
-    setError("");
+
+    // ★ 영역 6-B: STEP 3 진입 전에 PE 큐레이션을 미리 실행 (사용자가 자동 선정 결과를 바로 보고 추가 선택할 수 있도록)
+    setCurating(true);
+    setProgress(["📝 PE 사전 큐레이션 실행 중 (전체 이슈 정리)..."]);
+    setStep(3);  // STEP 3 화면으로 먼저 전환 (로딩 표시 포함)
+
+    try {
+      // 카테고리 메시지 준비 (영역 5 흐름과 동일)
+      const ambig = cl.ambiguousMsgs || [];
+      let ambigResult = { quality: [], process_change: [], test: [], skip: [] };
+      if (ambig.length > 0) {
+        setProgress(p => [...p, `🔀 모호 메시지 AI 분류 중 (${ambig.length}건)...`]);
+        try {
+          ambigResult = await classifyAmbiguousMessages(ambig);
+          setProgress(p => [...p, `✅ 모호 분류 완료 (품질 ${ambigResult.quality.length} / 공정변경 ${ambigResult.process_change.length} / 테스트 ${ambigResult.test.length})`]);
+        } catch {
+          setProgress(p => [...p, `⚠️ 모호 분류 실패 — 첫 매칭 카테고리로 자동 할당`]);
+          ambig.forEach(m => {
+            const first = m.matched?.[0];
+            if (first === "quality") ambigResult.quality.push(m);
+            else if (first === "process_change") ambigResult.process_change.push(m);
+            else if (first === "test") ambigResult.test.push(m);
+          });
+        }
+      }
+      const categoryMsgs = {
+        quality: [...(cl.qualityMsgs || []), ...ambigResult.quality],
+        process_change: [...(cl.processChangeMsgs || []), ...ambigResult.process_change],
+        test: [...(cl.testMsgs || []), ...ambigResult.test],
+      };
+
+      // PE 큐레이션 실행 (KB 없이 진행 — STEP 3에선 빠르게)
+      const allIssuesForCuration = [...pri.urgent, ...pri.important, ...pri.normal];
+      let curation;
+      try {
+        curation = await runPreCuration(allIssuesForCuration, "", reportType, categoryMsgs);
+        setProgress(p => [...p, `✅ PE 큐레이션 완료 (장기부동 ${curation.long_downtime.length}건, 반복 ${curation.recurring.length}건)`]);
+      } catch {
+        setProgress(p => [...p, `⚠️ PE 큐레이션 실패 — 폴백 사용`]);
+        curation = buildFallbackCuration(allIssuesForCuration, categoryMsgs);
+      }
+
+      // 자동 선정 (긴급 + 중요 후보 중 점수 상위 MAX_ISSUES건)
+      const autoTop = selectKeyIssues(pri);
+      const autoIds = autoTop.map(getIssueId);
+
+      setPreCuration(curation);
+      setPreCategoryMsgs(categoryMsgs);
+      setAutoSelectedIds(autoIds);
+      setSelectedIssueIds(autoIds);  // 초기값 = 자동 선정 (사용자가 추가/제거 가능)
+      setProgress(p => [...p, `🎯 자동 선정 ${autoIds.length}건. 추가 선택 후 분석 시작 가능.`]);
+    } catch (e) {
+      setError(`STEP 3 준비 중 오류: ${e?.message || e}`);
+    } finally {
+      setCurating(false);
+    }
+  };
+
+  // ★ 영역 6: 체크박스 토글
+  const toggleIssueSelection = (id) => {
+    setSelectedIssueIds(prev =>
+      prev.includes(id) ? prev.filter(x => x !== id) : [...prev, id]
+    );
   };
 
   const runAnalysis = async () => {
@@ -1514,44 +1585,48 @@ export default function App() {
         setProgress(p => [...p, "⚠️ 학습 로드 실패 — 기본 역할로 진행"]);
       }
 
-      // 심층 분석 대상 (긴급+중요)
-      const keyIssues = selectKeyIssues(priority);
+      // ★ 영역 6: STEP 3에서 사용자가 체크한 이슈를 분석 대상으로 사용
+      // 자동 선정 + 사용자 추가 = selectedIssueIds (체크박스로 자유 선택)
+      // 매뉴얼 추가 이슈는 점수 계산 후 score 부여 (정렬 일관성)
+      const candidates = [...priority.urgent, ...priority.important];
+      const candidatesScored = candidates.map(issue => {
+        const s = scoreIssue(issue);
+        return { ...issue, score: s.total, scoreBreakdown: s.breakdown };
+      });
+      const keyIssues = candidatesScored
+        .filter(issue => selectedIssueIds.includes(getIssueId(issue)))
+        .sort((a, b) => {
+          if (b.score !== a.score) return b.score - a.score;
+          return (b.durMin || 0) - (a.durMin || 0);
+        });
+
       const liteIssues = priority.normal.slice(0, MAX_ISSUES);
       const allTargets = [...keyIssues, ...liteIssues];
 
-      setProgress(p => [...p, `🔍 심층 분석 대상: 긴급/중요 ${keyIssues.length}건 + 일반(LITE) ${liteIssues.length}건`]);
+      const autoCount = keyIssues.filter(i => autoSelectedIds.includes(getIssueId(i))).length;
+      const manualCount = keyIssues.length - autoCount;
+      setProgress(p => [...p, `🔍 본문 논의: 자동 ${autoCount}건 + 매뉴얼 ${manualCount}건 = 총 ${keyIssues.length}건 + 일반(LITE) ${liteIssues.length}건`]);
 
-      // ★ PE 사전 큐레이션 (전체 이슈 1회 호출)
-      setProgress(p => [...p, "📝 PE 사전 큐레이션 중 (전체 이슈 정리)..."]);
+      // ★ 영역 6-E: STEP 3에서 미리 실행한 큐레이션 재사용 (재호출 없음)
       const allIssuesForCuration = [...priority.urgent, ...priority.important, ...priority.normal];
-
-      // ★ 영역 5: 모호 메시지 AI 분류 (2개 이상 카테고리 매칭된 메시지만 Haiku 호출)
-      const ambig = classified?.ambiguousMsgs || [];
-      let ambigResult = { quality: [], process_change: [], test: [], skip: [] };
-      if (ambig.length > 0) {
-        setProgress(p => [...p, `🔀 모호 메시지 AI 분류 중 (${ambig.length}건)...`]);
-        try {
-          ambigResult = await classifyAmbiguousMessages(ambig);
-          setProgress(p => [...p, `✅ 모호 분류 완료 (품질 ${ambigResult.quality.length} / 공정변경 ${ambigResult.process_change.length} / 테스트 ${ambigResult.test.length} / 제외 ${ambigResult.skip.length})`]);
-        } catch {
-          setProgress(p => [...p, `⚠️ 모호 분류 실패 — 첫 매칭 카테고리로 자동 할당`]);
-        }
-      }
-      // 카테고리별 최종 메시지 = 키워드 직접 매칭 + AI 분류 결과
-      const categoryMsgs = {
-        quality: [...(classified?.qualityMsgs || []), ...ambigResult.quality],
-        process_change: [...(classified?.processChangeMsgs || []), ...ambigResult.process_change],
-        test: [...(classified?.testMsgs || []), ...ambigResult.test],
+      const categoryMsgs = preCategoryMsgs || {
+        quality: classified?.qualityMsgs || [],
+        process_change: classified?.processChangeMsgs || [],
+        test: classified?.testMsgs || [],
       };
-      setProgress(p => [...p, `📊 카테고리 집계: 품질 ${categoryMsgs.quality.length}건 / 공정변경 ${categoryMsgs.process_change.length}건 / 테스트 ${categoryMsgs.test.length}건`]);
-
-      let curation;
-      try {
-        curation = await runPreCuration(allIssuesForCuration, kbResult.kb["Cell_PE"] || kbResult.kb["Elec_PE"] || "", reportType, categoryMsgs);
-        setProgress(p => [...p, `✅ PE 큐레이션 완료 (일자별 ${curation.daily_table.length}건, 장기부동 ${curation.long_downtime.length}건, 반복 ${curation.recurring.length}건, 품질 ${curation.quality_issues.length}건, 공정변경 ${curation.process_changes.length}건, 테스트 ${curation.tests_inspections.length}건)`]);
-      } catch (e) {
-        setProgress(p => [...p, `⚠️ PE 큐레이션 실패 - 폴백 사용`]);
-        curation = buildFallbackCuration(allIssuesForCuration, categoryMsgs);
+      let curation = preCuration;
+      if (curation) {
+        setProgress(p => [...p, `♻️ PE 큐레이션 재사용 (STEP 3에서 사전 실행됨)`]);
+      } else {
+        // 폴백: STEP 3 큐레이션이 어떤 이유로든 없으면 여기서 실행
+        setProgress(p => [...p, "📝 PE 사전 큐레이션 중 (전체 이슈 정리)..."]);
+        try {
+          curation = await runPreCuration(allIssuesForCuration, kbResult.kb["Cell_PE"] || kbResult.kb["Elec_PE"] || "", reportType, categoryMsgs);
+          setProgress(p => [...p, `✅ PE 큐레이션 완료`]);
+        } catch {
+          setProgress(p => [...p, `⚠️ PE 큐레이션 실패 - 폴백 사용`]);
+          curation = buildFallbackCuration(allIssuesForCuration, categoryMsgs);
+        }
       }
 
       // 모드 분류 + 건별 논의
@@ -1826,6 +1901,10 @@ export default function App() {
     setDiscussions([]); setMinutes(null); setProgress([]);
     setError(""); setSheetSaved(false); setReportType("meeting");
     setSelectedProcess("Cell"); setExtraAgents([]);
+    // ★ 영역 6: 큐레이션 캐시 + 선택 상태 초기화
+    setPreCuration(null); setPreCategoryMsgs(null);
+    setAutoSelectedIds([]); setSelectedIssueIds([]);
+    setCurating(false);
   };
 
   return (
@@ -2258,44 +2337,138 @@ export default function App() {
               </div>
             </div>
 
-            {priority.urgent.length > 0 && (
+            {/* ★ 영역 6-C: 큐레이션 로딩 표시 (사전 실행 중일 때만) */}
+            {curating && (
               <div style={{
-                background:"rgba(239,68,68,0.05)", border:"1px solid rgba(239,68,68,0.2)",
-                borderRadius:10, padding:"12px 14px", marginBottom:10,
+                background:"rgba(59,130,246,0.05)", border:"1px solid rgba(59,130,246,0.25)",
+                borderRadius:10, padding:"14px 16px", marginBottom:12,
+                display:"flex", alignItems:"center", gap:10,
               }}>
-                <div style={{fontSize:10,color:"#ef4444",fontWeight:800,marginBottom:8}}>
-                  🔴 긴급 이슈 ({priority.urgent.length}건)
+                <Spinner/>
+                <div style={{fontSize:11,color:"#93c5fd"}}>
+                  PE 사전 큐레이션 실행 중... (전체 이슈 정리, 약 30초 소요)
                 </div>
-                {priority.urgent.map((d,i) => (
-                  <div key={i} style={{fontSize:11,color:"#fca5a5",marginBottom:5}}>
-                    <span style={{color:"#ef4444",fontWeight:700}}>[{d.time}] {d.eq}</span>
-                    <span style={{color:"#94a3b8"}}> · {d.durMin}분 · {d.prob}</span>
-                    <span style={{color:"#ef4444",fontSize:9,marginLeft:6}}>({d.reasons?.join(", ")})</span>
-                  </div>
-                ))}
               </div>
             )}
 
-            {priority.important.length > 0 && (
-              <div style={{
-                background:"rgba(245,158,11,0.05)", border:"1px solid rgba(245,158,11,0.2)",
-                borderRadius:10, padding:"12px 14px", marginBottom:14,
-              }}>
-                <div style={{fontSize:10,color:"#f59e0b",fontWeight:800,marginBottom:8}}>
-                  🟡 중요 이슈 ({priority.important.length}건)
-                </div>
-                {priority.important.slice(0,5).map((d,i) => (
-                  <div key={i} style={{fontSize:11,color:"#fcd34d",marginBottom:5}}>
-                    <span style={{color:"#f59e0b",fontWeight:700}}>[{d.time}] {d.eq}</span>
-                    <span style={{color:"#94a3b8"}}> · {d.durMin}분 · {d.prob}</span>
-                    <span style={{color:"#f59e0b",fontSize:9,marginLeft:6}}>({d.reasons?.join(", ")})</span>
+            {/* ★ 영역 6-C: 본문 논의 후보 목록 (긴급+중요 통합, 체크박스 + 자동선정 표시) */}
+            {!curating && (priority.urgent.length > 0 || priority.important.length > 0) && (() => {
+              // 긴급+중요 후보를 점수순으로 정렬해서 한 목록에 표시
+              const candidates = [...priority.urgent, ...priority.important];
+              const scored = candidates.map(issue => {
+                const s = scoreIssue(issue);
+                return { ...issue, score: s.total, scoreBreakdown: s.breakdown };
+              }).sort((a, b) => {
+                if (b.score !== a.score) return b.score - a.score;
+                return (b.durMin || 0) - (a.durMin || 0);
+              });
+              const total = scored.length;
+              const sel = selectedIssueIds.length;
+              return (
+                <div style={{
+                  background:"rgba(15,23,42,0.6)", border:"1px solid rgba(100,116,139,0.3)",
+                  borderRadius:10, padding:"12px 14px", marginBottom:12,
+                }}>
+                  <div style={{
+                    display:"flex", justifyContent:"space-between", alignItems:"center",
+                    marginBottom:8, paddingBottom:8, borderBottom:"1px solid rgba(51,65,85,0.4)",
+                  }}>
+                    <div style={{fontSize:11,color:"#cbd5e1",fontWeight:800}}>
+                      📋 본문 논의 후보 ({total}건) — 자동 선정 ⭐ 표시 / 체크박스로 자유 선택
+                    </div>
+                    <div style={{fontSize:10,color:"#22d3ee",fontWeight:700}}>
+                      선택 {sel}건 / {total}건
+                    </div>
                   </div>
-                ))}
-                {priority.important.length > 5 && (
-                  <div style={{fontSize:10,color:"#78716c"}}>외 {priority.important.length-5}건</div>
-                )}
-              </div>
-            )}
+
+                  {/* 일괄 액션 버튼 */}
+                  <div style={{display:"flex",gap:6,marginBottom:8}}>
+                    <button onClick={()=>setSelectedIssueIds(scored.map(getIssueId))} style={{
+                      fontSize:9, padding:"3px 8px", borderRadius:4,
+                      background:"rgba(34,211,238,0.1)", border:"1px solid rgba(34,211,238,0.3)",
+                      color:"#22d3ee", cursor:"pointer", fontWeight:700,
+                    }}>전체 선택</button>
+                    <button onClick={()=>setSelectedIssueIds([])} style={{
+                      fontSize:9, padding:"3px 8px", borderRadius:4,
+                      background:"rgba(100,116,139,0.1)", border:"1px solid rgba(100,116,139,0.3)",
+                      color:"#94a3b8", cursor:"pointer", fontWeight:700,
+                    }}>전체 해제</button>
+                    <button onClick={()=>setSelectedIssueIds([...autoSelectedIds])} style={{
+                      fontSize:9, padding:"3px 8px", borderRadius:4,
+                      background:"rgba(245,158,11,0.1)", border:"1px solid rgba(245,158,11,0.3)",
+                      color:"#f59e0b", cursor:"pointer", fontWeight:700,
+                    }}>자동 선정만 (⭐)</button>
+                  </div>
+
+                  {/* 후보 목록 (스크롤) */}
+                  <div style={{maxHeight:360, overflowY:"auto"}}>
+                    {scored.map((d) => {
+                      const id = getIssueId(d);
+                      const isAuto = autoSelectedIds.includes(id);
+                      const isChecked = selectedIssueIds.includes(id);
+                      const isUrgent = priority.urgent.includes(d);
+                      const tagColor = isUrgent ? "#ef4444" : "#f59e0b";
+                      const tagLabel = isUrgent ? "🔴 긴급" : "🟡 중요";
+                      return (
+                        <label key={id} style={{
+                          display:"flex", alignItems:"flex-start", gap:8,
+                          padding:"8px 10px", marginBottom:4, borderRadius:6,
+                          background: isChecked ? "rgba(34,211,238,0.06)" : "rgba(15,23,42,0.4)",
+                          border:`1px solid ${isChecked ? "rgba(34,211,238,0.3)" : "rgba(51,65,85,0.3)"}`,
+                          cursor:"pointer",
+                        }}>
+                          <input type="checkbox" checked={isChecked}
+                            onChange={()=>toggleIssueSelection(id)}
+                            style={{marginTop:3, cursor:"pointer", accentColor:"#22d3ee"}}/>
+                          <div style={{flex:1, fontSize:10, lineHeight:1.5}}>
+                            <div style={{display:"flex",gap:6,alignItems:"center",flexWrap:"wrap",marginBottom:3}}>
+                              <span style={{
+                                fontSize:9, padding:"1px 6px", borderRadius:3,
+                                background:`${tagColor}22`, color:tagColor, fontWeight:700,
+                              }}>{tagLabel}</span>
+                              {isAuto && (
+                                <span style={{
+                                  fontSize:9, padding:"1px 6px", borderRadius:3,
+                                  background:"rgba(245,158,11,0.15)", color:"#fbbf24", fontWeight:700,
+                                }}>⭐ 자동선정</span>
+                              )}
+                              <span style={{color:"#94a3b8"}}>{d.date} {d.time}</span>
+                              <span style={{color:"#cbd5e1",fontWeight:700}}>{d.eq}</span>
+                              <span style={{color:"#94a3b8"}}>· {d.durMin}분</span>
+                              <span style={{
+                                marginLeft:"auto",
+                                fontSize:9, padding:"1px 6px", borderRadius:3,
+                                background:"rgba(34,211,238,0.1)", color:"#22d3ee", fontWeight:700,
+                              }}>점수 {d.score}</span>
+                            </div>
+                            {d.prob && d.prob !== "-" && (
+                              <div style={{color:"#cbd5e1",marginBottom:2}}>
+                                <span style={{color:"#64748b"}}>Problem:</span> {d.prob}
+                              </div>
+                            )}
+                            {d.cause && d.cause !== "-" && (
+                              <div style={{color:"#94a3b8",marginBottom:2}}>
+                                <span style={{color:"#64748b"}}>Cause:</span> {d.cause}
+                              </div>
+                            )}
+                            {d.result && d.result !== "-" && (
+                              <div style={{color:"#94a3b8",marginBottom:2}}>
+                                <span style={{color:"#64748b"}}>Result:</span> {d.result}
+                              </div>
+                            )}
+                            {d.reasons?.length > 0 && (
+                              <div style={{color:"#64748b",fontSize:9}}>
+                                ({d.reasons.join(", ")})
+                              </div>
+                            )}
+                          </div>
+                        </label>
+                      );
+                    })}
+                  </div>
+                </div>
+              );
+            })()}
 
             <div style={{
               background:"rgba(167,139,250,0.06)", border:"1px solid rgba(167,139,250,0.2)",
@@ -2340,16 +2513,19 @@ export default function App() {
 
             <div style={{display:"flex",gap:10}}>
               <BackBtn onClick={()=>setStep(2)} label="← 보고서 변경"/>
-              <button onClick={runAnalysis} disabled={running} style={{
+              <button onClick={runAnalysis} disabled={running || curating || selectedIssueIds.length === 0} style={{
                 flex:1, padding:"12px",
-                background:running?"rgba(51,65,85,0.3)":"linear-gradient(135deg,#3b82f6,#22d3ee)",
+                background:(running||curating||selectedIssueIds.length===0)?"rgba(51,65,85,0.3)":"linear-gradient(135deg,#3b82f6,#22d3ee)",
                 border:"none", borderRadius:8,
-                color:running?"#374151":"#fff",
+                color:(running||curating||selectedIssueIds.length===0)?"#374151":"#fff",
                 fontSize:13, fontWeight:800,
-                cursor:running?"not-allowed":"pointer",
+                cursor:(running||curating||selectedIssueIds.length===0)?"not-allowed":"pointer",
                 display:"flex", alignItems:"center", justifyContent:"center", gap:8,
               }}>
-                {running?<><Spinner/>분석 진행 중...</>:"🔍 차등 논의 및 보고서 생성 →"}
+                {running ? <><Spinner/>분석 진행 중...</>
+                  : curating ? <><Spinner/>큐레이션 준비 중...</>
+                  : selectedIssueIds.length === 0 ? "⚠️ 논의할 이슈 1건 이상 선택하세요"
+                  : `🔍 차등 논의 및 보고서 생성 (${selectedIssueIds.length}건) →`}
               </button>
             </div>
           </div>

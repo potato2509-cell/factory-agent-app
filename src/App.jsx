@@ -3333,12 +3333,12 @@ function DiscussionCard({ discussion }) {
       {/* ★ 영역 7-B: 플로팅 채팅 버튼 (모든 STEP 공통) */}
       {!chatOpen && (
         <button onClick={()=>setChatOpen(true)} style={{
-          position:"fixed", right:24, bottom:24, zIndex:50,
-          width:56, height:56, borderRadius:"50%",
+          position:"fixed", right:24, bottom:24, zIndex:9999,
+          width:60, height:60, borderRadius:"50%",
           background:"linear-gradient(135deg,#3b82f6,#22d3ee)",
-          border:"none", cursor:"pointer",
-          boxShadow:"0 6px 20px rgba(34,211,238,0.4)",
-          fontSize:24, color:"#fff",
+          border:"2px solid rgba(255,255,255,0.2)", cursor:"pointer",
+          boxShadow:"0 8px 24px rgba(34,211,238,0.5), 0 0 0 4px rgba(34,211,238,0.15)",
+          fontSize:26, color:"#fff",
           display:"flex", alignItems:"center", justifyContent:"center",
         }} title="자유 채팅방 열기">💬</button>
       )}
@@ -3346,7 +3346,7 @@ function DiscussionCard({ discussion }) {
       {/* ★ 영역 7-C: 채팅창 모달 */}
       {chatOpen && (
         <div style={{
-          position:"fixed", right:24, bottom:24, zIndex:50,
+          position:"fixed", right:24, bottom:24, zIndex:9999,
           width:"min(440px, calc(100vw - 48px))",
           height:"min(640px, calc(100vh - 48px))",
           background:"rgba(3,6,13,0.97)",

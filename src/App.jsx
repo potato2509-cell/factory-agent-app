@@ -365,6 +365,153 @@ function selectKeyIssues(priority) {
 // ★ 새로운 논의 시스템 ★
 // ═════════════════════════════════════════════════════════════════════════════
 
+// ─── 0. PE 사전 큐레이션 (전체 이슈 1회 호출) ────────────────────────────────
+async function runPreCuration(allIssues, kbPE, reportType) {
+  // 모든 이슈를 한 번에 PE에게 보내서 일자별 표 + 장기부동 + 반복항목 정리
+  // 호출 1회로 전체 그림 작성 (토큰 비용 효율적)
+
+  if (!allIssues || allIssues.length === 0) {
+    return {
+      summary_text: "분석 대상 이슈 없음",
+      daily_table: [],
+      long_downtime: [],
+      recurring: [],
+      process_changes: [],
+      tests_inspections: [],
+    };
+  }
+
+  // 이슈 데이터를 JSON으로 변환 (PE가 읽기 쉽게)
+  const issuesData = allIssues.map((issue, idx) => ({
+    no: idx + 1,
+    date: issue.date || "",
+    time: issue.time,
+    equipment: issue.eq,
+    problem: issue.prob,
+    cause: issue.cause,
+    result: issue.result,
+    pic: issue.pic,
+    duration_min: issue.durMin,
+    reasons: issue.reasons,
+  }));
+
+  const focus = REPORT_FOCUS[reportType] || REPORT_FOCUS.meeting;
+  const kbText = kbPE ? `\n\n[학습 내용 일부]\n${kbPE.slice(0, 300)}` : "";
+
+  const sys = `${FACTORY_PHILOSOPHY}
+
+당신은 AZS 배터리 공장의 ${PERSONAS.Cell_PE.role.replace(" - Cell 공정", "")}입니다.
+이번 작업은 단일 이슈 분석이 아니라, 주어진 모든 이슈를 한눈에 보고 큐레이션 정리하는 역할입니다.${kbText}
+
+${focus} 다음 이슈 데이터 전체를 검토하여 보고서 첫머리에 들어갈 큐레이션을 작성하세요.
+
+[필수 출력 - JSON만, 다른 텍스트 금지]
+{
+  "summary_text": "전체 이슈 흐름의 핵심 트렌드 요약 (예: '주요 트러블은 Stacking 공정에 집중', 200자 이내)",
+  "daily_table": [
+    {"date":"발생일자","equipment":"발생호기","issue":"주요내용 (50자)","action":"조치사항 (50자)","downtime":부동시간_분단위_숫자}
+  ],
+  "long_downtime": [
+    {"equipment":"호기","reason":"장기 부동 사유","since":"시작일자","status":"현재상태 (진행형/완료/대기)","duration_note":"누적 시간 또는 기간 메모"}
+  ],
+  "recurring": [
+    {"item":"반복 항목명 (예: Align Table Ejector Time Out)","lines":["발생 호기 배열"],"count":발생_횟수,"cause":"주요 원인"}
+  ],
+  "process_changes": [],
+  "tests_inspections": []
+}
+
+[규칙]
+- daily_table은 모든 이슈가 아니라 주요 이슈만 (각 일자 대표 이슈, 최대 10건)
+- long_downtime은 60분 이상 또는 미해결 이슈
+- recurring은 같은 항목이 2회 이상 발생한 것 (Equipment 또는 Problem 기준)
+- process_changes와 tests_inspections는 빈 배열로 둘 것 (이번 단계에서는 지원 안 함)
+- 부동시간(downtime)은 반드시 숫자만 (단위 제외)
+- 이슈 데이터의 PIC, 사유 등은 무시하고 객관적 사실만 정리`;
+
+  const userMsg = `[전체 이슈 데이터 - ${allIssues.length}건]
+${JSON.stringify(issuesData, null, 1)}
+
+위 모든 이슈를 검토하여 큐레이션 JSON을 작성하세요.`;
+
+  try {
+    await new Promise(r => setTimeout(r, 500));
+    const raw = await callClaudeRaw(sys, userMsg, {
+      model: MODEL_REASONING,
+      max_tokens: 2000,  // 큐레이션은 출력이 큼
+    });
+    const parsed = safeJSON(raw);
+    return {
+      summary_text: parsed.summary_text || "큐레이션 요약 생성 실패",
+      daily_table: Array.isArray(parsed.daily_table) ? parsed.daily_table : [],
+      long_downtime: Array.isArray(parsed.long_downtime) ? parsed.long_downtime : [],
+      recurring: Array.isArray(parsed.recurring) ? parsed.recurring : [],
+      process_changes: [],   // 영역 5에서 추가 예정
+      tests_inspections: [], // 영역 5에서 추가 예정
+    };
+  } catch (e) {
+    console.error("[PE 큐레이션 실패]", e);
+    // 폴백: 데이터 기반 자동 생성 (API 호출 없이)
+    return buildFallbackCuration(allIssues);
+  }
+}
+
+// PE 큐레이션 폴백 - 데이터 기반 자동 생성
+function buildFallbackCuration(allIssues) {
+  // 일자별 정리 (각 일자에서 가장 부동시간 긴 이슈)
+  const byDate = {};
+  for (const issue of allIssues) {
+    const d = issue.date || "?";
+    if (!byDate[d] || (issue.durMin || 0) > (byDate[d].durMin || 0)) {
+      byDate[d] = issue;
+    }
+  }
+  const daily_table = Object.entries(byDate).map(([date, issue]) => ({
+    date,
+    equipment: issue.eq || "-",
+    issue: (issue.prob || "").slice(0, 50),
+    action: (issue.result || "").slice(0, 50),
+    downtime: issue.durMin || 0,
+  })).slice(0, 10);
+
+  // 장기 부동 (60분 이상 또는 미해결)
+  const long_downtime = allIssues
+    .filter(i => (i.durMin || 0) >= 60 || (i.result || "").toLowerCase().includes("not solved"))
+    .slice(0, 5)
+    .map(i => ({
+      equipment: i.eq || "-",
+      reason: (i.cause || i.prob || "").slice(0, 60),
+      since: i.date || "",
+      status: (i.result || "").toLowerCase().includes("solved") ? "완료" : "진행형",
+      duration_note: `${i.durMin || 0}분`,
+    }));
+
+  // 반복 항목 (Equipment 기준 2회 이상)
+  const eqCount = {};
+  for (const i of allIssues) {
+    if (!i.eq) continue;
+    eqCount[i.eq] = (eqCount[i.eq] || 0) + 1;
+  }
+  const recurring = Object.entries(eqCount)
+    .filter(([, c]) => c >= 2)
+    .slice(0, 5)
+    .map(([eq, count]) => ({
+      item: eq,
+      lines: [eq],
+      count,
+      cause: "(데이터 기반 자동 추출 - 상세 원인 추가 분석 필요)",
+    }));
+
+  return {
+    summary_text: `[PE 큐레이션 폴백] 총 ${allIssues.length}건의 이슈가 발생함. AI 큐레이션 호출 실패로 자동 정리됨.`,
+    daily_table,
+    long_downtime,
+    recurring,
+    process_changes: [],
+    tests_inspections: [],
+  };
+}
+
 // ─── 1. 모드 분류 (키워드 → 우선순위 → 폴백) ───────────────────────────────────
 function classifyDiscussionMode(issue, isPriUrgent, isPriImportant) {
   const fullText = [issue.eq, issue.prob, issue.cause, issue.result, issue.text].join(" ");
@@ -454,15 +601,38 @@ JSON만 출력 (다른 텍스트 금지):
   }
 }
 
-// ─── 3. 단일 페르소나 호출 (이전 의견 누적) ────────────────────────────────────
-async function callPersona(personaCode, issueCtx, prevOpinions, kbText, reportType) {
+// ─── 3. 단일 페르소나 호출 (이전 의견 누적 + 대화체 + JSON 스키마) ─────────────
+async function callPersona(personaCode, issueCtx, prevOpinions, kbText, reportType, isPostAction = false) {
+  // isPostAction: true이면 기조치 건 (기존 조치 적절성 평가 강조)
   const p = PERSONAS[personaCode];
   const focus = REPORT_FOCUS[reportType] || REPORT_FOCUS.meeting;
   const kb = kbText ? `\n\n[학습 내용]\n${kbText.slice(0, 500)}` : "";
 
+  // 이전 발언자 의견 (대화체 인용용)
   const prevText = prevOpinions.length > 0
-    ? `\n\n[먼저 발언한 동료 의견]\n${prevOpinions.map(o => `── ${PERSONAS[o.persona]?.label} (${o.persona}) ──\n${o.opinion}`).join("\n\n")}\n\n위 의견을 참고하여 의견을 제시하세요. 동의할 부분은 "동의합니다"로 짧게, 다른 입장일 때만 명확히 다른 관점 제시.`
-    : "\n\n당신의 관점에서 의견을 제시하세요.";
+    ? `\n\n[먼저 발언한 동료 의견]\n${prevOpinions.map(o => {
+        const op = o.opinion || {};
+        return `── ${PERSONAS[o.persona]?.label} (${o.persona}) ──
+[현상] ${op["현상"] || "-"}
+[원인] ${op["원인"] || "-"}
+[대책] ${op["대책"] || "-"}
+[기존조치 평가] ${op["기존조치_평가"] || "-"}`;
+      }).join("\n\n")}`
+    : "";
+
+  const conversationGuide = prevOpinions.length > 0
+    ? `\n\n[대화 진행 방식]
+- 위 동료 의견을 직접 언급/인용하며 대화체로 작성하세요 (예: "Cell_TE의 온도 분석에 대해 동의합니다만...", "ME가 지적한 베어링 마모 외에...")
+- previous_reference 필드에 누구의 어떤 의견을 받아 답하는지 명시
+- stance 필드에 동의/부분동의/반대/추가의견 중 선택`
+    : `\n\n[첫 발언자 안내]\n- 당신이 첫 발언자입니다. previous_reference는 빈 문자열, stance는 "초기분석"`;
+
+  const postActionGuide = isPostAction
+    ? `\n\n[★ 기조치 건 - 추가 강조 사항]
+- 이미 조치가 시도된 건입니다. "기존조치_평가" 필드에 반드시 기존 조치의 적절성을 분석하세요.
+- 평가 기준: ① 적절했는지 ② 부족한 점 ③ 추가로 필요한 보완책
+- "대책" 필드에는 보완책/재발방지책에 집중하세요.`
+    : "";
 
   const sys = `${FACTORY_PHILOSOPHY}
 
@@ -472,20 +642,34 @@ async function callPersona(personaCode, issueCtx, prevOpinions, kbText, reportTy
 [관심 영역] ${p.focus}
 [입장] ${p.stance}${kb}
 
-${focus} 다음 이슈를 분석하세요.
+${focus} 다음 이슈를 ${p.role.split(" ")[0]} 관점에서 분석하세요.${conversationGuide}${postActionGuide}
 
-JSON만 출력:
-{"analysis":"이슈 원인 및 영향 분석 (100자이내)","action":"즉시 조치사항 (60자이내)","prevention":"재발방지 방안 (60자이내)"}`;
+[필수 출력 - JSON만]
+{
+  "previous_reference": "이전 동료 의견 인용 (첫 발언자는 빈 문자열, 60자이내)",
+  "stance": "동의/부분동의/반대/추가의견/초기분석 중 하나",
+  "현상": "내 직무 관점에서 본 현상 (80자이내)",
+  "원인": "1차 원인 + 근본 원인 (100자이내)",
+  "대책": "구체적 대책 또는 보완책 (80자이내)",
+  "기존조치_평가": "이미 시도된 조치의 적절성·부족함 분석 (80자이내, 기조치 건이 아니면 '해당없음')"
+}`;
 
   try {
     await new Promise(r => setTimeout(r, 600));
     const raw = await callClaudeRaw(sys, `[이슈]\n${issueCtx}${prevText}`, {
       model: MODEL_REASONING,
-      max_tokens: 500,
+      max_tokens: 800,  // 6필드 수용 (기존 500에서 증가)
     });
     return safeJSON(raw);
   } catch {
-    return { analysis: "분석 중 오류", action: "-", prevention: "-" };
+    return {
+      previous_reference: "",
+      stance: "분석 오류",
+      "현상": "분석 중 오류",
+      "원인": "-",
+      "대책": "-",
+      "기존조치_평가": "-",
+    };
   }
 }
 
@@ -493,7 +677,13 @@ JSON만 출력:
 async function moderateDeep(issueCtx, opinions) {
   const opinionsText = opinions.map(o => {
     const p = PERSONAS[o.persona];
-    return `── ${p.label} (${o.persona}) ──\n분석: ${o.opinion?.analysis}\n조치: ${o.opinion?.action}\n재발방지: ${o.opinion?.prevention}`;
+    const op = o.opinion || {};
+    return `── ${p.label} (${o.persona}) [${op.stance || "-"}] ──
+[이전 발언 인용] ${op.previous_reference || "(첫 발언자)"}
+[현상] ${op["현상"] || "-"}
+[원인] ${op["원인"] || "-"}
+[대책] ${op["대책"] || "-"}
+[기존조치 평가] ${op["기존조치_평가"] || "-"}`;
   }).join("\n\n");
 
   const sys = `당신은 공장 이슈 논의의 중립 사회자입니다. 어느 한쪽 편들지 않고 객관적으로 종합하세요.
@@ -508,26 +698,24 @@ JSON만 출력:
   "needsMore":"추가 논의 필요 사항 (없으면 '없음')"
 }`;
 
-  try {
-    await new Promise(r => setTimeout(r, 500));
-    const raw = await callClaudeRaw(sys, `[이슈]\n${issueCtx}\n\n[엔지니어 의견]\n${opinionsText}\n\n5섹션 형식으로 종합 정리하세요.`, {
-      model: MODEL_REASONING,
-      max_tokens: 800,
-    });
-    return safeJSON(raw);
-  } catch {
-    return {
-      consensus: "사회자 종합 실패",
-      differences: "-", conflicts: "-", recommendation: "-", needsMore: "-",
-    };
-  }
+  await new Promise(r => setTimeout(r, 500));
+  const raw = await callClaudeRaw(sys, `[이슈]\n${issueCtx}\n\n[엔지니어 의견]\n${opinionsText}\n\n5섹션 형식으로 종합 정리하세요.`, {
+    model: MODEL_REASONING,
+    max_tokens: 800,
+  });
+  return safeJSON(raw);
 }
 
 // ─── 5. 사회자: STANDARD 액션플랜 ──────────────────────────────────────────────
 async function moderateStandard(issueCtx, opinions) {
   const opinionsText = opinions.map(o => {
     const p = PERSONAS[o.persona];
-    return `── ${p.label} (${o.persona}) ──\n조치: ${o.opinion?.action}\n재발방지: ${o.opinion?.prevention}`;
+    const op = o.opinion || {};
+    return `── ${p.label} (${o.persona}) [${op.stance || "-"}] ──
+[현상] ${op["현상"] || "-"}
+[원인] ${op["원인"] || "-"}
+[대책] ${op["대책"] || "-"}
+[기존조치 평가] ${op["기존조치_평가"] || "-"}`;
   }).join("\n\n");
 
   const sys = `당신은 공장 이슈 논의의 중립 사회자입니다. 의견을 받아 실행 가능한 액션 플랜으로 정리하세요.
@@ -542,16 +730,12 @@ JSON만 출력:
   "needsMore":"추가 확인 필요 (없으면 '없음')"
 }`;
 
-  try {
-    await new Promise(r => setTimeout(r, 500));
-    const raw = await callClaudeRaw(sys, `[이슈]\n${issueCtx}\n\n[의견]\n${opinionsText}\n\n액션 플랜으로 정리.`, {
-      model: MODEL_REASONING,
-      max_tokens: 700,
-    });
-    return safeJSON(raw);
-  } catch {
-    return { summary: "사회자 종합 실패", actions: [], needsMore: "-" };
-  }
+  await new Promise(r => setTimeout(r, 500));
+  const raw = await callClaudeRaw(sys, `[이슈]\n${issueCtx}\n\n[의견]\n${opinionsText}\n\n액션 플랜으로 정리.`, {
+    model: MODEL_REASONING,
+    max_tokens: 700,
+  });
+  return safeJSON(raw);
 }
 
 // ─── 6. 사회자: LITE 압축 평가 (단독 호출, 페르소나 호출 없음) ──────────────────
@@ -566,17 +750,148 @@ JSON만 출력:
   "prevention":"재발 방지책 (1-2개 구체 행동)"
 }`;
 
+  await new Promise(r => setTimeout(r, 400));
+  const raw = await callClaudeRaw(sys, `[완료된 이슈]\n${issueCtx}\n\n짧게 평가.`, {
+    model: MODEL_REASONING,
+    max_tokens: 400,
+  });
+  return safeJSON(raw);
+}
+
+// ─── 6-1. 사회자 3단계 폴백 통합 함수 ───────────────────────────────────────────
+async function moderateWithFallback(mode, issueCtx, opinions) {
+  // 1차: 정상 호출
   try {
-    await new Promise(r => setTimeout(r, 400));
-    const raw = await callClaudeRaw(sys, `[완료된 이슈]\n${issueCtx}\n\n짧게 평가.`, {
-      model: MODEL_REASONING,
-      max_tokens: 400,
-    });
-    return safeJSON(raw);
-  } catch {
-    return { supplement: "-", recurRisk: "-", prevention: "-" };
+    let primary;
+    if (mode === "DEEP")     primary = await moderateDeep(issueCtx, opinions);
+    else if (mode === "STANDARD") primary = await moderateStandard(issueCtx, opinions);
+    else if (mode === "LITE")     primary = await moderateLite(issueCtx);
+    else throw new Error(`Unknown mode: ${mode}`);
+
+    return { ...primary, _fallback_level: "primary" };
+  } catch (e1) {
+    console.warn(`[Moderator 1차 실패] ${mode}:`, e1.message);
+
+    // 2차: 단순 프롬프트로 재시도
+    try {
+      const retry = await moderateRetrySimple(mode, issueCtx, opinions);
+      return { ...retry, _fallback_level: "retry" };
+    } catch (e2) {
+      console.warn(`[Moderator 2차 실패] ${mode}:`, e2.message);
+
+      // 3차: 코드 레벨 자동 생성 (API 호출 없음)
+      const codeFallback = codeFallbackModerator(mode, opinions);
+      return { ...codeFallback, _fallback_level: "code_fallback" };
+    }
   }
 }
+
+// 2차 재시도 - 더 단순한 프롬프트 + 더 짧은 출력 요구
+async function moderateRetrySimple(mode, issueCtx, opinions) {
+  const opinionsCompact = opinions.map(o => {
+    const p = PERSONAS[o.persona];
+    const op = o.opinion || {};
+    return `${p.label}: 현상=${op["현상"] || "-"} / 원인=${op["원인"] || "-"} / 대책=${op["대책"] || "-"}`;
+  }).join("\n");
+
+  if (mode === "DEEP") {
+    const sys = `다음 의견들을 5섹션으로 짧게 종합하세요. JSON만:
+{"consensus":"합의","differences":"차이","conflicts":"충돌","recommendation":"권고","needsMore":"추가"}`;
+    await new Promise(r => setTimeout(r, 400));
+    const raw = await callClaudeRaw(sys, `[이슈]\n${issueCtx.slice(0, 300)}\n\n[의견]\n${opinionsCompact}`, {
+      model: MODEL_REASONING,
+      max_tokens: 500,
+    });
+    return safeJSON(raw);
+  }
+
+  if (mode === "STANDARD") {
+    const sys = `다음 의견을 액션 플랜으로 짧게 정리. JSON만:
+{"summary":"요약","actions":[{"action":"행동","owner":"담당","priority":"우선순위","duration":"기간"}],"needsMore":"추가"}`;
+    await new Promise(r => setTimeout(r, 400));
+    const raw = await callClaudeRaw(sys, `[이슈]\n${issueCtx.slice(0, 300)}\n\n[의견]\n${opinionsCompact}`, {
+      model: MODEL_REASONING,
+      max_tokens: 500,
+    });
+    return safeJSON(raw);
+  }
+
+  // LITE
+  const sys = `다음 이슈를 짧게 평가. JSON만:
+{"supplement":"보완점","recurRisk":"재발우려","prevention":"방지책"}`;
+  await new Promise(r => setTimeout(r, 400));
+  const raw = await callClaudeRaw(sys, `[이슈]\n${issueCtx.slice(0, 300)}`, {
+    model: MODEL_REASONING,
+    max_tokens: 300,
+  });
+  return safeJSON(raw);
+}
+
+// 3차 폴백 - 코드 레벨 자동 생성 (페르소나 의견을 직접 합쳐 결과 생성)
+function codeFallbackModerator(mode, opinions) {
+  // 페르소나별 의견 간단 정리
+  const opinionsByPersona = opinions.map(o => {
+    const p = PERSONAS[o.persona];
+    const op = o.opinion || {};
+    return {
+      label: p?.label || o.persona,
+      code: o.persona,
+      stance: op.stance || "-",
+      현상: op["현상"] || "(의견 없음)",
+      원인: op["원인"] || "(의견 없음)",
+      대책: op["대책"] || "(의견 없음)",
+      기존조치_평가: op["기존조치_평가"] || "해당없음",
+    };
+  });
+
+  // 합의 추출 시도 (모두 비슷한 단어가 있는지)
+  const allCauses = opinionsByPersona.map(o => o.원인).join(" ");
+  const allActions = opinionsByPersona.map(o => o.대책).join(" ");
+
+  // 충돌 추출 (반대 stance가 있는지)
+  const stances = opinionsByPersona.map(o => o.stance);
+  const hasConflict = stances.includes("반대") || stances.includes("부분동의");
+
+  if (mode === "DEEP") {
+    const consensus = opinionsByPersona.length > 0
+      ? `${opinionsByPersona.length}명의 엔지니어가 본 이슈를 분석함. 자동 종합 모드 (사회자 호출 실패).`
+      : "분석 의견이 수집되지 않음";
+    const differences = opinionsByPersona
+      .map(o => `${o.label}: ${o.원인.slice(0, 50)} → ${o.대책.slice(0, 50)}`)
+      .join(" / ");
+    const conflicts = hasConflict
+      ? `반대/부분동의 의견 존재 (${stances.filter(s => s === "반대" || s === "부분동의").length}건)`
+      : "명시적 충돌 없음";
+    const recommendation = `자동 종합: ${opinionsByPersona[0]?.대책 || "-"} 우선 검토 필요. 사회자 자동 종합 실패로 수동 검토 권장.`;
+    const needsMore = "★ 사회자 호출 실패 — 위 내용을 직접 검토해주세요. 페르소나 개별 의견을 참조하세요.";
+
+    return { consensus, differences, conflicts, recommendation, needsMore };
+  }
+
+  if (mode === "STANDARD") {
+    const summary = `${opinionsByPersona.length}명 의견 자동 정리 (사회자 호출 실패)`;
+    const actions = opinionsByPersona.map(o => ({
+      action: o.대책.slice(0, 60),
+      owner: o.code,
+      priority: o.stance === "반대" ? "낮음" : "중간",
+      duration: "검토 필요",
+    }));
+    const needsMore = "★ 사회자 호출 실패 — 페르소나 의견 직접 검토 필요";
+
+    return { summary, actions, needsMore };
+  }
+
+  // LITE
+  return {
+    supplement: "사회자 호출 실패 - 자동 평가 생성됨",
+    recurRisk: "낮음 (단순 분석 모드)",
+    prevention: "정상 모드에서 재분석 권장",
+  };
+}
+
+// ─── 6-2. (구버전 호환) 단순 사회자 함수들 - 더 이상 직접 호출 안 함 ────────────
+// runIssueDiscussion에서 moderateWithFallback을 호출하므로 위 함수들은 내부에서만 사용
+
 
 // ─── 7. 통합: 단일 이슈 모드별 논의 실행 ────────────────────────────────────────
 async function runIssueDiscussion(issue, modeInfo, kb, reportType, allowedAgents, onProgress) {
@@ -589,12 +904,18 @@ async function runIssueDiscussion(issue, modeInfo, kb, reportType, allowedAgents
 담당자: ${issue.pic}
 우선순위 사유: ${issue.reasons?.join(", ")}`;
 
+  // ★ 기조치 건 판단: result에 "solved" 등이 있으면 이미 조치된 건
+  const resultLower = (issue.result || "").toLowerCase();
+  const isPostAction = resultLower.includes("solved") &&
+                       !resultLower.includes("not solved") &&
+                       !resultLower.includes("unsolved");
+
   // ─── LITE 모드: 사회자만 단독 호출 (1회) ───
   if (modeInfo.mode === "LITE") {
-    onProgress?.(`🟢 LITE 모드 - 사회자 단독 평가`);
-    const result = await moderateLite(issueCtx);
+    onProgress?.(`🟢 LITE 모드 - 사회자 단독 평가${isPostAction ? " (기조치)" : ""}`);
+    const result = await moderateWithFallback("LITE", issueCtx, []);
     return {
-      issue, modeInfo,
+      issue, modeInfo, isPostAction,
       router: null,
       opinions: [],
       moderator: { type: "lite", ...result },
@@ -603,31 +924,117 @@ async function runIssueDiscussion(issue, modeInfo, kb, reportType, allowedAgents
 
   // ─── DEEP / STANDARD: 라우터 → 순차 호출 → 사회자 ───
   // [1] 라우터 (선택된 풀 안에서만 결정)
-  onProgress?.(`🎯 라우터: 발언 순서 결정 중... (${allowedAgents.length}명 풀)`);
+  onProgress?.(`🎯 라우터: 발언 순서 결정 중... (${allowedAgents.length}명 풀)${isPostAction ? " [기조치 건]" : ""}`);
   const router = await routeAgentOrder(issueCtx, allowedAgents);
   onProgress?.(`🎯 발언 순서: ${router.order.map(o => PERSONAS[o]?.label).join(" → ")}`);
 
-  // [2] 페르소나 순차 호출
+  // [2] 페르소나 순차 호출 (대화체 + JSON 스키마 + 기조치 평가)
   const opinions = [];
   for (const personaCode of router.order) {
     const p = PERSONAS[personaCode];
     onProgress?.(`${p.icon} ${p.label} 의견 수렴 중... (${opinions.length + 1}/${router.order.length})`);
-    const opinion = await callPersona(personaCode, issueCtx, opinions, kb[personaCode] || "", reportType);
+    const opinion = await callPersona(personaCode, issueCtx, opinions, kb[personaCode] || "", reportType, isPostAction);
     opinions.push({ persona: personaCode, opinion });
   }
 
-  // [3] 사회자 (모드별 분기)
-  onProgress?.(`📋 사회자 종합 중...`);
-  const moderator = modeInfo.mode === "DEEP"
-    ? { type: "deep", ...await moderateDeep(issueCtx, opinions) }
-    : { type: "standard", ...await moderateStandard(issueCtx, opinions) };
+  // [3] 사회자 (모드별 분기 + 3단계 폴백)
+  onProgress?.(`📋 사회자 종합 중... (${modeInfo.mode})`);
+  const result = await moderateWithFallback(modeInfo.mode, issueCtx, opinions);
+  const moderator = { type: modeInfo.mode.toLowerCase(), ...result };
 
-  return { issue, modeInfo, router, opinions, moderator };
+  if (result._fallback_level && result._fallback_level !== "primary") {
+    onProgress?.(`⚠️ 사회자 폴백 사용: ${result._fallback_level}`);
+  }
+
+  return { issue, modeInfo, isPostAction, router, opinions, moderator };
 }
 
 // ═════════════════════════════════════════════════════════════════════════════
 // 시간/빈도 분석 (인수인계 문서 7번)
 // ═════════════════════════════════════════════════════════════════════════════
+// ═════════════════════════════════════════════════════════════════════════════
+// 이슈별 상세 카드 생성 (모드별 차등)
+// ═════════════════════════════════════════════════════════════════════════════
+function buildIssueDetailCard(discussion) {
+  const { issue, modeInfo, isPostAction, router, opinions, moderator } = discussion;
+
+  // 페르소나 의견을 종합해 필드별로 추출
+  const aggregateField = (fieldName) => {
+    return opinions
+      .filter(o => o.opinion?.[fieldName] && o.opinion[fieldName] !== "-" && o.opinion[fieldName] !== "해당없음")
+      .map(o => `[${PERSONAS[o.persona]?.label}] ${o.opinion[fieldName]}`)
+      .join(" / ");
+  };
+
+  // 페르소나별 의견 한 줄 요약
+  const opinionsByPersona = opinions.map(o => {
+    const p = PERSONAS[o.persona];
+    const op = o.opinion || {};
+    return {
+      code: o.persona,
+      label: p?.label || o.persona,
+      icon: p?.icon || "•",
+      stance: op.stance || "-",
+      summary: `${op["현상"] || "-"} → ${op["원인"] || "-"} → ${op["대책"] || "-"}`,
+    };
+  });
+
+  // 합의/반대 지점 분석
+  const stances = opinions.map(o => o.opinion?.stance);
+  const agreedCount = stances.filter(s => s === "동의" || s === "초기분석").length;
+  const conflictCount = stances.filter(s => s === "반대" || s === "부분동의").length;
+  const consensusPoint = moderator?.type === "deep" ? (moderator.consensus || "-") : "-";
+  const conflictPoint = moderator?.type === "deep" ? (moderator.conflicts || "-") : "-";
+
+  if (modeInfo.mode === "DEEP") {
+    // DEEP: 8필드 풀 카드
+    return {
+      mode: "DEEP",
+      isPostAction,
+      header: `[${issue.time}] ${issue.eq} (${issue.durMin}분)`,
+      modeReason: modeInfo.reason,
+      fallbackLevel: moderator?._fallback_level || "primary",
+
+      // 8필드
+      현상: aggregateField("현상") || issue.prob || "-",
+      원인: aggregateField("원인") || issue.cause || "-",
+      즉시조치: issue.result || "-",
+      기존조치_적절성: isPostAction
+        ? (aggregateField("기존조치_평가") || "평가 없음")
+        : "(기조치 아님 - 해당없음)",
+      재발방지책: moderator?.type === "deep"
+        ? (moderator.recommendation || "-")
+        : aggregateField("대책"),
+      보완책: moderator?.type === "deep"
+        ? (moderator.needsMore && moderator.needsMore !== "없음" ? moderator.needsMore : aggregateField("대책"))
+        : aggregateField("대책"),
+      발언자별의견: opinionsByPersona,
+      합의반대지점: `합의: ${consensusPoint} | 충돌: ${conflictPoint} (동의 ${agreedCount}, 반대/부분 ${conflictCount})`,
+    };
+  }
+
+  // STANDARD/LITE: 3필드 축약
+  const liteSupplement = moderator?.type === "lite" ? (moderator.supplement || "-") : "-";
+  const literRecur = moderator?.type === "lite" ? (moderator.recurRisk || "-") : "-";
+  const litePrev = moderator?.type === "lite" ? (moderator.prevention || "-") : "-";
+  const stdSummary = moderator?.type === "standard" ? (moderator.summary || "-") : "-";
+
+  return {
+    mode: modeInfo.mode,
+    isPostAction,
+    header: `[${issue.time}] ${issue.eq} (${issue.durMin}분)`,
+    modeReason: modeInfo.reason,
+    fallbackLevel: moderator?._fallback_level || "primary",
+
+    // 3필드 축약
+    현상: aggregateField("현상") || issue.prob || "-",
+    원인: aggregateField("원인") || issue.cause || "-",
+    대책: modeInfo.mode === "LITE"
+      ? `${litePrev} (재발 우려: ${literRecur} | 보완: ${liteSupplement})`
+      : (stdSummary !== "-" ? stdSummary : aggregateField("대책")),
+  };
+}
+
 function buildTimeFreqAnalysis(allIssues, processName = "Cell") {
   // 시간대별
   const hourBuckets = new Array(24).fill(0);
@@ -662,13 +1069,16 @@ function buildTimeFreqAnalysis(allIssues, processName = "Cell") {
 // ═════════════════════════════════════════════════════════════════════════════
 // 보고서 생성 (모드별 그룹핑 + 시간/빈도 분석 추가)
 // ═════════════════════════════════════════════════════════════════════════════
-async function generateReport(date, dates, discussions, priority, reportType, kb, allIssues, processName = "Cell") {
+async function generateReport(date, dates, discussions, priority, reportType, kb, allIssues, processName = "Cell", curation = null) {
   const focus = REPORT_FOCUS[reportType] || REPORT_FOCUS.meeting;
   const reportTitle = REPORT_TYPES.find(r => r.id === reportType)?.label || "회의록";
   const dateStr = dates.length > 1 ? `${dates[0]} ~ ${dates[dates.length-1]}` : date;
 
   // 시간/빈도 분석 (모든 이슈 대상)
   const analytics = buildTimeFreqAnalysis(allIssues, processName);
+
+  // ★ 이슈별 상세 카드 생성 (모드별 차등)
+  const detailCards = discussions.map(d => buildIssueDetailCard(d));
 
   // 모드별 그룹핑
   const grouped = { DEEP: [], STANDARD: [], LITE: [] };
@@ -764,6 +1174,8 @@ ${discussionSummary}`;
     agenda: `다운타임 ${priority.urgent.length + priority.important.length + priority.normal.length}건 분석 및 대책 수립`,
     sections,
     discussions,
+    detailCards,    // ★ 이슈별 상세 카드 (모드별 차등)
+    curation,       // ★ PE 사전 큐레이션
     analytics,
     grouped,
   };
@@ -913,6 +1325,18 @@ export default function App() {
 
       setProgress(p => [...p, `🔍 심층 분석 대상: 긴급/중요 ${keyIssues.length}건 + 일반(LITE) ${liteIssues.length}건`]);
 
+      // ★ PE 사전 큐레이션 (전체 이슈 1회 호출)
+      setProgress(p => [...p, "📝 PE 사전 큐레이션 중 (전체 이슈 정리)..."]);
+      const allIssuesForCuration = [...priority.urgent, ...priority.important, ...priority.normal];
+      let curation;
+      try {
+        curation = await runPreCuration(allIssuesForCuration, kbResult.kb["Cell_PE"] || kbResult.kb["Elec_PE"] || "", reportType);
+        setProgress(p => [...p, `✅ PE 큐레이션 완료 (일자별 ${curation.daily_table.length}건, 장기부동 ${curation.long_downtime.length}건, 반복 ${curation.recurring.length}건)`]);
+      } catch (e) {
+        setProgress(p => [...p, `⚠️ PE 큐레이션 실패 - 폴백 사용`]);
+        curation = buildFallbackCuration(allIssuesForCuration);
+      }
+
       // 모드 분류 + 건별 논의
       const allDiscussions = [];
 
@@ -950,7 +1374,7 @@ export default function App() {
       setProgress(p => [...p, "📄 보고서 생성 중..."]);
       const dateStr = selDates.length > 1 ? `${selDates[0]}~${selDates[selDates.length-1]}` : selDates[0];
       const allIssuesForAnalytics = [...priority.urgent, ...priority.important, ...priority.normal];
-      const report = await generateReport(dateStr, selDates, allDiscussions, priority, reportType, kbResult.kb, allIssuesForAnalytics, selectedProcess);
+      const report = await generateReport(dateStr, selDates, allDiscussions, priority, reportType, kbResult.kb, allIssuesForAnalytics, selectedProcess, curation);
       // ★ 보고서에 공정/참여 에이전트 정보 추가
       report.process = selectedProcess;
       report.allowedAgents = allowedAgents;
@@ -990,10 +1414,37 @@ export default function App() {
     if (!minutes) return;
     let t = `${"═".repeat(52)}\n${minutes.title}\n${"═".repeat(52)}\n`;
     t += `일시: ${minutes.date}\n참석: ${minutes.attendees}\n안건: ${minutes.agenda}\n`;
-    // ★ 공정/참여 에이전트 정보
     if (minutes.process && minutes.allowedAgents) {
       t += `대상 공정: ${PROCESSES[minutes.process]?.label || minutes.process}\n`;
       t += `참여 에이전트 (${minutes.allowedAgents.length}명): ${minutes.allowedAgents.map(a => `${a}(${PERSONAS[a]?.label})`).join(", ")}\n`;
+    }
+
+    // ★ PE 사전 큐레이션
+    if (minutes.curation) {
+      t += `\n${"═".repeat(52)}\n📝 PE 사전 큐레이션\n${"═".repeat(52)}\n`;
+      t += `\n${minutes.curation.summary_text}\n`;
+
+      if (minutes.curation.daily_table?.length > 0) {
+        t += `\n[일자별 주요 이슈]\n`;
+        minutes.curation.daily_table.forEach(row => {
+          t += `  ${row.date} | ${row.equipment} | ${row.issue} | ${row.action} | ${row.downtime}분\n`;
+        });
+      }
+
+      if (minutes.curation.long_downtime?.length > 0) {
+        t += `\n[장기 부동 (${minutes.curation.long_downtime.length}건)]\n`;
+        minutes.curation.long_downtime.forEach(d => {
+          t += `  • ${d.equipment}: ${d.reason} (${d.duration_note}, ${d.status})\n`;
+        });
+      }
+
+      if (minutes.curation.recurring?.length > 0) {
+        t += `\n[반복 발생 항목 (${minutes.curation.recurring.length}건)]\n`;
+        minutes.curation.recurring.forEach(r => {
+          t += `  • ${r.item} (${r.count}회) - ${r.lines?.join(", ")}\n`;
+          if (r.cause) t += `    원인: ${r.cause}\n`;
+        });
+      }
     }
 
     // 시간/빈도 분석
@@ -1009,27 +1460,66 @@ export default function App() {
       });
     }
 
-    // 모드별 건별 논의 결과
+    // ★ 이슈별 상세 카드 (모드별 차등)
+    if (minutes.detailCards?.length > 0) {
+      t += `\n${"═".repeat(52)}\n📋 이슈별 상세 분석 카드\n${"═".repeat(52)}\n`;
+      minutes.detailCards.forEach((card, i) => {
+        t += `\n[${i+1}] ${card.header}${card.isPostAction ? " ✓ 기조치" : ""} [${card.mode}]\n`;
+        t += `${"─".repeat(40)}\n`;
+        t += `분류 사유: ${card.modeReason}\n`;
+        if (card.fallbackLevel !== "primary") {
+          t += `⚠️ 사회자 폴백: ${card.fallbackLevel}\n`;
+        }
+        t += `\n현상: ${card["현상"]}\n`;
+        t += `원인: ${card["원인"]}\n`;
+
+        if (card.mode === "DEEP") {
+          t += `즉시 조치: ${card["즉시조치"]}\n`;
+          t += `★ 기존 조치 적절성: ${card["기존조치_적절성"]}\n`;
+          t += `재발 방지책: ${card["재발방지책"]}\n`;
+          t += `보완책: ${card["보완책"]}\n`;
+          t += `\n발언자별 의견:\n`;
+          (card["발언자별의견"] || []).forEach(v => {
+            t += `  ${v.icon} ${v.label} [${v.stance}]: ${v.summary}\n`;
+          });
+          t += `\n합의/반대 지점: ${card["합의반대지점"]}\n`;
+        } else {
+          t += `대책: ${card["대책"]}\n`;
+        }
+      });
+    }
+
+    // 모드별 건별 논의 결과 (페르소나 원본 의견)
     if (discussions.length > 0) {
-      t += `\n${"═".repeat(52)}\n건별 논의 결과 (모드별)\n${"═".repeat(52)}\n`;
+      t += `\n${"═".repeat(52)}\n💬 건별 논의 원본 (페르소나 의견 + 사회자 종합)\n${"═".repeat(52)}\n`;
       for (const mode of ["DEEP", "STANDARD", "LITE"]) {
         const items = (minutes.grouped?.[mode]) || [];
         if (items.length === 0) continue;
         t += `\n${MODE_STYLE[mode].label} (${items.length}건)\n${"─".repeat(40)}\n`;
         items.forEach((d, i) => {
-          t += `\n[${mode}-${i+1}] ${d.issue.eq} (${d.issue.durMin}분, ${d.issue.time})\n`;
+          t += `\n[${mode}-${i+1}] ${d.issue.eq} (${d.issue.durMin}분, ${d.issue.time})${d.isPostAction ? " ✓ 기조치" : ""}\n`;
           t += `  분류: ${d.modeInfo.reason} (${d.modeInfo.source})\n`;
           if (d.router) t += `  발언 순서: ${d.router.order.join(" → ")} (${d.router.reason})\n`;
+          if (d.moderator?._fallback_level && d.moderator._fallback_level !== "primary") {
+            t += `  ⚠️ 사회자 폴백: ${d.moderator._fallback_level}\n`;
+          }
 
-          // 페르소나 의견
+          // 페르소나 의견 (6필드, 대화체)
           if (d.opinions.length > 0) {
-            t += `\n  ── 페르소나 의견 ──\n`;
+            t += `\n  ── 페르소나 의견 (대화체) ──\n`;
             d.opinions.forEach(o => {
               const p = PERSONAS[o.persona];
-              t += `  ${p.icon} ${p.label} (${o.persona})\n`;
-              t += `     분석: ${o.opinion?.analysis}\n`;
-              t += `     조치: ${o.opinion?.action}\n`;
-              t += `     재발방지: ${o.opinion?.prevention}\n`;
+              const op = o.opinion || {};
+              t += `\n  ${p.icon} ${p.label} (${o.persona}) [${op.stance || "-"}]\n`;
+              if (op.previous_reference && op.previous_reference !== "") {
+                t += `     💬 인용: "${op.previous_reference}"\n`;
+              }
+              t += `     📌 현상: ${op["현상"] || "-"}\n`;
+              t += `     🔍 원인: ${op["원인"] || "-"}\n`;
+              t += `     ⚡ 대책: ${op["대책"] || "-"}\n`;
+              if (op["기존조치_평가"] && op["기존조치_평가"] !== "해당없음" && op["기존조치_평가"] !== "-") {
+                t += `     🔁 기조치 평가: ${op["기존조치_평가"]}\n`;
+              }
             });
           }
 
@@ -1098,7 +1588,7 @@ export default function App() {
           display:"flex", alignItems:"center", justifyContent:"center", fontSize:17,
         }}>🏭</div>
         <div>
-          <div style={{fontSize:13,fontWeight:800,color:"#f1f5f9"}}>AZS · 논의 시스템 v3 · 다중 공정 보고서</div>
+          <div style={{fontSize:13,fontWeight:800,color:"#f1f5f9"}}>AZS · 논의 시스템 v3.1 · PE 큐레이션 + 대화형 논의</div>
           <div style={{fontSize:9,color:"#22d3ee",letterSpacing:2,fontWeight:700}}>Cell · Elec · FA · Vision  |  AZS</div>
         </div>
         {step > 0 && (
@@ -1137,7 +1627,7 @@ export default function App() {
               fontSize:11, color:"#22d3ee", lineHeight:1.7,
             }}>
               💡 날짜 기준: 06:00 이전 메시지는 전날 생산분으로 처리됩니다<br/>
-              🆕 v3: 공정 선택(Cell/Elec) + 추가 에이전트 선택 + 차등 논의 + 시간/빈도 분석
+              🆕 v3.1: PE 사전 큐레이션 + 대화체 논의 + 사회자 3단계 폴백 + 이슈 상세 카드 + 기조치 평가
             </div>
           </div>
         )}
@@ -1610,6 +2100,91 @@ export default function App() {
               </div>
             )}
 
+            {/* ★ PE 사전 큐레이션 (보고서 1부 - 전체 정리) */}
+            {minutes.curation && (
+              <div style={{
+                background:"rgba(15,23,42,0.7)",
+                border:"1px solid rgba(59,130,246,0.3)",
+                borderRadius:10, padding:"14px 16px", marginBottom:14,
+              }}>
+                <div style={{fontSize:12,fontWeight:800,color:"#3b82f6",marginBottom:10}}>
+                  📝 PE 사전 큐레이션 — 전체 이슈 정리
+                </div>
+
+                {/* 요약 텍스트 */}
+                <div style={{fontSize:11,color:"#cbd5e1",lineHeight:1.7,marginBottom:12,padding:"8px 10px",background:"rgba(59,130,246,0.06)",borderRadius:6}}>
+                  {minutes.curation.summary_text}
+                </div>
+
+                {/* 일자별 표 */}
+                {minutes.curation.daily_table?.length > 0 && (
+                  <div style={{marginBottom:12}}>
+                    <div style={{fontSize:10,color:"#94a3b8",fontWeight:700,marginBottom:6}}>
+                      📅 일자별 주요 이슈
+                    </div>
+                    <div style={{overflowX:"auto"}}>
+                      <table style={{width:"100%",fontSize:10,borderCollapse:"collapse"}}>
+                        <thead>
+                          <tr style={{background:"rgba(59,130,246,0.15)"}}>
+                            <th style={{padding:"5px 8px",textAlign:"left",color:"#60a5fa",border:"1px solid rgba(51,65,85,0.4)"}}>일자</th>
+                            <th style={{padding:"5px 8px",textAlign:"left",color:"#60a5fa",border:"1px solid rgba(51,65,85,0.4)"}}>호기</th>
+                            <th style={{padding:"5px 8px",textAlign:"left",color:"#60a5fa",border:"1px solid rgba(51,65,85,0.4)"}}>주요 내용</th>
+                            <th style={{padding:"5px 8px",textAlign:"left",color:"#60a5fa",border:"1px solid rgba(51,65,85,0.4)"}}>조치</th>
+                            <th style={{padding:"5px 8px",textAlign:"right",color:"#60a5fa",border:"1px solid rgba(51,65,85,0.4)"}}>분</th>
+                          </tr>
+                        </thead>
+                        <tbody>
+                          {minutes.curation.daily_table.map((row, i) => (
+                            <tr key={i}>
+                              <td style={{padding:"5px 8px",color:"#e2e8f0",border:"1px solid rgba(51,65,85,0.4)",whiteSpace:"nowrap"}}>{row.date}</td>
+                              <td style={{padding:"5px 8px",color:"#e2e8f0",border:"1px solid rgba(51,65,85,0.4)",whiteSpace:"nowrap"}}>{row.equipment}</td>
+                              <td style={{padding:"5px 8px",color:"#cbd5e1",border:"1px solid rgba(51,65,85,0.4)"}}>{row.issue}</td>
+                              <td style={{padding:"5px 8px",color:"#cbd5e1",border:"1px solid rgba(51,65,85,0.4)"}}>{row.action}</td>
+                              <td style={{padding:"5px 8px",color:row.downtime >= 60 ? "#ef4444" : "#94a3b8",textAlign:"right",fontWeight:row.downtime >= 60 ? 700 : 400,border:"1px solid rgba(51,65,85,0.4)"}}>{row.downtime}</td>
+                            </tr>
+                          ))}
+                        </tbody>
+                      </table>
+                    </div>
+                  </div>
+                )}
+
+                {/* 장기 부동 */}
+                {minutes.curation.long_downtime?.length > 0 && (
+                  <div style={{marginBottom:12}}>
+                    <div style={{fontSize:10,color:"#ef4444",fontWeight:700,marginBottom:6}}>
+                      ⏰ 장기 부동 ({minutes.curation.long_downtime.length}건)
+                    </div>
+                    {minutes.curation.long_downtime.map((d, i) => (
+                      <div key={i} style={{fontSize:10,padding:"6px 10px",background:"rgba(239,68,68,0.08)",borderRadius:5,marginBottom:4}}>
+                        <span style={{color:"#fca5a5",fontWeight:700}}>{d.equipment}</span>
+                        <span style={{color:"#94a3b8"}}> | {d.reason}</span>
+                        <span style={{color:"#fbbf24",marginLeft:6}}>({d.duration_note})</span>
+                        {d.status && <span style={{color:"#ef4444",fontSize:9,marginLeft:6}}>{d.status}</span>}
+                      </div>
+                    ))}
+                  </div>
+                )}
+
+                {/* 반복 항목 */}
+                {minutes.curation.recurring?.length > 0 && (
+                  <div>
+                    <div style={{fontSize:10,color:"#f59e0b",fontWeight:700,marginBottom:6}}>
+                      🔁 반복 발생 항목 ({minutes.curation.recurring.length}건)
+                    </div>
+                    {minutes.curation.recurring.map((r, i) => (
+                      <div key={i} style={{fontSize:10,padding:"6px 10px",background:"rgba(245,158,11,0.08)",borderRadius:5,marginBottom:4}}>
+                        <span style={{color:"#fcd34d",fontWeight:700}}>{r.item}</span>
+                        <span style={{color:"#94a3b8"}}> ({r.count}회) </span>
+                        <span style={{color:"#cbd5e1"}}>{r.lines?.join(", ")}</span>
+                        {r.cause && <div style={{color:"#94a3b8",marginTop:2}}>원인: {r.cause}</div>}
+                      </div>
+                    ))}
+                  </div>
+                )}
+              </div>
+            )}
+
             {/* 시간/빈도 분석 */}
             {minutes.analytics && (
               <div style={{
@@ -1775,8 +2350,16 @@ export default function App() {
 // ─── 논의 카드 컴포넌트 ────────────────────────────────────────────────────────
 function DiscussionCard({ discussion }) {
   const [showOpinions, setShowOpinions] = useState(false);
-  const { issue, modeInfo, router, opinions, moderator } = discussion;
+  const [showDetailCard, setShowDetailCard] = useState(false);
+  const { issue, modeInfo, isPostAction, router, opinions, moderator } = discussion;
   const mStyle = MODE_STYLE[modeInfo.mode];
+  const fallbackLevel = moderator?._fallback_level || "primary";
+  const detailCard = buildIssueDetailCard(discussion);
+
+  // 폴백 배지
+  const fbBadge = fallbackLevel === "primary" ? null
+    : fallbackLevel === "retry" ? { label: "🔁 재시도 성공", color: "#f59e0b", bg: "rgba(245,158,11,0.15)" }
+    : { label: "⚠️ 코드 폴백", color: "#ef4444", bg: "rgba(239,68,68,0.15)" };
 
   return (
     <div style={{
@@ -1785,17 +2368,31 @@ function DiscussionCard({ discussion }) {
       borderRadius:10, padding:"14px 16px", marginBottom:8,
     }}>
       {/* 헤더 */}
-      <div style={{display:"flex",justifyContent:"space-between",alignItems:"flex-start",marginBottom:8,gap:8}}>
+      <div style={{display:"flex",justifyContent:"space-between",alignItems:"flex-start",marginBottom:8,gap:8,flexWrap:"wrap"}}>
         <div style={{flex:1,minWidth:0}}>
           <div style={{fontSize:11,fontWeight:800,color:mStyle.color}}>
             [{issue.time}] {issue.eq}
+            {isPostAction && (
+              <span style={{
+                marginLeft:6, fontSize:9, padding:"1px 6px",
+                background:"rgba(52,211,153,0.15)", color:"#34d399",
+                borderRadius:8, fontWeight:700,
+              }}>✓ 기조치</span>
+            )}
           </div>
           <div style={{fontSize:10,color:"#94a3b8",marginTop:2}}>
             {issue.durMin}분 · {issue.prob}
           </div>
         </div>
-        <div style={{fontSize:9,color:mStyle.color,textAlign:"right",flexShrink:0}}>
-          {modeInfo.source}
+        <div style={{display:"flex",gap:4,alignItems:"center",flexShrink:0}}>
+          {fbBadge && (
+            <span style={{
+              fontSize:9, padding:"2px 6px",
+              background:fbBadge.bg, color:fbBadge.color,
+              borderRadius:8, fontWeight:700,
+            }}>{fbBadge.label}</span>
+          )}
+          <span style={{fontSize:9,color:mStyle.color}}>{modeInfo.source}</span>
         </div>
       </div>
 
@@ -1844,7 +2441,64 @@ function DiscussionCard({ discussion }) {
         )}
       </div>
 
-      {/* 페르소나 의견 펼치기 (LITE는 의견 없음) */}
+      {/* ★ 상세 카드 펼치기 (모드별 차등) */}
+      <button onClick={()=>setShowDetailCard(!showDetailCard)} style={{
+        marginTop:8, marginRight:6, padding:"4px 10px", fontSize:10,
+        background:"rgba(167,139,250,0.1)", border:"1px solid rgba(167,139,250,0.4)",
+        borderRadius:4, color:"#a78bfa", cursor:"pointer", fontWeight:700,
+      }}>
+        {showDetailCard ? "▲ 상세 카드 접기" : `▼ 상세 카드 (${detailCard.mode === "DEEP" ? "8필드" : "3필드"})`}
+      </button>
+
+      {showDetailCard && (
+        <div style={{
+          marginTop:8, padding:"12px 14px",
+          background:"rgba(167,139,250,0.06)",
+          border:"1px solid rgba(167,139,250,0.2)",
+          borderRadius:6, fontSize:11, color:"#e2e8f0", lineHeight:1.7,
+        }}>
+          <div style={{fontSize:10,color:"#a78bfa",fontWeight:800,marginBottom:8}}>
+            📋 이슈 상세 분석 카드
+          </div>
+
+          <DetailRow label="현상" value={detailCard["현상"]} />
+          <DetailRow label="원인" value={detailCard["원인"]} />
+
+          {detailCard.mode === "DEEP" ? (
+            <>
+              <DetailRow label="즉시 조치" value={detailCard["즉시조치"]} />
+              <DetailRow
+                label="기존 조치 적절성"
+                value={detailCard["기존조치_적절성"]}
+                highlight={isPostAction}
+              />
+              <DetailRow label="재발 방지책" value={detailCard["재발방지책"]} />
+              <DetailRow label="보완책" value={detailCard["보완책"]} />
+
+              {/* 발언자별 의견 */}
+              <div style={{marginTop:8}}>
+                <div style={{fontSize:10,color:"#a78bfa",fontWeight:700,marginBottom:5}}>발언자별 의견</div>
+                {detailCard["발언자별의견"].map((v, vi) => (
+                  <div key={vi} style={{
+                    fontSize:10, padding:"5px 8px", marginBottom:3,
+                    background:"rgba(0,0,0,0.2)", borderRadius:4,
+                  }}>
+                    <span style={{color:PERSONAS[v.code]?.color,fontWeight:700}}>{v.icon} {v.label}</span>
+                    <span style={{color:"#94a3b8",fontSize:9,marginLeft:6}}>[{v.stance}]</span>
+                    <div style={{color:"#cbd5e1",marginTop:2}}>{v.summary}</div>
+                  </div>
+                ))}
+              </div>
+
+              <DetailRow label="합의/반대 지점" value={detailCard["합의반대지점"]} />
+            </>
+          ) : (
+            <DetailRow label="대책" value={detailCard["대책"]} />
+          )}
+        </div>
+      )}
+
+      {/* 페르소나 의견 펼치기 (대화체 + 새 6필드) */}
       {opinions.length > 0 && (
         <>
           <button onClick={()=>setShowOpinions(!showOpinions)} style={{
@@ -1858,17 +2512,41 @@ function DiscussionCard({ discussion }) {
             <div style={{marginTop:8}}>
               {opinions.map((o, i) => {
                 const p = PERSONAS[o.persona];
+                const op = o.opinion || {};
                 return (
                   <div key={i} style={{
                     background:p.bg, padding:"8px 10px", borderRadius:6, marginBottom:5,
                   }}>
-                    <div style={{fontSize:10,color:p.color,fontWeight:800,marginBottom:4}}>
-                      {p.icon} {p.label} ({o.persona})
+                    <div style={{display:"flex",justifyContent:"space-between",alignItems:"center",marginBottom:4}}>
+                      <div style={{fontSize:10,color:p.color,fontWeight:800}}>
+                        {p.icon} {p.label} ({o.persona})
+                      </div>
+                      {op.stance && (
+                        <span style={{
+                          fontSize:9,padding:"1px 6px",
+                          background:"rgba(0,0,0,0.3)",color:"#cbd5e1",
+                          borderRadius:8,
+                        }}>{op.stance}</span>
+                      )}
                     </div>
+                    {/* 이전 발언 인용 (대화체 표시) */}
+                    {op.previous_reference && op.previous_reference !== "" && (
+                      <div style={{
+                        fontSize:9,color:"#94a3b8",fontStyle:"italic",
+                        padding:"4px 8px",background:"rgba(0,0,0,0.25)",
+                        borderLeft:`2px solid ${p.color}`,marginBottom:5,borderRadius:3,
+                      }}>
+                        💬 {op.previous_reference}
+                      </div>
+                    )}
+                    {/* 6필드 출력 */}
                     <div style={{fontSize:10,color:"#cbd5e1",lineHeight:1.6}}>
-                      📊 {o.opinion?.analysis}<br/>
-                      ⚡ {o.opinion?.action}<br/>
-                      🛡️ {o.opinion?.prevention}
+                      📌 <b>현상:</b> {op["현상"] || "-"}<br/>
+                      🔍 <b>원인:</b> {op["원인"] || "-"}<br/>
+                      ⚡ <b>대책:</b> {op["대책"] || "-"}<br/>
+                      {op["기존조치_평가"] && op["기존조치_평가"] !== "해당없음" && op["기존조치_평가"] !== "-" && (
+                        <>🔁 <b>기조치 평가:</b> {op["기존조치_평가"]}</>
+                      )}
                     </div>
                   </div>
                 );
@@ -1877,6 +2555,25 @@ function DiscussionCard({ discussion }) {
           )}
         </>
       )}
+    </div>
+  );
+}
+
+// 상세 카드 한 행
+function DetailRow({ label, value, highlight }) {
+  return (
+    <div style={{
+      marginBottom:6, paddingBottom:6,
+      borderBottom:"1px solid rgba(51,65,85,0.3)",
+    }}>
+      <span style={{
+        fontSize:9, fontWeight:800,
+        color: highlight ? "#34d399" : "#a78bfa",
+        marginRight:6,
+      }}>
+        {highlight && "★ "}{label}
+      </span>
+      <span style={{fontSize:10,color:"#cbd5e1"}}>{value || "-"}</span>
     </div>
   );
 }

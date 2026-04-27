@@ -1448,6 +1448,14 @@ export default function App() {
   const [autoSelectedIds, setAutoSelectedIds] = useState([]);    // 자동 선정된 이슈 id 목록 (TOP N)
   const [selectedIssueIds, setSelectedIssueIds] = useState([]);  // 사용자가 최종 선택한 이슈 id 목록
   const [curating, setCurating] = useState(false);               // 큐레이션 실행 중 플래그
+  // ★ 영역 7: 자유 채팅방
+  const [chatOpen, setChatOpen] = useState(false);                // 채팅창 표시 여부
+  const [chatStage, setChatStage] = useState("setup");           // "setup" (에이전트 선택) | "active" (대화 중)
+  const [chatAgents, setChatAgents] = useState([]);              // 채팅방 참석 에이전트 코드 배열
+  const [chatKb, setChatKb] = useState({});                       // 채팅 전용 KB 캐시 (방 개설 시 1회 로드)
+  const [chatMessages, setChatMessages] = useState([]);          // {role:"user"|"assistant", agent?:string, text, time}
+  const [chatInput, setChatInput] = useState("");                 // 입력창
+  const [chatBusy, setChatBusy] = useState(false);                // AI 응답 대기 중
   const fileRef = useRef();
 
   const toggleDate = (d) => {
@@ -1895,6 +1903,197 @@ export default function App() {
     }).click();
   };
 
+  // ─── ★ 영역 7: 자유 채팅방 백엔드 ─────────────────────────────────────────────
+  // 7-E: STEP에 따라 가용 컨텍스트 빌드 (이슈 데이터 자동 적응)
+  const buildChatContext = () => {
+    const parts = [];
+    parts.push(`현재 단계: STEP ${step}`);
+    if (step === 0) {
+      parts.push("아직 WhatsApp 파일이 업로드되지 않았습니다. 일반적인 공정 상담만 가능합니다.");
+    } else if (step >= 1 && allMsgs.length > 0) {
+      parts.push(`업로드된 메시지: ${allMsgs.length}건, 발생 일자 수: ${dates.length}일`);
+      if (selDates.length > 0) parts.push(`분석 대상 일자: ${selDates.join(", ")}`);
+    }
+    if (priority) {
+      parts.push(`이슈 분류: 긴급 ${priority.urgent.length}건 / 중요 ${priority.important.length}건 / 일반 ${priority.normal.length}건`);
+      const top = [...priority.urgent, ...priority.important].slice(0, 15);
+      if (top.length > 0) {
+        parts.push("\n[주요 이슈 목록 (상위 15건)]");
+        top.forEach((d, i) => {
+          parts.push(`${i+1}. [${d.date} ${d.time}] ${d.eq || "-"} | ${d.durMin}분 | Problem: ${d.prob || "-"} | Cause: ${d.cause || "-"} | Result: ${d.result || "-"}`);
+        });
+      }
+    }
+    if (preCuration) {
+      parts.push(`\n[PE 사전 큐레이션 요약]\n${preCuration.summary_text || ""}`);
+      if (preCuration.long_downtime?.length > 0) {
+        parts.push(`장기부동 ${preCuration.long_downtime.length}건, 반복 ${preCuration.recurring?.length || 0}건, 품질 ${preCuration.quality_issues?.length || 0}건, 공정변경 ${preCuration.process_changes?.length || 0}건, 테스트 ${preCuration.tests_inspections?.length || 0}건`);
+      }
+    }
+    if (minutes && step === 4) {
+      parts.push(`\n[STEP 4 보고서 완성됨 — ${minutes.detailCards?.length || 0}건 이슈 분석 완료]`);
+    }
+    return parts.join("\n");
+  };
+
+  // 7-D: @멘션 파싱 + 라우터 (멘션 우선, 없으면 Haiku로 자동 선택)
+  const extractMentions = (text) => {
+    // @PE, @EE, @FA, @Cell_PE, @Elec_EE 등 모두 지원
+    // chatAgents 코드와 매칭되는 것만 채택
+    const mentions = new Set();
+    const tokens = (text.match(/@\w+/g) || []).map(t => t.slice(1));
+    for (const tok of tokens) {
+      // 정확 매칭 우선
+      const exact = chatAgents.find(a => a === tok || a.toLowerCase() === tok.toLowerCase());
+      if (exact) { mentions.add(exact); continue; }
+      // 후위 매칭 (PE → Cell_PE 또는 Elec_PE 모두)
+      const suffix = chatAgents.filter(a => a.endsWith(`_${tok}`) || a.endsWith(`_${tok.toUpperCase()}`));
+      suffix.forEach(s => mentions.add(s));
+    }
+    return Array.from(mentions);
+  };
+
+  const routeChatQuestion = async (userText) => {
+    if (chatAgents.length === 1) return [chatAgents[0]];
+    const mentioned = extractMentions(userText);
+    if (mentioned.length > 0) return mentioned;
+    // 자동 라우터 (Haiku)
+    const agentList = chatAgents.map(a => `${a} (${PERSONAS[a]?.role || ""})`).join("\n");
+    const sys = `당신은 멀티 에이전트 채팅방의 라우터입니다. 사용자 질문을 보고 가장 적합한 에이전트 1~2명을 골라 코드를 JSON으로 반환하세요. 다른 텍스트 금지.`;
+    const userMsg = `[참석 에이전트]
+${agentList}
+
+[사용자 질문]
+${userText}
+
+다음 형식으로 출력:
+{"agents":["코드1","코드2"]}  // 1명만 적합하면 1개, 최대 2명까지`;
+    try {
+      const raw = await callClaudeRaw(sys, userMsg, { model: MODEL_FAST, max_tokens: 200 });
+      const parsed = safeJSON(raw);
+      const picked = (parsed.agents || []).filter(a => chatAgents.includes(a));
+      if (picked.length > 0) return picked.slice(0, 2);
+    } catch {/* 폴백 */}
+    // 폴백: 첫 번째 에이전트 1명
+    return [chatAgents[0]];
+  };
+
+  // 7-D: 단일 에이전트 응답 생성
+  const generateAgentReply = async (agentCode, userText, history) => {
+    const persona = PERSONAS[agentCode];
+    if (!persona) return "(에이전트를 찾을 수 없음)";
+    const kbText = chatKb[agentCode] ? `\n\n[학습 내용]\n${chatKb[agentCode].slice(0, 1500)}` : "";
+    const ctx = buildChatContext();
+    const sys = `${FACTORY_PHILOSOPHY}
+
+당신은 AZS 배터리 공장의 ${persona.role}입니다.
+이 채팅방은 사용자가 이슈와 관련해 자유롭게 질문하는 자리입니다.${kbText}
+
+[현재 컨텍스트]
+${ctx}
+
+[규칙]
+- 당신의 역할 관점에서 답하세요.
+- 이슈 데이터가 없으면 일반 상담으로 답하되, 추가 데이터가 필요하면 그렇다고 안내하세요.
+- 답변은 간결하게 (5문장 이내 권장, 필요하면 늘어남).
+- 이미 답변한 다른 에이전트가 있으면 중복 피하고 보완하는 관점으로.`;
+    const historyText = history.slice(-10).map(m => {
+      if (m.role === "user") return `[사용자] ${m.text}`;
+      return `[${PERSONAS[m.agent]?.label || m.agent}] ${m.text}`;
+    }).join("\n");
+    const userMsg = `[직전까지의 대화]
+${historyText || "(이번이 첫 질문)"}
+
+[현재 사용자 질문]
+${userText}
+
+당신의 답변:`;
+    try {
+      const raw = await callClaudeRaw(sys, userMsg, { model: MODEL_REASONING, max_tokens: 800 });
+      return raw.trim();
+    } catch (e) {
+      return `(응답 실패: ${e?.message || e})`;
+    }
+  };
+
+  // 7-D: 채팅 메시지 전송
+  const sendChatMessage = async () => {
+    const text = chatInput.trim();
+    if (!text || chatBusy) return;
+    const userMsg = { role: "user", text, time: new Date().toLocaleTimeString("ko-KR", { hour: "2-digit", minute: "2-digit" }) };
+    const newHistory = [...chatMessages, userMsg];
+    setChatMessages(newHistory);
+    setChatInput("");
+    setChatBusy(true);
+    try {
+      const responders = await routeChatQuestion(text);
+      let runningHistory = newHistory;
+      for (const code of responders) {
+        const reply = await generateAgentReply(code, text, runningHistory);
+        const replyMsg = {
+          role: "assistant", agent: code, text: reply,
+          time: new Date().toLocaleTimeString("ko-KR", { hour: "2-digit", minute: "2-digit" }),
+        };
+        runningHistory = [...runningHistory, replyMsg];
+        setChatMessages(runningHistory);
+      }
+    } catch (e) {
+      setChatMessages(prev => [...prev, {
+        role: "assistant", agent: "system",
+        text: `(시스템 오류: ${e?.message || e})`,
+        time: new Date().toLocaleTimeString("ko-KR", { hour: "2-digit", minute: "2-digit" }),
+      }]);
+    } finally {
+      setChatBusy(false);
+    }
+  };
+
+  // 7-D: 채팅방 개설 (에이전트 선택 후 KB 로드)
+  const openChatRoom = async () => {
+    if (chatAgents.length === 0) return;
+    setChatBusy(true);
+    try {
+      const kbResult = await loadSelectedKnowledge(chatAgents);
+      setChatKb(kbResult.kb || {});
+    } catch {
+      setChatKb({});  // KB 로드 실패해도 진행
+    }
+    setChatStage("active");
+    setChatBusy(false);
+  };
+
+  // 7-F: 대화 내용 TXT 다운로드
+  const downloadChatTxt = () => {
+    if (chatMessages.length === 0) return;
+    const stamp = new Date().toLocaleString("ko-KR");
+    let t = `AZS 자유 채팅방 대화 기록\n생성: ${stamp}\n참석 에이전트: ${chatAgents.map(a => `${a}(${PERSONAS[a]?.label || a})`).join(", ")}\n${"═".repeat(52)}\n\n`;
+    chatMessages.forEach(m => {
+      if (m.role === "user") {
+        t += `[${m.time}] 사용자\n  ${m.text}\n\n`;
+      } else {
+        const label = PERSONAS[m.agent]?.label || m.agent;
+        t += `[${m.time}] ${label}\n  ${m.text.replace(/\n/g, "\n  ")}\n\n`;
+      }
+    });
+    const blob = new Blob([t], { type: "text/plain;charset=utf-8" });
+    const url = URL.createObjectURL(blob);
+    Object.assign(document.createElement("a"), {
+      href: url, download: `chat_${new Date().toISOString().slice(0,10)}.txt`,
+    }).click();
+    URL.revokeObjectURL(url);
+  };
+
+  // 7-D: 채팅방 닫기 (대화 초기화)
+  const closeChatRoom = () => {
+    if (chatMessages.length > 0 && !window.confirm("대화가 사라집니다. TXT 저장 안 하셨다면 먼저 저장하세요. 그래도 닫을까요?")) return;
+    setChatOpen(false);
+    setChatStage("setup");
+    setChatAgents([]);
+    setChatMessages([]);
+    setChatInput("");
+    setChatKb({});
+  };
+
   const reset = () => {
     setStep(0); setAllMsgs([]); setDates([]); setSelDates([]);
     setClassified(null); setPriority(null); setKbStats(null);
@@ -1905,6 +2104,9 @@ export default function App() {
     setPreCuration(null); setPreCategoryMsgs(null);
     setAutoSelectedIds([]); setSelectedIssueIds([]);
     setCurating(false);
+    // ★ 영역 7: 채팅방 상태 초기화
+    setChatOpen(false); setChatStage("setup"); setChatAgents([]);
+    setChatMessages([]); setChatInput(""); setChatKb({}); setChatBusy(false);
   };
 
   return (
@@ -3126,6 +3328,215 @@ function DiscussionCard({ discussion }) {
             </div>
           )}
         </>
+      )}
+
+      {/* ★ 영역 7-B: 플로팅 채팅 버튼 (모든 STEP 공통) */}
+      {!chatOpen && (
+        <button onClick={()=>setChatOpen(true)} style={{
+          position:"fixed", right:24, bottom:24, zIndex:50,
+          width:56, height:56, borderRadius:"50%",
+          background:"linear-gradient(135deg,#3b82f6,#22d3ee)",
+          border:"none", cursor:"pointer",
+          boxShadow:"0 6px 20px rgba(34,211,238,0.4)",
+          fontSize:24, color:"#fff",
+          display:"flex", alignItems:"center", justifyContent:"center",
+        }} title="자유 채팅방 열기">💬</button>
+      )}
+
+      {/* ★ 영역 7-C: 채팅창 모달 */}
+      {chatOpen && (
+        <div style={{
+          position:"fixed", right:24, bottom:24, zIndex:50,
+          width:"min(440px, calc(100vw - 48px))",
+          height:"min(640px, calc(100vh - 48px))",
+          background:"rgba(3,6,13,0.97)",
+          border:"1px solid rgba(34,211,238,0.3)",
+          borderRadius:14,
+          boxShadow:"0 10px 40px rgba(0,0,0,0.6)",
+          display:"flex", flexDirection:"column",
+          overflow:"hidden",
+        }}>
+          {/* 헤더 */}
+          <div style={{
+            padding:"12px 16px",
+            borderBottom:"1px solid rgba(51,65,85,0.4)",
+            display:"flex", alignItems:"center", justifyContent:"space-between",
+            background:"rgba(15,23,42,0.6)",
+          }}>
+            <div style={{display:"flex",alignItems:"center",gap:8}}>
+              <span style={{fontSize:14}}>💬</span>
+              <div style={{fontSize:12,fontWeight:800,color:"#22d3ee"}}>
+                {chatStage === "setup" ? "채팅방 개설" : `자유 채팅방 (${chatAgents.length}명)`}
+              </div>
+            </div>
+            <div style={{display:"flex",gap:6}}>
+              {chatStage === "active" && chatMessages.length > 0 && (
+                <button onClick={downloadChatTxt} style={{
+                  fontSize:10, padding:"4px 10px", borderRadius:5,
+                  background:"rgba(52,211,153,0.1)", border:"1px solid rgba(52,211,153,0.3)",
+                  color:"#34d399", cursor:"pointer", fontWeight:700,
+                }} title="대화 내용 TXT 저장">💾 저장</button>
+              )}
+              <button onClick={closeChatRoom} style={{
+                fontSize:14, padding:"2px 10px", borderRadius:5,
+                background:"transparent", border:"1px solid rgba(100,116,139,0.4)",
+                color:"#94a3b8", cursor:"pointer",
+              }} title="채팅방 닫기">✕</button>
+            </div>
+          </div>
+
+          {/* 본문 */}
+          {chatStage === "setup" ? (
+            // 에이전트 선택 화면
+            <div style={{flex:1, padding:16, overflowY:"auto"}}>
+              <div style={{fontSize:11,color:"#cbd5e1",lineHeight:1.6,marginBottom:12}}>
+                대화에 참여할 에이전트를 선택하세요. (최소 1명)
+                <div style={{fontSize:10,color:"#64748b",marginTop:4}}>
+                  선택 후 KB가 로드되면 채팅이 시작됩니다.<br/>
+                  여러 명을 선택하면 질문에 따라 자동으로 답할 사람을 정하거나 <code style={{color:"#22d3ee"}}>@PE</code> 식으로 직접 지정할 수 있습니다.
+                </div>
+              </div>
+              <div style={{display:"grid",gridTemplateColumns:"repeat(2, 1fr)",gap:6,marginBottom:14}}>
+                {Object.entries(PERSONAS).map(([code, p]) => {
+                  const sel = chatAgents.includes(code);
+                  return (
+                    <button key={code} onClick={()=>setChatAgents(prev =>
+                      prev.includes(code) ? prev.filter(x => x !== code) : [...prev, code]
+                    )} style={{
+                      padding:"8px 10px", borderRadius:6,
+                      background: sel ? p.bg : "rgba(15,23,42,0.5)",
+                      border:`1px solid ${sel ? p.color : "rgba(51,65,85,0.4)"}`,
+                      color: sel ? p.color : "#94a3b8",
+                      fontSize:10, fontWeight:700, cursor:"pointer", textAlign:"left",
+                    }}>
+                      <div>{p.icon} {p.label}</div>
+                      <div style={{fontSize:8.5,opacity:0.75,marginTop:2}}>{code}</div>
+                    </button>
+                  );
+                })}
+              </div>
+              <button onClick={openChatRoom}
+                disabled={chatAgents.length === 0 || chatBusy} style={{
+                  width:"100%", padding:"10px",
+                  background: (chatAgents.length === 0 || chatBusy) ? "rgba(51,65,85,0.3)" : "linear-gradient(135deg,#3b82f6,#22d3ee)",
+                  border:"none", borderRadius:8,
+                  color: (chatAgents.length === 0 || chatBusy) ? "#475569" : "#fff",
+                  fontSize:12, fontWeight:800,
+                  cursor: (chatAgents.length === 0 || chatBusy) ? "not-allowed" : "pointer",
+                  display:"flex", alignItems:"center", justifyContent:"center", gap:8,
+                }}>
+                {chatBusy ? <><Spinner/>KB 로드 중...</> : `🚪 채팅방 개설 (${chatAgents.length}명)`}
+              </button>
+            </div>
+          ) : (
+            // 대화 화면
+            <>
+              {/* 참석자 표시 */}
+              <div style={{
+                padding:"6px 12px",
+                background:"rgba(15,23,42,0.4)",
+                borderBottom:"1px solid rgba(51,65,85,0.3)",
+                display:"flex", gap:4, flexWrap:"wrap", fontSize:9,
+              }}>
+                {chatAgents.map(code => {
+                  const p = PERSONAS[code];
+                  return (
+                    <span key={code} style={{
+                      padding:"2px 7px", borderRadius:9,
+                      background:p.bg, color:p.color, fontWeight:700,
+                    }}>{p.icon} {code}</span>
+                  );
+                })}
+              </div>
+
+              {/* 메시지 영역 */}
+              <div style={{flex:1, overflowY:"auto", padding:"12px 14px", background:"rgba(0,0,0,0.2)"}}>
+                {chatMessages.length === 0 ? (
+                  <div style={{fontSize:11,color:"#64748b",textAlign:"center",padding:"30px 0",lineHeight:1.7}}>
+                    👋 무엇이든 물어보세요.<br/>
+                    <span style={{fontSize:10}}>예: "Stacking 공정 반복 이슈 원인 분석해줘"<br/>
+                    "@PE 이 호기 점검 방법은?"</span>
+                  </div>
+                ) : chatMessages.map((m, i) => {
+                  if (m.role === "user") {
+                    return (
+                      <div key={i} style={{display:"flex",justifyContent:"flex-end",marginBottom:10}}>
+                        <div style={{
+                          maxWidth:"80%", padding:"8px 12px", borderRadius:"12px 12px 2px 12px",
+                          background:"rgba(34,211,238,0.15)", border:"1px solid rgba(34,211,238,0.3)",
+                          fontSize:11, color:"#e2e8f0", lineHeight:1.5, whiteSpace:"pre-wrap",
+                        }}>
+                          {m.text}
+                          <div style={{fontSize:8,color:"#64748b",marginTop:4,textAlign:"right"}}>{m.time}</div>
+                        </div>
+                      </div>
+                    );
+                  }
+                  const p = PERSONAS[m.agent] || { label: m.agent || "system", color: "#94a3b8", bg: "rgba(100,116,139,0.1)", icon: "⚙️" };
+                  return (
+                    <div key={i} style={{display:"flex",flexDirection:"column",marginBottom:10}}>
+                      <div style={{display:"flex",alignItems:"center",gap:6,marginBottom:3}}>
+                        <span style={{
+                          fontSize:9, padding:"2px 7px", borderRadius:9,
+                          background:p.bg, color:p.color, fontWeight:700,
+                        }}>{p.icon} {p.label}</span>
+                      </div>
+                      <div style={{
+                        maxWidth:"90%", padding:"8px 12px", borderRadius:"12px 12px 12px 2px",
+                        background:"rgba(15,23,42,0.7)", border:`1px solid ${p.color}33`,
+                        fontSize:11, color:"#e2e8f0", lineHeight:1.6, whiteSpace:"pre-wrap",
+                      }}>
+                        {m.text}
+                        <div style={{fontSize:8,color:"#64748b",marginTop:4}}>{m.time}</div>
+                      </div>
+                    </div>
+                  );
+                })}
+                {chatBusy && (
+                  <div style={{display:"flex",alignItems:"center",gap:8,padding:"6px 0",fontSize:10,color:"#94a3b8"}}>
+                    <Spinner/> 응답 생성 중...
+                  </div>
+                )}
+              </div>
+
+              {/* 입력창 */}
+              <div style={{
+                padding:"10px 12px",
+                borderTop:"1px solid rgba(51,65,85,0.4)",
+                background:"rgba(15,23,42,0.6)",
+                display:"flex", gap:8,
+              }}>
+                <textarea value={chatInput}
+                  onChange={(e)=>setChatInput(e.target.value)}
+                  onKeyDown={(e)=>{
+                    if (e.key === "Enter" && !e.shiftKey) {
+                      e.preventDefault();
+                      sendChatMessage();
+                    }
+                  }}
+                  placeholder="질문 입력 (Shift+Enter로 줄바꿈, @코드 멘션 가능)"
+                  rows={2}
+                  disabled={chatBusy}
+                  style={{
+                    flex:1, padding:"6px 10px", borderRadius:6,
+                    background:"rgba(0,0,0,0.3)",
+                    border:"1px solid rgba(51,65,85,0.5)",
+                    color:"#e2e8f0", fontSize:11, lineHeight:1.5,
+                    resize:"none", fontFamily:"inherit",
+                  }}/>
+                <button onClick={sendChatMessage}
+                  disabled={chatBusy || !chatInput.trim()} style={{
+                    padding:"0 14px", borderRadius:6,
+                    background: (chatBusy || !chatInput.trim()) ? "rgba(51,65,85,0.4)" : "linear-gradient(135deg,#3b82f6,#22d3ee)",
+                    border:"none",
+                    color: (chatBusy || !chatInput.trim()) ? "#475569" : "#fff",
+                    fontSize:11, fontWeight:800,
+                    cursor: (chatBusy || !chatInput.trim()) ? "not-allowed" : "pointer",
+                  }}>전송</button>
+              </div>
+            </>
+          )}
+        </div>
       )}
     </div>
   );

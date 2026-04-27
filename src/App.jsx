@@ -28,6 +28,28 @@ const DEEP_FORCE_KEYWORDS = {
   라인정지: ["라인 정지", "가동 중단", "전 라인 멈춤", "올스톱", "full_stop"],
 };
 
+// ─── 영역 5: 큐레이션 이력 카테고리 키워드 (1차 안, 사용 후 튜닝) ─────────────────
+// 부동 이슈와 별개로 WhatsApp 일반 메시지에서 추출하여 큐레이션 이력으로만 정리
+const QUALITY_KEYWORDS = [
+  "불량", "defect", "NG", "수율", "yield", "Cpk",
+  "코팅 불량", "두께", "정렬", "외관", "치수",
+  "SAR", "NCR", "HOLD", "스크랩", "scrap", "리젝",
+];
+
+const PROCESS_CHANGE_KEYWORDS = [
+  "변경", "조정", "change", "set", "setpoint",
+  "recipe", "셋업", "조건", "오프셋", "offset",
+  "Gap", "압력", "온도", "속도", "tuning", "튜닝",
+  "파라미터", "parameter",
+];
+
+const TEST_KEYWORDS = [
+  "테스트", "test", "시험", "검증", "validation",
+  "trial", "trial run", "샘플", "sample", "DOE",
+  "양산외", "비정상 생산", "특별 생산", "엔지니어링 런",
+  "engineering run", "pilot",
+];
+
 // ─── 모델 설정 (Function이 model 파라미터 지원하도록 수정됨) ─────────────────────
 const MODEL_FAST = "claude-haiku-4-5";       // 라우터/분류기
 const MODEL_REASONING = "claude-sonnet-4-5"; // 본 논의/사회자
@@ -288,6 +310,8 @@ function extractField(text, fieldName) {
 
 function classifyMessages(msgs) {
   const downtime = [], equipment = [], general = [];
+  // 영역 5: 큐레이션 이력 카테고리
+  const qualityMsgs = [], processChangeMsgs = [], testMsgs = [], ambiguousMsgs = [];
   let i = 0;
   while (i < msgs.length) {
     const m = msgs[i];
@@ -308,8 +332,83 @@ function classifyMessages(msgs) {
       if (m.text.trim().length > 5) general.push({ time: m.time, sender: m.sender, text: m.text, date: m.date, hour: m.hour });
       i++;
     }
+
+    // ── 영역 5: 다운타임이 아닌 메시지에 대해 큐레이션 카테고리 키워드 매칭 ──
+    // (다운타임 메시지는 j까지 점프했으므로 위에서 분류되고 여기는 돌아오지 않음)
+    if (m.text.includes("[BM Downtime Bot]")) continue;
+    if (m.text.trim().length <= 5) continue;
+    if (m.text.includes("미디어 파일 제외됨")) continue;
+
+    const lowerText = m.text.toLowerCase();
+    const matched = [];
+    if (QUALITY_KEYWORDS.some(kw => lowerText.includes(kw.toLowerCase()))) matched.push("quality");
+    if (PROCESS_CHANGE_KEYWORDS.some(kw => lowerText.includes(kw.toLowerCase()))) matched.push("process_change");
+    if (TEST_KEYWORDS.some(kw => lowerText.includes(kw.toLowerCase()))) matched.push("test");
+
+    const entry = { time: m.time, sender: m.sender, text: m.text, date: m.date, hour: m.hour };
+
+    if (matched.length === 1) {
+      // 1개 카테고리만 매칭 → 직접 할당
+      if (matched[0] === "quality") qualityMsgs.push(entry);
+      else if (matched[0] === "process_change") processChangeMsgs.push(entry);
+      else if (matched[0] === "test") testMsgs.push(entry);
+    } else if (matched.length >= 2) {
+      // 2개 이상 카테고리에 걸침 → 모호 (AI 분류 대상, 5-C에서 처리)
+      ambiguousMsgs.push({ ...entry, matched });
+    }
+    // matched.length === 0 → general에만 남고 카테고리 미할당 (AI 비용 절약)
   }
-  return { downtime, equipment, general };
+  return { downtime, equipment, general, qualityMsgs, processChangeMsgs, testMsgs, ambiguousMsgs };
+}
+
+// ─── 영역 5-C: 모호 메시지 AI 분류 (2개 이상 카테고리에 걸친 메시지만 Haiku 호출) ──
+async function classifyAmbiguousMessages(ambiguousMsgs) {
+  if (!ambiguousMsgs || ambiguousMsgs.length === 0) {
+    return { quality: [], process_change: [], test: [], skip: [] };
+  }
+
+  const sys = `당신은 공장 메시지 분류기입니다. 각 메시지를 다음 카테고리 중 하나로 정확히 분류하세요:
+- quality: 품질 이슈 (불량, NG, 수율, 외관 등 결과 측면)
+- process_change: 설비/공정 조건 변경 (recipe/setpoint/gap/온도/속도 등 셋팅 변경)
+- test: 테스트/양산외 생산 (DOE, trial, 시험, 샘플 등)
+- skip: 위 어디에도 명확히 해당하지 않음
+
+여러 카테고리에 걸쳐 있다면 메시지의 주된 의도를 보고 1개만 선택하세요.
+출력은 JSON 객체만, 다른 텍스트 금지.`;
+
+  const userMsg = `[모호 메시지 ${ambiguousMsgs.length}건]
+${ambiguousMsgs.map((m, i) => `${i + 1}. ${m.text.slice(0, 200).replace(/\n/g, " ")}`).join("\n")}
+
+다음 형식으로 출력 (메시지 번호와 카테고리):
+{"items":[{"no":1,"category":"quality"},{"no":2,"category":"process_change"}]}`;
+
+  try {
+    const raw = await callClaudeRaw(sys, userMsg, { model: MODEL_FAST, max_tokens: 1500 });
+    const parsed = safeJSON(raw);
+    const result = { quality: [], process_change: [], test: [], skip: [] };
+    if (Array.isArray(parsed.items)) {
+      parsed.items.forEach(item => {
+        const idx = (item.no || 0) - 1;
+        const cat = item.category;
+        if (idx >= 0 && idx < ambiguousMsgs.length && result[cat]) {
+          result[cat].push(ambiguousMsgs[idx]);
+        }
+      });
+    }
+    return result;
+  } catch (e) {
+    console.error("[모호 메시지 AI 분류 실패]", e);
+    // 폴백: 모호 메시지를 첫 매칭 카테고리에 자동 할당
+    const result = { quality: [], process_change: [], test: [], skip: [] };
+    ambiguousMsgs.forEach(m => {
+      const first = m.matched?.[0];
+      if (first === "quality") result.quality.push(m);
+      else if (first === "process_change") result.process_change.push(m);
+      else if (first === "test") result.test.push(m);
+      else result.skip.push(m);
+    });
+    return result;
+  }
 }
 
 function classifyPriority(downtime) {
@@ -341,7 +440,12 @@ function classifyPriority(downtime) {
     const cause = extractField(d.text, "Cause");
     const result_ = extractField(d.text, "Result");
     const pic = extractField(d.text, "PIC");
-    const issueInfo = { ...d, eq: eq_, prob, cause, result: result_, pic, durMin, reasons: [] };
+    // 영역 5: 점수 계산용 반복 횟수 (호기 또는 부품 중 큰 값)
+    const repeatCount = Math.max(
+      eq_ ? (equipCount[eq_] || 1) : 1,
+      (part && part !== "-" && part.length > 2) ? (partCount[part] || 1) : 1,
+    );
+    const issueInfo = { ...d, eq: eq_, prob, cause, result: result_, pic, durMin, reasons: [], repeatCount };
 
     if (isUnsolved || isLong) {
       issueInfo.reasons = [isUnsolved && "미해결", isLong && `${durMin}분 이상`].filter(Boolean);
@@ -356,9 +460,52 @@ function classifyPriority(downtime) {
   return { urgent, important, normal };
 }
 
+// ─── 영역 5-D: 이슈 점수 계산 ────────────────────────────────────────────────
+// 점수 = 부동(분)/30 + 반복횟수×3 + 안전환경(+10) + 미해결(+5) + FullStop(+5)
+function scoreIssue(issue) {
+  const breakdown = {
+    downtime: (issue.durMin || 0) / 30,
+    repeat: ((issue.repeatCount || 1) >= 2) ? (issue.repeatCount * 3) : 0,
+    safety_env: 0,
+    unsolved: 0,
+    full_stop: 0,
+  };
+
+  // 안전/환경 키워드 보너스 (+10)
+  const fullText = [issue.eq, issue.prob, issue.cause, issue.result, issue.text || ""]
+    .join(" ").toLowerCase();
+  const safetyEnvKw = [...DEEP_FORCE_KEYWORDS.안전, ...DEEP_FORCE_KEYWORDS.환경];
+  if (safetyEnvKw.some(kw => fullText.includes(kw.toLowerCase()))) {
+    breakdown.safety_env = 10;
+  }
+
+  // 미해결 보너스 (+5)
+  if (issue.reasons?.some(r => r.includes("미해결"))) breakdown.unsolved = 5;
+
+  // Full Stop 보너스 (+5)
+  if (issue.reasons?.some(r => r.includes("완전 정지"))) breakdown.full_stop = 5;
+
+  const total = Object.values(breakdown).reduce((a, b) => a + b, 0);
+  return { total: Math.round(total * 10) / 10, breakdown };
+}
+
 function selectKeyIssues(priority) {
-  const all = [...priority.urgent, ...priority.important];
-  return all.slice(0, MAX_ISSUES);
+  // urgent(장기부동/미해결) + important(반복/FullStop/부품반복) 모두 후보
+  const candidates = [...priority.urgent, ...priority.important];
+
+  // 점수 계산 후 score 필드 부착
+  const scored = candidates.map(issue => {
+    const s = scoreIssue(issue);
+    return { ...issue, score: s.total, scoreBreakdown: s.breakdown };
+  });
+
+  // 점수 내림차순, 동률 시 부동시간 내림차순
+  scored.sort((a, b) => {
+    if (b.score !== a.score) return b.score - a.score;
+    return (b.durMin || 0) - (a.durMin || 0);
+  });
+
+  return scored.slice(0, MAX_ISSUES);
 }
 
 // ═════════════════════════════════════════════════════════════════════════════
@@ -366,9 +513,14 @@ function selectKeyIssues(priority) {
 // ═════════════════════════════════════════════════════════════════════════════
 
 // ─── 0. PE 사전 큐레이션 (전체 이슈 1회 호출) ────────────────────────────────
-async function runPreCuration(allIssues, kbPE, reportType) {
+async function runPreCuration(allIssues, kbPE, reportType, categoryMsgs = {}) {
   // 모든 이슈를 한 번에 PE에게 보내서 일자별 표 + 장기부동 + 반복항목 정리
   // 호출 1회로 전체 그림 작성 (토큰 비용 효율적)
+  // 영역 5: categoryMsgs = { quality: [...], process_change: [...], test: [...] }
+
+  const qualityList = categoryMsgs.quality || [];
+  const processChangeList = categoryMsgs.process_change || [];
+  const testList = categoryMsgs.test || [];
 
   if (!allIssues || allIssues.length === 0) {
     return {
@@ -376,6 +528,7 @@ async function runPreCuration(allIssues, kbPE, reportType) {
       daily_table: [],
       long_downtime: [],
       recurring: [],
+      quality_issues: [],
       process_changes: [],
       tests_inspections: [],
     };
@@ -394,6 +547,19 @@ async function runPreCuration(allIssues, kbPE, reportType) {
     duration_min: issue.durMin,
     reasons: issue.reasons,
   }));
+
+  // 영역 5: 카테고리 메시지를 PE 입력용으로 변환 (각 최대 20건)
+  const formatMsgs = (arr, max = 20) => arr.slice(0, max).map((m, i) => ({
+    no: i + 1,
+    date: m.date || "",
+    time: m.time || "",
+    sender: m.sender || "",
+    text: (m.text || "").slice(0, 200).replace(/\n/g, " "),
+  }));
+
+  const qualityData = formatMsgs(qualityList);
+  const processChangeData = formatMsgs(processChangeList);
+  const testData = formatMsgs(testList);
 
   const focus = REPORT_FOCUS[reportType] || REPORT_FOCUS.meeting;
   const kbText = kbPE ? `\n\n[학습 내용 일부]\n${kbPE.slice(0, 300)}` : "";
@@ -417,28 +583,46 @@ ${focus} 다음 이슈 데이터 전체를 검토하여 보고서 첫머리에 �
   "recurring": [
     {"item":"반복 항목명 (예: Align Table Ejector Time Out)","lines":["발생 호기 배열"],"count":발생_횟수,"cause":"주요 원인"}
   ],
-  "process_changes": [],
-  "tests_inspections": []
+  "quality_issues": [
+    {"date":"발생일자","time":"시간","item":"품질 이슈 내용 요약 (50자)","note":"비고 (담당자/처리상태 등)"}
+  ],
+  "process_changes": [
+    {"date":"발생일자","time":"시간","item":"변경 내용 요약 (50자)","who":"담당자 또는 작업자"}
+  ],
+  "tests_inspections": [
+    {"date":"발생일자","time":"시간","item":"테스트/시험 내용 요약 (50자)","purpose":"목적 또는 결과"}
+  ]
 }
 
 [규칙]
 - daily_table은 모든 이슈가 아니라 주요 이슈만 (각 일자 대표 이슈, 최대 10건)
 - long_downtime은 60분 이상 또는 미해결 이슈
 - recurring은 같은 항목이 2회 이상 발생한 것 (Equipment 또는 Problem 기준)
-- process_changes와 tests_inspections는 빈 배열로 둘 것 (이번 단계에서는 지원 안 함)
+- quality_issues / process_changes / tests_inspections는 [품질 메시지], [공정변경 메시지], [테스트 메시지] 섹션 참고하여 정리 (각 최대 15건)
+  · 입력 메시지가 없으면 빈 배열 []
+  · 명백한 잡담이나 분류 오류로 보이면 제외
 - 부동시간(downtime)은 반드시 숫자만 (단위 제외)
 - 이슈 데이터의 PIC, 사유 등은 무시하고 객관적 사실만 정리`;
 
-  const userMsg = `[전체 이슈 데이터 - ${allIssues.length}건]
+  const userMsg = `[전체 부동 이슈 데이터 - ${allIssues.length}건]
 ${JSON.stringify(issuesData, null, 1)}
 
-위 모든 이슈를 검토하여 큐레이션 JSON을 작성하세요.`;
+[품질 이슈 메시지 - ${qualityData.length}건]
+${qualityData.length > 0 ? JSON.stringify(qualityData, null, 1) : "(없음)"}
+
+[공정/설비 조건변경 메시지 - ${processChangeData.length}건]
+${processChangeData.length > 0 ? JSON.stringify(processChangeData, null, 1) : "(없음)"}
+
+[테스트/양산외 생산 메시지 - ${testData.length}건]
+${testData.length > 0 ? JSON.stringify(testData, null, 1) : "(없음)"}
+
+위 모든 데이터를 검토하여 큐레이션 JSON을 작성하세요.`;
 
   try {
     await new Promise(r => setTimeout(r, 500));
     const raw = await callClaudeRaw(sys, userMsg, {
       model: MODEL_REASONING,
-      max_tokens: 2000,  // 큐레이션은 출력이 큼
+      max_tokens: 2500,  // 영역 5: 3개 카테고리 추가로 출력 늘어남
     });
     const parsed = safeJSON(raw);
     return {
@@ -446,18 +630,19 @@ ${JSON.stringify(issuesData, null, 1)}
       daily_table: Array.isArray(parsed.daily_table) ? parsed.daily_table : [],
       long_downtime: Array.isArray(parsed.long_downtime) ? parsed.long_downtime : [],
       recurring: Array.isArray(parsed.recurring) ? parsed.recurring : [],
-      process_changes: [],   // 영역 5에서 추가 예정
-      tests_inspections: [], // 영역 5에서 추가 예정
+      quality_issues: Array.isArray(parsed.quality_issues) ? parsed.quality_issues : [],
+      process_changes: Array.isArray(parsed.process_changes) ? parsed.process_changes : [],
+      tests_inspections: Array.isArray(parsed.tests_inspections) ? parsed.tests_inspections : [],
     };
   } catch (e) {
     console.error("[PE 큐레이션 실패]", e);
     // 폴백: 데이터 기반 자동 생성 (API 호출 없이)
-    return buildFallbackCuration(allIssues);
+    return buildFallbackCuration(allIssues, categoryMsgs);
   }
 }
 
 // PE 큐레이션 폴백 - 데이터 기반 자동 생성
-function buildFallbackCuration(allIssues) {
+function buildFallbackCuration(allIssues, categoryMsgs = {}) {
   // 일자별 정리 (각 일자에서 가장 부동시간 긴 이슈)
   const byDate = {};
   for (const issue of allIssues) {
@@ -502,13 +687,22 @@ function buildFallbackCuration(allIssues) {
       cause: "(데이터 기반 자동 추출 - 상세 원인 추가 분석 필요)",
     }));
 
+  // 영역 5: 카테고리 메시지를 단순 매핑하여 폴백 생성
+  const mapMsgs = (arr, extraField) => (arr || []).slice(0, 15).map(m => ({
+    date: m.date || "",
+    time: m.time || "",
+    item: (m.text || "").slice(0, 50).replace(/\n/g, " "),
+    [extraField]: m.sender || "-",
+  }));
+
   return {
-    summary_text: `[PE 큐레이션 폴백] 총 ${allIssues.length}건의 이슈가 발생함. AI 큐레이션 호출 실패로 자동 정리됨.`,
+    summary_text: `[PE 큐레이션 폴백] 총 ${allIssues.length}건의 부동 이슈 발생. AI 큐레이션 호출 실패로 자동 정리됨.`,
     daily_table,
     long_downtime,
     recurring,
-    process_changes: [],
-    tests_inspections: [],
+    quality_issues: mapMsgs(categoryMsgs.quality, "note"),
+    process_changes: mapMsgs(categoryMsgs.process_change, "who"),
+    tests_inspections: mapMsgs(categoryMsgs.test, "purpose"),
   };
 }
 
@@ -1246,6 +1440,8 @@ export default function App() {
   // ★ 공정/추가 에이전트 선택 state
   const [selectedProcess, setSelectedProcess] = useState("Cell");
   const [extraAgents, setExtraAgents] = useState([]);
+  // ★ 영역 5: 선정 기준 드롭다운 (평소 숨김)
+  const [showCriteriaBox, setShowCriteriaBox] = useState(false);
   const fileRef = useRef();
 
   const toggleDate = (d) => {
@@ -1328,13 +1524,34 @@ export default function App() {
       // ★ PE 사전 큐레이션 (전체 이슈 1회 호출)
       setProgress(p => [...p, "📝 PE 사전 큐레이션 중 (전체 이슈 정리)..."]);
       const allIssuesForCuration = [...priority.urgent, ...priority.important, ...priority.normal];
+
+      // ★ 영역 5: 모호 메시지 AI 분류 (2개 이상 카테고리 매칭된 메시지만 Haiku 호출)
+      const ambig = classified?.ambiguousMsgs || [];
+      let ambigResult = { quality: [], process_change: [], test: [], skip: [] };
+      if (ambig.length > 0) {
+        setProgress(p => [...p, `🔀 모호 메시지 AI 분류 중 (${ambig.length}건)...`]);
+        try {
+          ambigResult = await classifyAmbiguousMessages(ambig);
+          setProgress(p => [...p, `✅ 모호 분류 완료 (품질 ${ambigResult.quality.length} / 공정변경 ${ambigResult.process_change.length} / 테스트 ${ambigResult.test.length} / 제외 ${ambigResult.skip.length})`]);
+        } catch {
+          setProgress(p => [...p, `⚠️ 모호 분류 실패 — 첫 매칭 카테고리로 자동 할당`]);
+        }
+      }
+      // 카테고리별 최종 메시지 = 키워드 직접 매칭 + AI 분류 결과
+      const categoryMsgs = {
+        quality: [...(classified?.qualityMsgs || []), ...ambigResult.quality],
+        process_change: [...(classified?.processChangeMsgs || []), ...ambigResult.process_change],
+        test: [...(classified?.testMsgs || []), ...ambigResult.test],
+      };
+      setProgress(p => [...p, `📊 카테고리 집계: 품질 ${categoryMsgs.quality.length}건 / 공정변경 ${categoryMsgs.process_change.length}건 / 테스트 ${categoryMsgs.test.length}건`]);
+
       let curation;
       try {
-        curation = await runPreCuration(allIssuesForCuration, kbResult.kb["Cell_PE"] || kbResult.kb["Elec_PE"] || "", reportType);
-        setProgress(p => [...p, `✅ PE 큐레이션 완료 (일자별 ${curation.daily_table.length}건, 장기부동 ${curation.long_downtime.length}건, 반복 ${curation.recurring.length}건)`]);
+        curation = await runPreCuration(allIssuesForCuration, kbResult.kb["Cell_PE"] || kbResult.kb["Elec_PE"] || "", reportType, categoryMsgs);
+        setProgress(p => [...p, `✅ PE 큐레이션 완료 (일자별 ${curation.daily_table.length}건, 장기부동 ${curation.long_downtime.length}건, 반복 ${curation.recurring.length}건, 품질 ${curation.quality_issues.length}건, 공정변경 ${curation.process_changes.length}건, 테스트 ${curation.tests_inspections.length}건)`]);
       } catch (e) {
         setProgress(p => [...p, `⚠️ PE 큐레이션 실패 - 폴백 사용`]);
-        curation = buildFallbackCuration(allIssuesForCuration);
+        curation = buildFallbackCuration(allIssuesForCuration, categoryMsgs);
       }
 
       // 모드 분류 + 건별 논의
@@ -1445,7 +1662,49 @@ export default function App() {
           if (r.cause) t += `    원인: ${r.cause}\n`;
         });
       }
+
+      // ★ 영역 5-I: 큐레이션 이력 카테고리 3종
+      if (minutes.curation.quality_issues?.length > 0) {
+        t += `\n[품질 이슈 이력 (${minutes.curation.quality_issues.length}건)]\n`;
+        minutes.curation.quality_issues.forEach(q => {
+          t += `  • ${q.date} ${q.time} | ${q.item}`;
+          if (q.note && q.note !== "-") t += ` (${q.note})`;
+          t += `\n`;
+        });
+      }
+
+      if (minutes.curation.process_changes?.length > 0) {
+        t += `\n[공정/설비 조건변경 이력 (${minutes.curation.process_changes.length}건)]\n`;
+        minutes.curation.process_changes.forEach(c => {
+          t += `  • ${c.date} ${c.time} | ${c.item}`;
+          if (c.who && c.who !== "-") t += ` (${c.who})`;
+          t += `\n`;
+        });
+      }
+
+      if (minutes.curation.tests_inspections?.length > 0) {
+        t += `\n[테스트/양산외 생산 이력 (${minutes.curation.tests_inspections.length}건)]\n`;
+        minutes.curation.tests_inspections.forEach(test => {
+          t += `  • ${test.date} ${test.time} | ${test.item}`;
+          if (test.purpose && test.purpose !== "-") t += ` (${test.purpose})`;
+          t += `\n`;
+        });
+      }
     }
+
+    // ★ 영역 5-I: 참고용 — 선정 기준 / 점수 공식 / 모드 정의
+    t += `\n${"─".repeat(52)}\n[참고: 선정 기준 / 점수 공식 / 모드 정의]\n${"─".repeat(52)}\n`;
+    t += `① 본문 논의 대상\n`;
+    t += `   - 장기부동 (60분↑ OR Result에 "not solved")\n`;
+    t += `   - 반복 (동일 호기/부품 2회↑)\n`;
+    t += `   - Full Stop (라인 완전정지)\n`;
+    t += `   → 점수 상위 ${MAX_ISSUES}건 선정 (공정변경·테스트·품질은 큐레이션 이력만)\n`;
+    t += `② 점수 공식\n`;
+    t += `   score = 부동(분)/30 + 반복횟수×3 + 안전환경(+10) + 미해결(+5) + FullStop(+5)\n`;
+    t += `③ 논의 모드\n`;
+    t += `   - DEEP    : 안전·환경·품질통제·출하고객·라인정지 키워드 OR 긴급 → 8필드 풀 논의\n`;
+    t += `   - STANDARD: 중요 (반복/FullStop/부품반복) → 3필드 액션플랜\n`;
+    t += `   - LITE    : 일반 (완료/단순) → 압축 평가\n`;
 
     // 시간/빈도 분석
     if (minutes.analytics) {
@@ -1946,6 +2205,39 @@ export default function App() {
               ))}
             </div>
 
+            {/* ★ 영역 5-G: 큐레이션 이력 카테고리 카운트 (참고 표시) */}
+            {classified && (classified.qualityMsgs?.length || classified.processChangeMsgs?.length || classified.testMsgs?.length || classified.ambiguousMsgs?.length) > 0 && (
+              <div style={{
+                background:"rgba(15,23,42,0.5)", border:"1px solid rgba(100,116,139,0.25)",
+                borderRadius:10, padding:"10px 12px", marginBottom:12,
+              }}>
+                <div style={{fontSize:10,color:"#94a3b8",fontWeight:800,marginBottom:8}}>
+                  📦 큐레이션 이력 카테고리 (본문 논의 외 — 보고서 상단에 정리됨)
+                </div>
+                <div style={{display:"flex",gap:8}}>
+                  {[
+                    {label:"🧪 품질",count:classified.qualityMsgs?.length || 0,color:"#a78bfa",bg:"rgba(167,139,250,0.08)",border:"rgba(167,139,250,0.2)"},
+                    {label:"⚙️ 공정변경",count:classified.processChangeMsgs?.length || 0,color:"#34d399",bg:"rgba(52,211,153,0.08)",border:"rgba(52,211,153,0.2)"},
+                    {label:"🔬 테스트",count:classified.testMsgs?.length || 0,color:"#22d3ee",bg:"rgba(34,211,238,0.08)",border:"rgba(34,211,238,0.2)"},
+                    {label:"🔀 모호",count:classified.ambiguousMsgs?.length || 0,color:"#94a3b8",bg:"rgba(100,116,139,0.08)",border:"rgba(100,116,139,0.2)"},
+                  ].map(c => (
+                    <div key={c.label} style={{
+                      flex:1, background:c.bg, border:`1px solid ${c.border}`,
+                      borderRadius:6, padding:"6px 8px", textAlign:"center",
+                    }}>
+                      <div style={{fontSize:14,fontWeight:800,color:c.color}}>{c.count}</div>
+                      <div style={{fontSize:9,color:c.color,fontWeight:700}}>{c.label}</div>
+                    </div>
+                  ))}
+                </div>
+                {(classified.ambiguousMsgs?.length || 0) > 0 && (
+                  <div style={{fontSize:9,color:"#64748b",marginTop:6}}>
+                    ※ 모호 {classified.ambiguousMsgs.length}건은 분석 시작 시 AI(Haiku)가 카테고리 판정
+                  </div>
+                )}
+              </div>
+            )}
+
             <div style={{
               background:"rgba(167,139,250,0.06)", border:"1px solid rgba(167,139,250,0.2)",
               borderRadius:10, padding:"12px 14px", marginBottom:12,
@@ -2100,6 +2392,62 @@ export default function App() {
               </div>
             )}
 
+            {/* ★ 영역 5: 선정 기준 / 모드 정의 / 점수 공식 (드롭다운 — 평소 숨김) */}
+            <div style={{marginBottom:14}}>
+              <button onClick={()=>setShowCriteriaBox(v=>!v)} style={{
+                width:"100%",
+                background:"rgba(15,23,42,0.5)",
+                border:"1px solid rgba(100,116,139,0.3)",
+                borderRadius:8, padding:"8px 12px",
+                color:"#94a3b8", fontSize:11, fontWeight:700,
+                cursor:"pointer", textAlign:"left",
+                display:"flex", alignItems:"center", justifyContent:"space-between",
+              }}>
+                <span>📋 본문 논의 선정 기준 / 논의 모드 정의 / 점수 공식 (참고용)</span>
+                <span style={{fontSize:10,color:"#64748b"}}>{showCriteriaBox ? "▲ 접기" : "▼ 펼치기"}</span>
+              </button>
+              {showCriteriaBox && (
+                <div style={{
+                  marginTop:6,
+                  background:"rgba(15,23,42,0.6)",
+                  border:"1px solid rgba(100,116,139,0.25)",
+                  borderRadius:8, padding:"12px 14px",
+                  fontSize:10.5, color:"#cbd5e1", lineHeight:1.7,
+                }}>
+                  <div style={{marginBottom:10}}>
+                    <div style={{fontSize:11,fontWeight:800,color:"#22d3ee",marginBottom:4}}>① 본문 논의 대상 선정 기준</div>
+                    <div style={{paddingLeft:8,color:"#94a3b8"}}>
+                      • <b style={{color:"#cbd5e1"}}>장기부동</b>: 부동시간 60분 이상 OR Result에 "not solved" 포함<br/>
+                      • <b style={{color:"#cbd5e1"}}>반복</b>: 동일 호기 2회 이상 OR 동일 부품 2회 이상<br/>
+                      • <b style={{color:"#cbd5e1"}}>Full Stop</b>: 라인 완전정지 이슈<br/>
+                      → 위 3가지 후보 중 점수 상위 <b style={{color:"#cbd5e1"}}>{MAX_ISSUES}건</b> 선정<br/>
+                      <span style={{color:"#64748b"}}>※ 공정/설비 조건변경 · Test/양산외 생산 · 품질이슈는 본문 논의 대신 큐레이션 이력으로만 정리</span>
+                    </div>
+                  </div>
+                  <div style={{marginBottom:10}}>
+                    <div style={{fontSize:11,fontWeight:800,color:"#22d3ee",marginBottom:4}}>② 점수 공식</div>
+                    <div style={{paddingLeft:8,color:"#94a3b8",fontFamily:"monospace",background:"rgba(0,0,0,0.2)",padding:"6px 8px",borderRadius:4}}>
+                      score = 부동(분)/30 + 반복횟수×3 + 안전환경(+10) + 미해결(+5) + FullStop(+5)
+                    </div>
+                    <div style={{paddingLeft:8,color:"#64748b",marginTop:4,fontSize:10}}>
+                      예: 부동 90분 + 반복 2회 + 안전키워드 → 3 + 6 + 10 = 19점
+                    </div>
+                  </div>
+                  <div>
+                    <div style={{fontSize:11,fontWeight:800,color:"#22d3ee",marginBottom:4}}>③ 논의 모드 정의 (DEEP / STANDARD / LITE)</div>
+                    <div style={{paddingLeft:8,color:"#94a3b8"}}>
+                      • <b style={{color:"#ef4444"}}>DEEP</b>: 안전·환경·품질통제·출하고객·라인정지 키워드 감지 OR 긴급 이슈<br/>
+                      &nbsp;&nbsp;&nbsp;→ 8필드 상세 카드 + 다중 페르소나 논의<br/>
+                      • <b style={{color:"#f59e0b"}}>STANDARD</b>: 중요 이슈 (반복 / Full Stop / 부품 반복교체)<br/>
+                      &nbsp;&nbsp;&nbsp;→ 3필드 카드 + 페르소나 논의<br/>
+                      • <b style={{color:"#94a3b8"}}>LITE</b>: 일반 이슈 (완료/단순)<br/>
+                      &nbsp;&nbsp;&nbsp;→ 압축 평가 (간단 코멘트)
+                    </div>
+                  </div>
+                </div>
+              )}
+            </div>
+
             {/* ★ PE 사전 큐레이션 (보고서 1부 - 전체 정리) */}
             {minutes.curation && (
               <div style={{
@@ -2178,6 +2526,54 @@ export default function App() {
                         <span style={{color:"#94a3b8"}}> ({r.count}회) </span>
                         <span style={{color:"#cbd5e1"}}>{r.lines?.join(", ")}</span>
                         {r.cause && <div style={{color:"#94a3b8",marginTop:2}}>원인: {r.cause}</div>}
+                      </div>
+                    ))}
+                  </div>
+                )}
+
+                {/* ★ 영역 5-H: 품질 이슈 이력 */}
+                {minutes.curation.quality_issues?.length > 0 && (
+                  <div style={{marginTop:12}}>
+                    <div style={{fontSize:10,color:"#a78bfa",fontWeight:700,marginBottom:6}}>
+                      🧪 품질 이슈 이력 ({minutes.curation.quality_issues.length}건)
+                    </div>
+                    {minutes.curation.quality_issues.map((q, i) => (
+                      <div key={i} style={{fontSize:10,padding:"6px 10px",background:"rgba(167,139,250,0.08)",borderRadius:5,marginBottom:4}}>
+                        <span style={{color:"#94a3b8"}}>{q.date} {q.time}</span>{" "}
+                        <span style={{color:"#cbd5e1"}}>{q.item}</span>
+                        {q.note && q.note !== "-" && <span style={{color:"#94a3b8"}}> · {q.note}</span>}
+                      </div>
+                    ))}
+                  </div>
+                )}
+
+                {/* ★ 영역 5-H: 공정/설비 조건변경 이력 */}
+                {minutes.curation.process_changes?.length > 0 && (
+                  <div style={{marginTop:12}}>
+                    <div style={{fontSize:10,color:"#34d399",fontWeight:700,marginBottom:6}}>
+                      ⚙️ 공정/설비 조건변경 이력 ({minutes.curation.process_changes.length}건)
+                    </div>
+                    {minutes.curation.process_changes.map((c, i) => (
+                      <div key={i} style={{fontSize:10,padding:"6px 10px",background:"rgba(52,211,153,0.08)",borderRadius:5,marginBottom:4}}>
+                        <span style={{color:"#94a3b8"}}>{c.date} {c.time}</span>{" "}
+                        <span style={{color:"#cbd5e1"}}>{c.item}</span>
+                        {c.who && c.who !== "-" && <span style={{color:"#94a3b8"}}> · {c.who}</span>}
+                      </div>
+                    ))}
+                  </div>
+                )}
+
+                {/* ★ 영역 5-H: 테스트/양산외 생산 이력 */}
+                {minutes.curation.tests_inspections?.length > 0 && (
+                  <div style={{marginTop:12}}>
+                    <div style={{fontSize:10,color:"#22d3ee",fontWeight:700,marginBottom:6}}>
+                      🔬 테스트/양산외 생산 이력 ({minutes.curation.tests_inspections.length}건)
+                    </div>
+                    {minutes.curation.tests_inspections.map((t, i) => (
+                      <div key={i} style={{fontSize:10,padding:"6px 10px",background:"rgba(34,211,238,0.08)",borderRadius:5,marginBottom:4}}>
+                        <span style={{color:"#94a3b8"}}>{t.date} {t.time}</span>{" "}
+                        <span style={{color:"#cbd5e1"}}>{t.item}</span>
+                        {t.purpose && t.purpose !== "-" && <span style={{color:"#94a3b8"}}> · {t.purpose}</span>}
                       </div>
                     ))}
                   </div>

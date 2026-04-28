@@ -28,12 +28,16 @@ const DEEP_FORCE_KEYWORDS = {
   라인정지: ["라인 정지", "가동 중단", "전 라인 멈춤", "올스톱", "full_stop"],
 };
 
-// ─── 영역 5: 큐레이션 이력 카테고리 키워드 (1차 안, 사용 후 튜닝) ─────────────────
-// 부동 이슈와 별개로 WhatsApp 일반 메시지에서 추출하여 큐레이션 이력으로만 정리
+// ─── 영역 9-B: 5-카테고리 분류 키워드 (명세서 §4 + 부록 A 기반) ─────────────
+// 한 이슈가 여러 카테고리에 속할 수 있음 (tags 배열로 다중 분류)
 const QUALITY_KEYWORDS = [
+  // 명세서 §4.3: NG / 품질
   "불량", "defect", "NG", "수율", "yield", "Cpk",
   "코팅 불량", "두께", "정렬", "외관", "치수",
   "SAR", "NCR", "HOLD", "스크랩", "scrap", "리젝",
+  // 명세서 §10.2 QUALITY_NG 패턴
+  "tab width", "sepa fold", "electrode expose", "vision NG", "appearance",
+  "tab fold", "tab widht",  // tab widht는 명세서 부록 A 그대로 (오타 유지)
 ];
 
 const PROCESS_CHANGE_KEYWORDS = [
@@ -41,6 +45,8 @@ const PROCESS_CHANGE_KEYWORDS = [
   "recipe", "셋업", "조건", "오프셋", "offset",
   "Gap", "압력", "온도", "속도", "tuning", "튜닝",
   "파라미터", "parameter",
+  // 명세서 §10.2 CONDITION_CHANGE 패턴
+  "setting", "adjust",
 ];
 
 const TEST_KEYWORDS = [
@@ -48,7 +54,57 @@ const TEST_KEYWORDS = [
   "trial", "trial run", "샘플", "sample", "DOE",
   "양산외", "비정상 생산", "특별 생산", "엔지니어링 런",
   "engineering run", "pilot",
+  // 명세서 §10.2 TEST_PM 패턴
+  "swap", "swab", "calibration", "PM", "monitoring",
 ];
+
+// 명세서 §5.2 키워드 가중치 매트릭스 (점수 보너스)
+const SCORE_KEYWORD_MATRIX = {
+  safety_env: {
+    bonus: 10,
+    keywords: ["emergency", "EMO", "safety", "환경", "부상", "사고", "화재",
+               "감전", "추락", "응급", "구급", "injury", "fire",
+               "누유", "누수", "유출", "분진", "악취", "leak", "spill"],
+    fields: ["problem", "cause"],
+  },
+  quality_critical: {
+    bonus: 7,
+    keywords: ["NG", "defect", "품질", "vision NG"],
+    fields: ["problem", "alarm"],
+  },
+  full_stop: {
+    bonus: 5,
+    keywords: ["full_stop"],
+    fields: ["stop_status"],
+  },
+  unresolved: {
+    bonus: 5,
+    keywords: ["OPEN", "ToBeInformedLater", "monitoring", "not solved", "unsolved"],
+    fields: ["duration", "status", "result"],
+  },
+  spare_missing: {
+    bonus: 3,
+    keywords: ["no spare", "spare 없음", "spare 부족"],
+    fields: ["action"],
+  },
+};
+
+// 명세서 §4.3: High Frequency 원인 카테고리 키워드 매트릭스 (부록 A)
+const CAUSE_CATEGORIES = {
+  ejector_suction: ["ejector", "suction", "vacuum", "PnP fail"],
+  sensor: ["sensor", "limit", "detection", "cable loose"],
+  servo: ["servo", "fault code", "over run", "31137"],
+  regulator_coil: ["regulator", "coil", "BMREG"],
+  ng_tab: ["tab width", "tab fold", "tab widht"],
+  heat_press: ["heat press", "heatpress", "pressure result"],
+  hang_error: ["hang error", "magazine lifter"],
+  pulling: ["pulling drag", "pulling grip"],
+  mandrel: ["mandrel"],
+  splicing: ["splice", "splicing"],
+};
+// 우선순위 (이중 카테고리화 방지) — 위에서 아래로 우선
+const CAUSE_PRIORITY = ["ng_tab", "mandrel", "ejector_suction", "servo", "regulator_coil",
+                        "heat_press", "hang_error", "pulling", "splicing", "sensor"];
 
 // ─── 모델 설정 (Function이 model 파라미터 지원하도록 수정됨) ─────────────────────
 const MODEL_FAST = "claude-haiku-4-5";       // 라우터/분류기
@@ -235,15 +291,39 @@ function safeJSON(raw) {
 // ─── WhatsApp 파서 (기존 그대로) ───────────────────────────────────────────────
 function parseWhatsApp(text) {
   const lines = text.split("\n");
-  const msgRe = /^(\d{2}\/\d{1,2}\/\d{1,2})\s+(\d{1,2}:\d{2})\s+-\s+([^:]+):\s*(.*)/;
+  // ★ 영역 9-A: 두 시간 형식 지원
+  //  (1) 24시간: "24/2/8 16:15 - 손영희: ..."
+  //  (2) AM/PM 한글 로케일: "24/2/8 PM 4:15 - ..." 또는 "24/2/8 오후 4:15 - ..."
+  const msgRe24   = /^(\d{2}\/\d{1,2}\/\d{1,2})\s+(\d{1,2}:\d{2})\s+-\s+([^:]+):\s*(.*)/;
+  const msgReAmPm = /^(\d{2}\/\d{1,2}\/\d{1,2})\s+(AM|PM|오전|오후)\s+(\d{1,2}):(\d{2})\s+-\s+([^:]+):\s*(.*)/;
+
+  // AM/PM → 24시간 변환
+  const to24h = (ampm, h, mm) => {
+    let hour = parseInt(h, 10);
+    const isPM = ampm === "PM" || ampm === "오후";
+    const isAM = ampm === "AM" || ampm === "오전";
+    if (isPM && hour < 12) hour += 12;
+    else if (isAM && hour === 12) hour = 0;
+    return { time: `${hour}:${mm}`, hour };
+  };
+
   const msgs = [];
   let cur = null;
   for (const line of lines) {
-    const m = line.match(msgRe);
+    let m = line.match(msgRe24);
     if (m) {
       if (cur) msgs.push(cur);
-      cur = { date: m[1], time: m[2], hour: parseInt(m[2].split(":")[0]), sender: m[3].trim(), text: m[4] };
-    } else if (cur && line.trim()) {
+      cur = { date: m[1], time: m[2], hour: parseInt(m[2].split(":")[0], 10), sender: m[3].trim(), text: m[4] };
+      continue;
+    }
+    m = line.match(msgReAmPm);
+    if (m) {
+      if (cur) msgs.push(cur);
+      const { time, hour } = to24h(m[2], m[3], m[4]);
+      cur = { date: m[1], time, hour, sender: m[5].trim(), text: m[6] };
+      continue;
+    }
+    if (cur && line.trim()) {
       cur.text += "\n" + line;
     }
   }
@@ -659,6 +739,150 @@ function selectKeyIssues(priority) {
 }
 
 // ═════════════════════════════════════════════════════════════════════════════
+// ★ 영역 9 (PoC) ★ 명세서 기반 5-카테고리 분류 + 다중 tags + 매트릭스 점수
+// ═════════════════════════════════════════════════════════════════════════════
+
+// ─── 9-B: 5-카테고리 분류 (명세서 §4) ───────────────────────────────────────
+// 한 이슈가 여러 카테고리(tags)에 속할 수 있음.
+// 입력: classifyPriority가 반환한 priority 객체 (urgent/important/normal 모두 활용)
+// 출력: 모든 이슈에 tags: [] 부착 + 카운트 정보
+function classifyIssues5Category(priority, options = {}) {
+  const { longDowntimeThresholdMin = 60, repeatThreshold = 2 } = options;
+  const allIssues = [...priority.urgent, ...priority.important, ...priority.normal];
+
+  // (a) 설비별 카운트 (HIGH_FREQUENCY 판정용)
+  const eqCounts = {};
+  for (const i of allIssues) {
+    const eq = i.eq || "";
+    if (eq) eqCounts[eq] = (eqCounts[eq] || 0) + 1;
+  }
+  // (b) 알람별 카운트
+  const alarmCounts = {};
+  for (const i of allIssues) {
+    // alarm 필드는 기존 classifyPriority에서 추출 안 됨 → text에서 alarm 라인 추출 시도
+    const alarmMatch = (i.text || "").match(/\*?Alarm\*?\s*[:：]\s*([^\n]+)/i);
+    const alarm = alarmMatch ? alarmMatch[1].trim() : "";
+    if (alarm) alarmCounts[alarm] = (alarmCounts[alarm] || 0) + 1;
+    i._alarm = alarm;  // 캐싱
+  }
+  // (c) 원인 카테고리 매칭 (이중 방지: CAUSE_PRIORITY 순서대로)
+  const matchCauseCategory = (issue) => {
+    const text = [issue.eq, issue.prob, issue.cause, issue.result, issue.text || ""]
+      .join(" ").toLowerCase();
+    for (const cat of CAUSE_PRIORITY) {
+      const kws = CAUSE_CATEGORIES[cat] || [];
+      if (kws.some(kw => text.includes(kw.toLowerCase()))) return cat;
+    }
+    return null;
+  };
+
+  // 각 이슈에 tags 부착
+  const tagged = allIssues.map(issue => {
+    const tags = [];
+    const fullText = [issue.eq, issue.prob, issue.cause, issue.result, issue.text || ""]
+      .join(" ").toLowerCase();
+
+    // LONG_DOWNTIME: 부동시간 ≥ threshold 또는 미해결
+    const isUnsolved = (issue.result || "").toLowerCase().match(/not solved|unsolved/) ||
+                       (issue.reasons || []).some(r => r.includes("미해결"));
+    if ((issue.durMin || 0) >= longDowntimeThresholdMin || isUnsolved) {
+      tags.push("LONG_DOWNTIME");
+    }
+
+    // HIGH_FREQUENCY: 동일 설비 N회+ 또는 동일 알람 N회+
+    const eq = issue.eq || "";
+    const alarm = issue._alarm || "";
+    if ((eq && eqCounts[eq] >= repeatThreshold) ||
+        (alarm && alarmCounts[alarm] >= repeatThreshold)) {
+      tags.push("HIGH_FREQUENCY");
+    }
+
+    // CONDITION_CHANGE: parameter change 패턴 (명세서 §10.2)
+    if (PROCESS_CHANGE_KEYWORDS.some(kw => fullText.includes(kw.toLowerCase())) ||
+        /(\d+(?:\.\d+)?)\s*(?:to|→|->|에서)\s*(\d+(?:\.\d+)?)/i.test(fullText)) {
+      tags.push("CONDITION_CHANGE");
+    }
+
+    // TEST_PM: 테스트 키워드
+    if (TEST_KEYWORDS.some(kw => fullText.includes(kw.toLowerCase()))) {
+      tags.push("TEST_PM");
+    }
+
+    // QUALITY_NG: 품질 키워드
+    if (QUALITY_KEYWORDS.some(kw => fullText.includes(kw.toLowerCase()))) {
+      tags.push("QUALITY_NG");
+    }
+
+    // 원인 카테고리 (서브 분류)
+    const causeCategory = matchCauseCategory(issue);
+
+    return { ...issue, tags, causeCategory };
+  });
+
+  // 카테고리별 카운트
+  const counts = {
+    LONG_DOWNTIME: tagged.filter(i => i.tags.includes("LONG_DOWNTIME")).length,
+    HIGH_FREQUENCY: tagged.filter(i => i.tags.includes("HIGH_FREQUENCY")).length,
+    CONDITION_CHANGE: tagged.filter(i => i.tags.includes("CONDITION_CHANGE")).length,
+    TEST_PM: tagged.filter(i => i.tags.includes("TEST_PM")).length,
+    QUALITY_NG: tagged.filter(i => i.tags.includes("QUALITY_NG")).length,
+    UNTAGGED: tagged.filter(i => i.tags.length === 0).length,
+  };
+
+  return { issues: tagged, counts, eqCounts, alarmCounts };
+}
+
+// ─── 9-C: 명세서 §5.2 매트릭스 기반 점수 (기존 scoreIssue 대체) ─────────────────
+// 기존 scoreIssue와 호환되는 시그니처. 명세서 키워드 매트릭스 5종 적용.
+function scoreIssueMatrix(issue) {
+  const breakdown = {
+    downtime: (issue.durMin || 0) / 30,
+    repeat: ((issue.repeatCount || 1) >= 2) ? (issue.repeatCount * 3) : 0,
+  };
+
+  // 매트릭스 5종 적용
+  const fieldMap = {
+    problem: issue.prob || "",
+    cause: issue.cause || "",
+    alarm: issue._alarm || "",
+    stop_status: issue.stopStatus || ((issue.reasons || []).join(" ").includes("Full Stop") ? "full_stop" : ""),
+    duration: issue.durMin == null ? "ToBeInformedLater" : "",
+    status: issue.result || "",
+    result: issue.result || "",
+    action: issue.action || "",
+  };
+
+  for (const [key, def] of Object.entries(SCORE_KEYWORD_MATRIX)) {
+    const text = (def.fields || []).map(f => fieldMap[f] || "").join(" ").toLowerCase();
+    if (def.keywords.some(kw => text.includes(kw.toLowerCase()))) {
+      breakdown[key] = def.bonus;
+    } else {
+      breakdown[key] = 0;
+    }
+  }
+
+  const total = Object.values(breakdown).reduce((a, b) => a + b, 0);
+  return { total: Math.round(total * 10) / 10, breakdown };
+}
+
+// ─── 9-B: 명세서 기반 신규 selectKeyIssues (LONG_DOWNTIME tag 기반) ────────────
+function selectKeyIssuesFromTags(taggedIssues, maxIssues = MAX_ISSUES) {
+  // LONG_DOWNTIME 또는 HIGH_FREQUENCY tag가 있는 이슈만 후보
+  const candidates = taggedIssues.filter(i =>
+    i.tags.includes("LONG_DOWNTIME") || i.tags.includes("HIGH_FREQUENCY")
+  );
+  const scored = candidates.map(issue => {
+    const s = scoreIssueMatrix(issue);
+    return { ...issue, score: s.total, scoreBreakdown: s.breakdown };
+  });
+  scored.sort((a, b) => {
+    if (b.score !== a.score) return b.score - a.score;
+    return (b.durMin || 0) - (a.durMin || 0);
+  });
+  return scored.slice(0, maxIssues);
+}
+
+// ═════════════════════════════════════════════════════════════════════════════
 // ★ 새로운 논의 시스템 ★
 // ═════════════════════════════════════════════════════════════════════════════
 
@@ -853,6 +1077,143 @@ function buildFallbackCuration(allIssues, categoryMsgs = {}) {
     quality_issues: mapMsgs(categoryMsgs.quality, "note"),
     process_changes: mapMsgs(categoryMsgs.process_change, "who"),
     tests_inspections: mapMsgs(categoryMsgs.test, "purpose"),
+  };
+}
+
+// ═════════════════════════════════════════════════════════════════════════════
+// ★ 영역 9-E: 간단모드 보고서 빌더 (명세서 §6 표 형태)
+// ═════════════════════════════════════════════════════════════════════════════
+function buildSimpleReport({ dateStr, selDates, taggedResult, priority, reportType, process, curation }) {
+  const { issues, counts, eqCounts, alarmCounts } = taggedResult;
+  const isWeekly = reportType === "weekly";
+
+  // 카테고리별 점수 매긴 후 정렬
+  const scoreEach = (arr) => arr.map(i => {
+    const s = scoreIssueMatrix(i);
+    return { ...i, score: s.total, scoreBreakdown: s.breakdown };
+  }).sort((a, b) => {
+    if (b.score !== a.score) return b.score - a.score;
+    return (b.durMin || 0) - (a.durMin || 0);
+  });
+
+  // 1. LONG_DOWNTIME 상위
+  const longDowntime = scoreEach(issues.filter(i => i.tags.includes("LONG_DOWNTIME")))
+    .slice(0, isWeekly ? 10 : 5);
+
+  // 2. HIGH_FREQUENCY (3축)
+  // (a) 설비별 TOP 10
+  const eqRanked = Object.entries(eqCounts)
+    .filter(([, c]) => c >= 2)
+    .sort((a, b) => b[1] - a[1])
+    .slice(0, 10)
+    .map(([eq, count]) => {
+      const samples = issues.filter(i => i.eq === eq).slice(0, 3);
+      return { equipment: eq, count, samples };
+    });
+  // (b) 알람별 TOP 10
+  const alarmRanked = Object.entries(alarmCounts)
+    .filter(([, c]) => c >= 2)
+    .sort((a, b) => b[1] - a[1])
+    .slice(0, 10)
+    .map(([alarm, count]) => ({ alarm, count }));
+  // (c) 원인 카테고리별
+  const causeCategoryStats = {};
+  issues.forEach(i => {
+    if (i.causeCategory) {
+      causeCategoryStats[i.causeCategory] = (causeCategoryStats[i.causeCategory] || 0) + 1;
+    }
+  });
+  const causeCategoryRanked = Object.entries(causeCategoryStats)
+    .sort((a, b) => b[1] - a[1])
+    .map(([cat, count]) => ({ category: cat, count }));
+
+  // 3. CONDITION_CHANGE — 큐레이션의 process_changes 활용 + 5-카테고리 분류 결과
+  const conditionChanges = [
+    ...(curation?.process_changes || []),
+    ...issues.filter(i => i.tags.includes("CONDITION_CHANGE") && !i.tags.includes("LONG_DOWNTIME"))
+              .slice(0, 10)
+              .map(i => ({ date: i.date, time: i.time, item: (i.prob || "").slice(0, 60), who: i.pic || "-" })),
+  ].slice(0, 15);
+
+  // 4. TEST_PM
+  const testPm = [
+    ...(curation?.tests_inspections || []),
+    ...issues.filter(i => i.tags.includes("TEST_PM") && !i.tags.includes("LONG_DOWNTIME"))
+              .slice(0, 10)
+              .map(i => ({ date: i.date, time: i.time, item: (i.prob || "").slice(0, 60), purpose: i.cause || "-" })),
+  ].slice(0, 15);
+
+  // 5. QUALITY_NG — 큐레이션의 quality_issues 활용
+  const qualityNg = [
+    ...(curation?.quality_issues || []),
+    ...issues.filter(i => i.tags.includes("QUALITY_NG") && !i.tags.includes("LONG_DOWNTIME"))
+              .slice(0, 10)
+              .map(i => ({ date: i.date, time: i.time, item: (i.prob || "").slice(0, 60), note: i.cause || "-" })),
+  ].slice(0, 15);
+
+  // 6. 미해결 / 모니터링 필요 이슈
+  const unresolved = issues.filter(i => {
+    const r = (i.result || "").toLowerCase();
+    return r.includes("not solved") || r.includes("unsolved") || (i.reasons || []).some(rs => rs.includes("미해결"));
+  }).slice(0, 10);
+
+  // 7. 일일 합계
+  const dailyTotals = {};
+  issues.forEach(i => {
+    const d = i.date || "?";
+    if (!dailyTotals[d]) dailyTotals[d] = { date: d, count: 0, totalMin: 0 };
+    dailyTotals[d].count += 1;
+    dailyTotals[d].totalMin += (i.durMin || 0);
+  });
+  const dailyOverview = Object.values(dailyTotals).sort((a, b) => a.date.localeCompare(b.date));
+
+  // 8. 자동 인사이트 (룰 기반)
+  const insights = [];
+  // 동일 설비 4회+ : RCA 권장
+  Object.entries(eqCounts).filter(([, c]) => c >= 4).slice(0, 3).forEach(([eq, c]) => {
+    insights.push(`설비 ${eq} 만성화: ${selDates.length}일 내 ${c}회 발생 — RCA(근본원인분석) 필요`);
+  });
+  // 동일 알람 5회+ : 부품/로직 점검
+  Object.entries(alarmCounts).filter(([, c]) => c >= 5).slice(0, 3).forEach(([al, c]) => {
+    insights.push(`알람 "${al.slice(0, 50)}" ${c}회 다발 — 부품 품질 또는 로직 점검 필요`);
+  });
+  // 미해결 이슈 다수
+  if (unresolved.length >= 3) {
+    insights.push(`미해결 이슈 ${unresolved.length}건 — TFT 구성 또는 우선 해결 권장`);
+  }
+  // 큐레이션 요약 활용
+  if (curation?.summary_text) {
+    insights.push(`PE 종합: ${curation.summary_text}`);
+  }
+
+  return {
+    title: `${process} 공정 ${dateStr} 이슈 정리 (간단모드)`,
+    date: dateStr,
+    attendees: "(간단모드 — 페르소나 논의 없음)",
+    agenda: `[${process} 공정] ${dateStr} 이슈 정리 (간단모드)`,
+    sections: [
+      { heading: "📊 일별 부동 현황", items: dailyOverview.map(d => `${d.date}: ${d.count}건 / ${d.totalMin}분`) },
+      { heading: "🔴 장기부동", items: longDowntime.map(i => `${i.eq} (${i.durMin}분, 점수${i.score}) — ${(i.prob||"").slice(0,40)}`) },
+      { heading: "🔁 반복 발생", items: eqRanked.map(e => `${e.equipment}: ${e.count}회`) },
+      { heading: "💡 인사이트", items: insights },
+    ],
+    // 간단모드 전용 데이터 (UI에서 표 렌더링)
+    simple: {
+      dailyOverview,
+      longDowntime,
+      eqRanked,
+      alarmRanked,
+      causeCategoryRanked,
+      conditionChanges,
+      testPm,
+      qualityNg,
+      unresolved,
+      insights,
+      counts,
+      threshold: isWeekly ? 60 : 30,
+    },
+    analytics: { totalIssues: issues.length, counts },
+    grouped: { DEEP: [], STANDARD: [], LITE: [] },  // 호환용 빈 배열
   };
 }
 
@@ -1580,6 +1941,10 @@ export default function App() {
   // ★ 영역 8: 날짜 범위 선택 (start/end/unit). 분석 함수는 selDates 사용 — selRange는 표시/분기용.
   const [selRange, setSelRange]   = useState({ start: null, end: null, unit: "day" });
   const [reportType, setReportType] = useState("meeting");
+  // ★ 영역 9-D: 보고서 생성 모드 (간단=명세서 표 형태, 상세=페르소나 8명 논의)
+  const [reportMode, setReportMode] = useState("simple");  // 기본값: 간단모드
+  // ★ 영역 9: 명세서 5-카테고리 분류 결과 (간단모드 표 출력용)
+  const [taggedIssues, setTaggedIssues] = useState(null);
   const [classified, setClassified] = useState(null);
   const [priority, setPriority]   = useState(null);
   const [kbStats, setKbStats]     = useState(null);
@@ -1789,37 +2154,51 @@ export default function App() {
         }
       }
 
+      // ★ 영역 9-B: 명세서 기반 5-카테고리 분류 (모드 무관, 항상 실행 — Y-strict)
+      const taggedResult = classifyIssues5Category(priority, {
+        longDowntimeThresholdMin: reportType === "weekly" ? 60 : 30,  // 명세서 §4.2
+        repeatThreshold: 2,
+      });
+      setTaggedIssues(taggedResult);
+      setProgress(p => [...p, `🏷️ 5-카테고리 분류: 장기부동 ${taggedResult.counts.LONG_DOWNTIME} / 반복 ${taggedResult.counts.HIGH_FREQUENCY} / 조건변경 ${taggedResult.counts.CONDITION_CHANGE} / 테스트 ${taggedResult.counts.TEST_PM} / 품질 ${taggedResult.counts.QUALITY_NG}`]);
+
       // 모드 분류 + 건별 논의
       const allDiscussions = [];
 
-      // 긴급+중요 처리
-      for (let i = 0; i < keyIssues.length; i++) {
-        const issue = keyIssues[i];
-        const isPriUrgent = priority.urgent.includes(issue);
-        const isPriImportant = priority.important.includes(issue);
-        const modeInfo = classifyDiscussionMode(issue, isPriUrgent, isPriImportant);
-        const mStyle = MODE_STYLE[modeInfo.mode];
+      // ★ 영역 9-D: 간단 모드면 페르소나 논의 건너뛰기
+      if (reportMode === "simple") {
+        setProgress(p => [...p, `📊 간단 모드: 페르소나 논의 생략. 표 형태 보고서를 생성합니다.`]);
+      } else {
+        // 상세 모드: 기존 페르소나 논의 흐름
+        // 긴급+중요 처리
+        for (let i = 0; i < keyIssues.length; i++) {
+          const issue = keyIssues[i];
+          const isPriUrgent = priority.urgent.includes(issue);
+          const isPriImportant = priority.important.includes(issue);
+          const modeInfo = classifyDiscussionMode(issue, isPriUrgent, isPriImportant);
+          const mStyle = MODE_STYLE[modeInfo.mode];
 
-        setProgress(p => [...p, `${mStyle.label} [${i+1}/${keyIssues.length}] ${issue.eq} (${modeInfo.reason})`]);
+          setProgress(p => [...p, `${mStyle.label} [${i+1}/${keyIssues.length}] ${issue.eq} (${modeInfo.reason})`]);
 
-        const result = await runIssueDiscussion(issue, modeInfo, kbResult.kb, reportType, allowedAgents, (msg) => {
-          setProgress(p => [...p, `   ${msg}`]);
-        });
-        allDiscussions.push(result);
-        setDiscussions([...allDiscussions]);
-      }
-
-      // 일반(LITE) 처리
-      for (let i = 0; i < liteIssues.length; i++) {
-        const issue = liteIssues[i];
-        const modeInfo = classifyDiscussionMode(issue, false, false);
-        if (modeInfo.mode === "DEEP") {
-          setProgress(p => [...p, `🚨 LITE 후보였으나 키워드 감지로 DEEP 강제: ${issue.eq}`]);
+          const result = await runIssueDiscussion(issue, modeInfo, kbResult.kb, reportType, allowedAgents, (msg) => {
+            setProgress(p => [...p, `   ${msg}`]);
+          });
+          allDiscussions.push(result);
+          setDiscussions([...allDiscussions]);
         }
-        setProgress(p => [...p, `${MODE_STYLE[modeInfo.mode].label} [LITE-${i+1}/${liteIssues.length}] ${issue.eq}`]);
-        const result = await runIssueDiscussion(issue, modeInfo, kbResult.kb, reportType, allowedAgents);
-        allDiscussions.push(result);
-        setDiscussions([...allDiscussions]);
+
+        // 일반(LITE) 처리
+        for (let i = 0; i < liteIssues.length; i++) {
+          const issue = liteIssues[i];
+          const modeInfo = classifyDiscussionMode(issue, false, false);
+          if (modeInfo.mode === "DEEP") {
+            setProgress(p => [...p, `🚨 LITE 후보였으나 키워드 감지로 DEEP 강제: ${issue.eq}`]);
+          }
+          setProgress(p => [...p, `${MODE_STYLE[modeInfo.mode].label} [LITE-${i+1}/${liteIssues.length}] ${issue.eq}`]);
+          const result = await runIssueDiscussion(issue, modeInfo, kbResult.kb, reportType, allowedAgents);
+          allDiscussions.push(result);
+          setDiscussions([...allDiscussions]);
+        }
       }
 
       // 보고서 생성
@@ -1829,33 +2208,56 @@ export default function App() {
         ? buildRangeLabel(selRange)
         : (selDates.length > 1 ? `${selDates[0]}~${selDates[selDates.length-1]}` : selDates[0]);
       const allIssuesForAnalytics = [...priority.urgent, ...priority.important, ...priority.normal];
-      const report = await generateReport(dateStr, selDates, allDiscussions, priority, reportType, kbResult.kb, allIssuesForAnalytics, selectedProcess, curation);
+
+      let report;
+      if (reportMode === "simple") {
+        // ★ 영역 9-E: 간단 모드 — 명세서 §6 표 형태 보고서 (페르소나 없음)
+        report = buildSimpleReport({
+          dateStr,
+          selDates,
+          taggedResult,
+          priority,
+          reportType,
+          process: selectedProcess,
+          curation,
+        });
+      } else {
+        // 상세 모드: 기존 페르소나 보고서
+        report = await generateReport(dateStr, selDates, allDiscussions, priority, reportType, kbResult.kb, allIssuesForAnalytics, selectedProcess, curation);
+      }
       // ★ 보고서에 공정/참여 에이전트 정보 추가
       report.process = selectedProcess;
       report.allowedAgents = allowedAgents;
       report.range = selRange;  // 영역 8: 보고서에 범위 정보 보존
+      report.mode = reportMode;  // 영역 9: 모드 보존
+      report.tagged = taggedResult;  // 영역 9: 5-카테고리 결과 보존
       setMinutes(report);
 
       // 시트 저장
       setProgress(p => [...p, "💾 구글 시트 저장 중..."]);
-      const deepSummary = report.grouped.DEEP.map(d => `${d.issue.eq}: ${d.moderator.consensus}`).join(" | ");
-      const stdSummary = report.grouped.STANDARD.map(d => `${d.issue.eq}: ${d.moderator.summary}`).join(" | ");
-      const liteSummary = report.grouped.LITE.map(d => `${d.issue.eq}: ${d.moderator.supplement}`).join(" | ");
+      // ★ 영역 9-E: 모드별 분기 (간단모드는 grouped 없음)
+      const deepSummary = (report.grouped?.DEEP || []).map(d => `${d.issue.eq}: ${d.moderator.consensus}`).join(" | ");
+      const stdSummary = (report.grouped?.STANDARD || []).map(d => `${d.issue.eq}: ${d.moderator.summary}`).join(" | ");
+      const liteSummary = (report.grouped?.LITE || []).map(d => `${d.issue.eq}: ${d.moderator.supplement}`).join(" | ");
 
       const saved = await saveToSheets({
         date: dateStr,
-        agenda: `[${selectedProcess} 공정] ${report.agenda}`,
-        issue_summary: `긴급${priority.urgent.length} 중요${priority.important.length} 일반${priority.normal.length} | DEEP${report.grouped.DEEP.length} STANDARD${report.grouped.STANDARD.length} LITE${report.grouped.LITE.length}`,
+        agenda: `[${selectedProcess} 공정/${reportMode === "simple" ? "간단" : "상세"}모드] ${report.agenda}`,
+        issue_summary: `긴급${priority.urgent.length} 중요${priority.important.length} 일반${priority.normal.length} | 5-카테고리 LD${taggedResult.counts.LONG_DOWNTIME}/HF${taggedResult.counts.HIGH_FREQUENCY}/CC${taggedResult.counts.CONDITION_CHANGE}/TP${taggedResult.counts.TEST_PM}/QN${taggedResult.counts.QUALITY_NG}` +
+          (reportMode === "detailed" ? ` | DEEP${report.grouped.DEEP.length} STANDARD${report.grouped.STANDARD.length} LITE${report.grouped.LITE.length}` : ""),
         pe_opinion: deepSummary.slice(0, 500),
         me_opinion: stdSummary.slice(0, 500),
         te_opinion: liteSummary.slice(0, 500),
-        discussion: report.sections.map(s => `${s.heading}: ${(s.items||[]).join(", ")}`).join(" / ").slice(0, 2000),
-        action_items: report.sections[3]?.items?.join(" | ") || "",
+        discussion: (report.sections || []).map(s => `${s.heading}: ${(s.items||[]).join(", ")}`).join(" / ").slice(0, 2000),
+        action_items: report.sections?.[3]?.items?.join(" | ") || "",
         minutes_full: JSON.stringify({
           process: selectedProcess,
+          mode: reportMode,
           agents: allowedAgents,
           analytics: report.analytics,
-          modeStats: { DEEP: report.grouped.DEEP.length, STANDARD: report.grouped.STANDARD.length, LITE: report.grouped.LITE.length },
+          modeStats: reportMode === "detailed"
+            ? { DEEP: report.grouped.DEEP.length, STANDARD: report.grouped.STANDARD.length, LITE: report.grouped.LITE.length }
+            : { tagged: taggedResult.counts },
         }).slice(0, 1000),
       });
       setSheetSaved(saved);
@@ -1872,7 +2274,80 @@ export default function App() {
     t += `일시: ${minutes.date}\n참석: ${minutes.attendees}\n안건: ${minutes.agenda}\n`;
     if (minutes.process && minutes.allowedAgents) {
       t += `대상 공정: ${PROCESSES[minutes.process]?.label || minutes.process}\n`;
-      t += `참여 에이전트 (${minutes.allowedAgents.length}명): ${minutes.allowedAgents.map(a => `${a}(${PERSONAS[a]?.label})`).join(", ")}\n`;
+      if (minutes.mode !== "simple") {
+        t += `참여 에이전트 (${minutes.allowedAgents.length}명): ${minutes.allowedAgents.map(a => `${a}(${PERSONAS[a]?.label})`).join(", ")}\n`;
+      } else {
+        t += `생성 모드: 간단 (페르소나 논의 없음)\n`;
+      }
+    }
+
+    // ★ 영역 9-E: 간단모드 전용 출력
+    if (minutes.mode === "simple" && minutes.simple) {
+      const s = minutes.simple;
+      t += `\n${"═".repeat(52)}\n📋 카테고리 분류 요약\n${"═".repeat(52)}\n`;
+      t += `🔴 장기부동 ${s.counts.LONG_DOWNTIME} / 🔁 반복 ${s.counts.HIGH_FREQUENCY} / ⚙️ 조건변경 ${s.counts.CONDITION_CHANGE} / 🧪 테스트PM ${s.counts.TEST_PM} / 🟣 품질NG ${s.counts.QUALITY_NG}\n`;
+
+      // 1. 일별
+      if (s.dailyOverview.length > 0) {
+        t += `\n[📊 일별 부동 현황]\n`;
+        s.dailyOverview.forEach(d => { t += `  ${d.date}: ${d.count}건 / ${d.totalMin}분\n`; });
+        t += `  합계: ${s.dailyOverview.reduce((a,b)=>a+b.count,0)}건 / ${s.dailyOverview.reduce((a,b)=>a+b.totalMin,0)}분\n`;
+      }
+      // 2. 장기부동
+      if (s.longDowntime.length > 0) {
+        t += `\n[🔴 장기부동 (${s.threshold}분 이상, ${s.longDowntime.length}건)]\n`;
+        s.longDowntime.forEach(i => {
+          t += `  ${i.date} ${i.time} | ${i.eq || "-"} | ${i.durMin}분 (점수${i.score}) | ${(i.prob || "").slice(0,80)}\n`;
+        });
+      }
+      // 3. 반복 (3축)
+      if (s.eqRanked.length > 0) {
+        t += `\n[🔁 반복 — 설비별 TOP ${s.eqRanked.length}]\n`;
+        s.eqRanked.forEach(e => { t += `  ${e.equipment}: ${e.count}회\n`; });
+      }
+      if (s.alarmRanked.length > 0) {
+        t += `\n[🔁 반복 — 알람별 TOP ${s.alarmRanked.length}]\n`;
+        s.alarmRanked.forEach(a => { t += `  ${a.count}회 | ${a.alarm.slice(0,90)}\n`; });
+      }
+      if (s.causeCategoryRanked.length > 0) {
+        t += `\n[🔁 반복 — 원인 카테고리]\n`;
+        s.causeCategoryRanked.forEach(c => { t += `  ${c.category}: ${c.count}회\n`; });
+      }
+      // 4. 조건변경
+      if (s.conditionChanges.length > 0) {
+        t += `\n[⚙️ 설비/공정 조건 변경 (${s.conditionChanges.length}건)]\n`;
+        s.conditionChanges.forEach(c => { t += `  ${c.date} ${c.time} | ${c.item} | ${c.who || "-"}\n`; });
+      }
+      // 5. 테스트
+      if (s.testPm.length > 0) {
+        t += `\n[🧪 테스트 / PM (${s.testPm.length}건)]\n`;
+        s.testPm.forEach(p => { t += `  ${p.date} ${p.time} | ${p.item} | ${p.purpose || "-"}\n`; });
+      }
+      // 6. 품질
+      if (s.qualityNg.length > 0) {
+        t += `\n[🟣 품질 / NG (${s.qualityNg.length}건)]\n`;
+        s.qualityNg.forEach(q => { t += `  ${q.date} ${q.time} | ${q.item} | ${q.note || "-"}\n`; });
+      }
+      // 7. 미해결
+      if (s.unresolved.length > 0) {
+        t += `\n[🚨 미해결 / 모니터링 필요 (${s.unresolved.length}건)]\n`;
+        s.unresolved.forEach(i => {
+          t += `  ${i.date} ${i.time} | ${i.eq || "-"} | ${(i.prob || "").slice(0,80)} | ${(i.result || "-").slice(0,60)}\n`;
+        });
+      }
+      // 8. 인사이트
+      if (s.insights.length > 0) {
+        t += `\n[💡 핵심 시사점]\n`;
+        s.insights.forEach((ins, idx) => { t += `  ${idx+1}. ${ins}\n`; });
+      }
+      t += `\n${"═".repeat(52)}\n생성: ${new Date().toLocaleString("ko-KR")}\n`;
+      // 간단모드는 여기서 종료
+      const blob = new Blob([t], {type:"text/plain;charset=utf-8"});
+      const a = document.createElement("a");
+      a.href = URL.createObjectURL(blob);
+      a.download = `회의록_${minutes.date.replace(/[\s/~]/g,"_").replace(/[()]/g,"")}_간단.txt`;
+      a.click();
+      return;
     }
 
     // ★ PE 사전 큐레이션
@@ -2260,6 +2735,7 @@ ${userText}
     setClassified(null); setPriority(null); setKbStats(null);
     setDiscussions([]); setMinutes(null); setProgress([]);
     setError(""); setSheetSaved(false); setReportType("meeting");
+    setReportMode("simple"); setTaggedIssues(null);
     setSelectedProcess("Cell"); setExtraAgents([]);
     // ★ 영역 6: 큐레이션 캐시 + 선택 상태 초기화
     setPreCuration(null); setPreCategoryMsgs(null);
@@ -2405,6 +2881,34 @@ ${userText}
                 📅 해당 주 자동 선택: {selDates.join(", ")}
               </div>
             )}
+
+            {/* ★ 영역 9-D: 보고서 모드 선택 (간단/상세) */}
+            <div style={{
+              background:"rgba(15,23,42,0.5)", border:"1px solid rgba(100,116,139,0.3)",
+              borderRadius:10, padding:"14px 16px", marginBottom:16,
+            }}>
+              <div style={{fontSize:11,color:"#cbd5e1",fontWeight:800,marginBottom:10}}>
+                📋 보고서 생성 방식
+              </div>
+              <div style={{display:"grid",gridTemplateColumns:"1fr 1fr",gap:10}}>
+                {[
+                  {id:"simple", icon:"📊", label:"간단 모드", desc:"표 형태 정리 보고서 (페르소나 논의 X). 빠르고 직관적, 비용 낮음.", color:"#34d399", bg:"rgba(52,211,153,0.12)"},
+                  {id:"detailed", icon:"🤖", label:"상세 모드", desc:"AI 페르소나 8명 논의 + 사회자 합의 (DEEP/STANDARD/LITE). 깊이 있지만 시간/비용 큼.", color:"#a78bfa", bg:"rgba(167,139,250,0.12)"},
+                ].map(m => (
+                  <button key={m.id} onClick={()=>setReportMode(m.id)} style={{
+                    padding:"12px 14px", textAlign:"left",
+                    background: reportMode===m.id ? m.bg : "rgba(20,30,50,0.5)",
+                    border:`2px solid ${reportMode===m.id ? m.color : "rgba(51,65,85,0.4)"}`,
+                    borderRadius:10, color: reportMode===m.id ? m.color : "#94a3b8",
+                    cursor:"pointer", transition:"all 0.2s",
+                  }}>
+                    <div style={{fontSize:20,marginBottom:4}}>{m.icon}</div>
+                    <div style={{fontSize:12,fontWeight:800,marginBottom:4}}>{m.label}</div>
+                    <div style={{fontSize:9,opacity:0.85,lineHeight:1.5}}>{m.desc}</div>
+                  </button>
+                ))}
+              </div>
+            </div>
 
             <div style={{display:"flex",gap:10}}>
               <BackBtn onClick={()=>setStep(1)} label="← 날짜 선택"/>
@@ -2948,8 +3452,11 @@ ${userText}
               )}
             </div>
 
-            {/* ★ PE 사전 큐레이션 (보고서 1부 - 전체 정리) */}
-            {minutes.curation && (
+            {/* ★ 영역 9-E: 간단 모드 — SimpleReport 컴포넌트 (페르소나 논의/큐레이션 박스/기존 보고서 모두 대체) */}
+            {minutes.mode === "simple" && <SimpleReport minutes={minutes}/>}
+
+            {/* ★ PE 사전 큐레이션 (보고서 1부 - 전체 정리) — 상세 모드만 표시 */}
+            {minutes.mode !== "simple" && minutes.curation && (
               <div style={{
                 background:"rgba(15,23,42,0.7)",
                 border:"1px solid rgba(59,130,246,0.3)",
@@ -3124,8 +3631,8 @@ ${userText}
               </div>
             )}
 
-            {/* 모드별 분석 결과 */}
-            {discussions.length > 0 && (
+            {/* 모드별 분석 결과 — 상세 모드만 표시 */}
+            {minutes.mode !== "simple" && discussions.length > 0 && (
               <div style={{marginBottom:16}}>
                 <div style={{
                   fontSize:12, fontWeight:800, color:"#f1f5f9", marginBottom:10,
@@ -3160,7 +3667,8 @@ ${userText}
               </div>
             )}
 
-            {/* 보고서 */}
+            {/* 보고서 — 상세 모드만 표시 */}
+            {minutes.mode !== "simple" && (
             <div style={{
               background:"rgba(248,250,252,0.97)", borderRadius:12,
               color:"#1e293b", padding:"28px 32px", marginBottom:14,
@@ -3208,6 +3716,8 @@ ${userText}
                 AI 생성 보고서 · {new Date().toLocaleString("ko-KR")}
               </div>
             </div>
+            )}
+            {/* /보고서 블록 종료 (간단모드 시 숨김 분기 닫기) */}
 
             <div style={{display:"flex",gap:10,marginBottom:10}}>
               <button onClick={downloadTxt} style={{
@@ -3774,6 +4284,232 @@ function DateRangePicker({ availableDates, selRange, onChange }) {
       ) : (
         <div style={{fontSize:11, color:"#64748b", padding:"8px 12px"}}>
           기간을 선택하세요
+        </div>
+      )}
+    </div>
+  );
+}
+
+// ─── ★ 영역 9-E: 간단모드 보고서 컴포넌트 (명세서 §6 표 형태) ──────────────────
+function SimpleReport({ minutes }) {
+  const s = minutes.simple;
+  if (!s) return <div style={{color:"#ef4444"}}>간단모드 데이터 없음</div>;
+
+  const sectionStyle = {
+    background:"rgba(15,23,42,0.6)",
+    border:"1px solid rgba(100,116,139,0.25)",
+    borderRadius:10, padding:"14px 16px", marginBottom:14,
+  };
+  const headingStyle = { fontSize:13, fontWeight:800, marginBottom:10, paddingBottom:6, borderBottom:"1px solid rgba(51,65,85,0.4)" };
+  const tableStyle = { width:"100%", fontSize:10.5, color:"#cbd5e1", borderCollapse:"collapse" };
+  const thStyle = { padding:"5px 8px", background:"rgba(51,65,85,0.4)", color:"#94a3b8", fontWeight:700, textAlign:"left", border:"1px solid rgba(51,65,85,0.4)" };
+  const tdStyle = { padding:"5px 8px", border:"1px solid rgba(51,65,85,0.3)", verticalAlign:"top" };
+  const empty = (msg) => <div style={{fontSize:10,color:"#64748b",padding:"8px 0"}}>{msg}</div>;
+
+  return (
+    <div>
+      {/* 카테고리 카운트 요약 */}
+      <div style={{...sectionStyle, padding:"12px 16px"}}>
+        <div style={{fontSize:11,color:"#94a3b8",fontWeight:700,marginBottom:8}}>📋 카테고리 분류 요약</div>
+        <div style={{display:"flex",gap:8,flexWrap:"wrap"}}>
+          {[
+            {label:"🔴 장기부동", count:s.counts.LONG_DOWNTIME, color:"#ef4444", bg:"rgba(239,68,68,0.1)"},
+            {label:"🔁 반복", count:s.counts.HIGH_FREQUENCY, color:"#f59e0b", bg:"rgba(245,158,11,0.1)"},
+            {label:"⚙️ 조건변경", count:s.counts.CONDITION_CHANGE, color:"#34d399", bg:"rgba(52,211,153,0.1)"},
+            {label:"🧪 테스트/PM", count:s.counts.TEST_PM, color:"#22d3ee", bg:"rgba(34,211,238,0.1)"},
+            {label:"🟣 품질NG", count:s.counts.QUALITY_NG, color:"#a78bfa", bg:"rgba(167,139,250,0.1)"},
+          ].map(c => (
+            <div key={c.label} style={{padding:"6px 12px",background:c.bg,border:`1px solid ${c.color}33`,borderRadius:6,fontSize:11,color:c.color,fontWeight:700}}>
+              {c.label}: <span style={{fontSize:14}}>{c.count}</span>
+            </div>
+          ))}
+        </div>
+      </div>
+
+      {/* 1. 일별 부동 현황 */}
+      <div style={sectionStyle}>
+        <div style={{...headingStyle,color:"#22d3ee"}}>📊 일별 부동 현황</div>
+        {s.dailyOverview.length === 0 ? empty("데이터 없음") : (
+          <table style={tableStyle}>
+            <thead><tr><th style={thStyle}>날짜</th><th style={{...thStyle,textAlign:"right"}}>이벤트 수</th><th style={{...thStyle,textAlign:"right"}}>총 부동시간(분)</th></tr></thead>
+            <tbody>
+              {s.dailyOverview.map(d => (
+                <tr key={d.date}><td style={tdStyle}>{d.date}</td><td style={{...tdStyle,textAlign:"right"}}>{d.count}</td><td style={{...tdStyle,textAlign:"right",fontWeight:d.totalMin>=120?700:400,color:d.totalMin>=120?"#fca5a5":"#cbd5e1"}}>{d.totalMin}</td></tr>
+              ))}
+              <tr style={{background:"rgba(34,211,238,0.08)"}}>
+                <td style={{...tdStyle,fontWeight:800,color:"#22d3ee"}}>합계</td>
+                <td style={{...tdStyle,textAlign:"right",fontWeight:800,color:"#22d3ee"}}>{s.dailyOverview.reduce((a,b)=>a+b.count,0)}</td>
+                <td style={{...tdStyle,textAlign:"right",fontWeight:800,color:"#22d3ee"}}>{s.dailyOverview.reduce((a,b)=>a+b.totalMin,0)}</td>
+              </tr>
+            </tbody>
+          </table>
+        )}
+      </div>
+
+      {/* 2. 장기부동 */}
+      <div style={sectionStyle}>
+        <div style={{...headingStyle,color:"#ef4444"}}>🔴 장기부동 ({s.threshold}분 이상)</div>
+        {s.longDowntime.length === 0 ? empty(`${s.threshold}분 이상 부동 이슈 없음`) : (
+          <table style={tableStyle}>
+            <thead><tr><th style={thStyle}>날짜/시간</th><th style={thStyle}>설비</th><th style={{...thStyle,textAlign:"right"}}>부동(분)</th><th style={{...thStyle,textAlign:"right"}}>점수</th><th style={thStyle}>문제</th><th style={thStyle}>조치</th></tr></thead>
+            <tbody>
+              {s.longDowntime.map((i, idx) => (
+                <tr key={idx}>
+                  <td style={tdStyle}>{i.date} {i.time}</td>
+                  <td style={{...tdStyle,fontFamily:"monospace",color:"#fcd34d",fontWeight:700}}>{i.eq || "-"}</td>
+                  <td style={{...tdStyle,textAlign:"right",fontWeight:700,color:i.durMin>=60?"#ef4444":"#f59e0b"}}>{i.durMin || "-"}</td>
+                  <td style={{...tdStyle,textAlign:"right",color:"#22d3ee",fontWeight:700}}>{i.score}</td>
+                  <td style={tdStyle}>{(i.prob || "-").slice(0,80)}</td>
+                  <td style={tdStyle}>{(i.result || "-").slice(0,60)}</td>
+                </tr>
+              ))}
+            </tbody>
+          </table>
+        )}
+      </div>
+
+      {/* 3. 반복 (3축) */}
+      <div style={sectionStyle}>
+        <div style={{...headingStyle,color:"#f59e0b"}}>🔁 반복 발생</div>
+
+        <div style={{marginBottom:10}}>
+          <div style={{fontSize:11,fontWeight:700,color:"#fcd34d",marginBottom:6}}>설비별 TOP {s.eqRanked.length}</div>
+          {s.eqRanked.length === 0 ? empty("2회 이상 반복된 설비 없음") : (
+            <table style={tableStyle}>
+              <thead><tr><th style={thStyle}>설비</th><th style={{...thStyle,textAlign:"right"}}>발생 횟수</th></tr></thead>
+              <tbody>
+                {s.eqRanked.map(e => (
+                  <tr key={e.equipment}>
+                    <td style={{...tdStyle,fontFamily:"monospace",color:"#fcd34d"}}>{e.equipment}</td>
+                    <td style={{...tdStyle,textAlign:"right",fontWeight:700,color:e.count>=4?"#ef4444":"#f59e0b"}}>{e.count}</td>
+                  </tr>
+                ))}
+              </tbody>
+            </table>
+          )}
+        </div>
+
+        <div style={{marginBottom:10}}>
+          <div style={{fontSize:11,fontWeight:700,color:"#fcd34d",marginBottom:6}}>알람별 TOP {s.alarmRanked.length}</div>
+          {s.alarmRanked.length === 0 ? empty("2회 이상 반복된 알람 없음") : (
+            <table style={tableStyle}>
+              <thead><tr><th style={thStyle}>알람</th><th style={{...thStyle,textAlign:"right"}}>횟수</th></tr></thead>
+              <tbody>
+                {s.alarmRanked.map((a, idx) => (
+                  <tr key={idx}>
+                    <td style={{...tdStyle,fontSize:10}}>{a.alarm.slice(0, 90)}</td>
+                    <td style={{...tdStyle,textAlign:"right",fontWeight:700,color:a.count>=5?"#ef4444":"#f59e0b"}}>{a.count}</td>
+                  </tr>
+                ))}
+              </tbody>
+            </table>
+          )}
+        </div>
+
+        {s.causeCategoryRanked.length > 0 && (
+          <div>
+            <div style={{fontSize:11,fontWeight:700,color:"#fcd34d",marginBottom:6}}>원인 카테고리</div>
+            <table style={tableStyle}>
+              <thead><tr><th style={thStyle}>카테고리</th><th style={{...thStyle,textAlign:"right"}}>횟수</th></tr></thead>
+              <tbody>
+                {s.causeCategoryRanked.map(c => (
+                  <tr key={c.category}>
+                    <td style={tdStyle}>{c.category}</td>
+                    <td style={{...tdStyle,textAlign:"right",fontWeight:700}}>{c.count}</td>
+                  </tr>
+                ))}
+              </tbody>
+            </table>
+          </div>
+        )}
+      </div>
+
+      {/* 4. 조건 변경 */}
+      <div style={sectionStyle}>
+        <div style={{...headingStyle,color:"#34d399"}}>⚙️ 설비/공정 조건 변경 ({s.conditionChanges.length}건)</div>
+        {s.conditionChanges.length === 0 ? empty("관련 메시지 없음") : (
+          <table style={tableStyle}>
+            <thead><tr><th style={thStyle}>날짜/시간</th><th style={thStyle}>변경 내용</th><th style={thStyle}>담당</th></tr></thead>
+            <tbody>
+              {s.conditionChanges.map((c, idx) => (
+                <tr key={idx}>
+                  <td style={tdStyle}>{c.date} {c.time}</td>
+                  <td style={tdStyle}>{(c.item || "").slice(0, 100)}</td>
+                  <td style={tdStyle}>{c.who || "-"}</td>
+                </tr>
+              ))}
+            </tbody>
+          </table>
+        )}
+      </div>
+
+      {/* 5. 테스트/PM */}
+      <div style={sectionStyle}>
+        <div style={{...headingStyle,color:"#22d3ee"}}>🧪 테스트 / PM ({s.testPm.length}건)</div>
+        {s.testPm.length === 0 ? empty("관련 메시지 없음") : (
+          <table style={tableStyle}>
+            <thead><tr><th style={thStyle}>날짜/시간</th><th style={thStyle}>내용</th><th style={thStyle}>목적/결과</th></tr></thead>
+            <tbody>
+              {s.testPm.map((t, idx) => (
+                <tr key={idx}>
+                  <td style={tdStyle}>{t.date} {t.time}</td>
+                  <td style={tdStyle}>{(t.item || "").slice(0, 100)}</td>
+                  <td style={tdStyle}>{t.purpose || "-"}</td>
+                </tr>
+              ))}
+            </tbody>
+          </table>
+        )}
+      </div>
+
+      {/* 6. 품질 NG */}
+      <div style={sectionStyle}>
+        <div style={{...headingStyle,color:"#a78bfa"}}>🟣 품질 / NG ({s.qualityNg.length}건)</div>
+        {s.qualityNg.length === 0 ? empty("관련 메시지 없음") : (
+          <table style={tableStyle}>
+            <thead><tr><th style={thStyle}>날짜/시간</th><th style={thStyle}>내용</th><th style={thStyle}>비고</th></tr></thead>
+            <tbody>
+              {s.qualityNg.map((q, idx) => (
+                <tr key={idx}>
+                  <td style={tdStyle}>{q.date} {q.time}</td>
+                  <td style={tdStyle}>{(q.item || "").slice(0, 100)}</td>
+                  <td style={tdStyle}>{q.note || "-"}</td>
+                </tr>
+              ))}
+            </tbody>
+          </table>
+        )}
+      </div>
+
+      {/* 7. 미해결 */}
+      {s.unresolved.length > 0 && (
+        <div style={sectionStyle}>
+          <div style={{...headingStyle,color:"#ef4444"}}>🚨 미해결 / 모니터링 필요 ({s.unresolved.length}건)</div>
+          <table style={tableStyle}>
+            <thead><tr><th style={thStyle}>날짜</th><th style={thStyle}>설비</th><th style={thStyle}>문제</th><th style={thStyle}>현재 상태</th></tr></thead>
+            <tbody>
+              {s.unresolved.map((i, idx) => (
+                <tr key={idx}>
+                  <td style={tdStyle}>{i.date} {i.time}</td>
+                  <td style={{...tdStyle,fontFamily:"monospace",color:"#fcd34d"}}>{i.eq || "-"}</td>
+                  <td style={tdStyle}>{(i.prob || "-").slice(0, 80)}</td>
+                  <td style={tdStyle}>{(i.result || "-").slice(0, 60)}</td>
+                </tr>
+              ))}
+            </tbody>
+          </table>
+        </div>
+      )}
+
+      {/* 8. 인사이트 */}
+      {s.insights.length > 0 && (
+        <div style={{...sectionStyle, background:"rgba(167,139,250,0.06)", borderColor:"rgba(167,139,250,0.25)"}}>
+          <div style={{...headingStyle,color:"#a78bfa"}}>💡 핵심 시사점</div>
+          {s.insights.map((ins, idx) => (
+            <div key={idx} style={{fontSize:11,color:"#cbd5e1",marginBottom:6,paddingLeft:14,position:"relative"}}>
+              <span style={{position:"absolute",left:0,color:"#a78bfa"}}>{idx+1}.</span> {ins}
+            </div>
+          ))}
         </div>
       )}
     </div>

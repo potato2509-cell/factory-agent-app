@@ -1197,17 +1197,20 @@ async function runPreCuration(allIssues, kbPE, reportType, categoryMsgs = {}) {
 }
 
 // ─── 분할 헬퍼: 공통 호출 (Sonnet 1차 → 504 시 Haiku fallback) ─────────────────
-async function callCurationPart(sys, userMsg, partLabel, allIssuesForFallback = [], categoryMsgsForFallback = {}) {
+async function callCurationPart(sys, userMsg, partLabel, allIssuesForFallback = [], categoryMsgsForFallback = {}, maxTokensOverride = null) {
   // ★ 영역 12-Z4: 응답 시간 측정용
+  // ★ 영역 12-AE1: maxTokensOverride — Part 2 강화 시 1800→2200 (conditionChangeGroups 풀 출력용)
+  const sonnetMaxTokens = maxTokensOverride || 1800;
+  const haikuMaxTokens = maxTokensOverride ? Math.min(maxTokensOverride - 400, 1500) : 1200;
   const t0 = Date.now();
   try {
     await new Promise(r => setTimeout(r, 200));
     const raw = await callClaudeRaw(sys, userMsg, {
       model: MODEL_REASONING,  // ★ Sonnet (품질 우선)
-      max_tokens: 1800,  // 영역 12-Z1: 2500→1800 — Netlify 10초 한계 안전선
+      max_tokens: sonnetMaxTokens,
     });
     const elapsed = ((Date.now() - t0) / 1000).toFixed(1);
-    console.log(`[PE 큐레이션 ${partLabel}] Sonnet 1차 성공 (${elapsed}초)`);
+    console.log(`[PE 큐레이션 ${partLabel}] Sonnet 1차 성공 (${elapsed}초, max_tokens ${sonnetMaxTokens})`);
     console.log(`[PE 큐레이션 ${partLabel}] raw 응답 첫 200자:`, (raw || "").slice(0, 200));
     return safeJSON(raw);
   } catch (e) {
@@ -1218,11 +1221,11 @@ async function callCurationPart(sys, userMsg, partLabel, allIssuesForFallback = 
     if (e?.message?.includes("504") || e?.message?.includes("Timeout") || e?.message?.includes("timeout")) {
       const tFallback = Date.now();
       try {
-        console.log(`[PE 큐레이션 ${partLabel}] Haiku로 fallback 재시도 (max_tokens 1200)...`);
+        console.log(`[PE 큐레이션 ${partLabel}] Haiku로 fallback 재시도 (max_tokens ${haikuMaxTokens})...`);
         await new Promise(r => setTimeout(r, 800));
         const raw2 = await callClaudeRaw(sys, userMsg, {
           model: MODEL_FAST,  // Haiku fallback
-          max_tokens: 1200,  // 영역 12-Z1: 1800→1200 — fallback timeout 방지
+          max_tokens: haikuMaxTokens,
         });
         const elapsedFb = ((Date.now() - tFallback) / 1000).toFixed(1);
         console.log(`[PE 큐레이션 ${partLabel}] Haiku fallback 성공 (${elapsedFb}초)`);
@@ -1309,6 +1312,16 @@ ${JSON.stringify(issuesData, null, 1)}
 
 // ─── Part 2: 2번 반복 + 3번 조건변경 ──────────────────────────────────────────
 async function curationPart2_RecurringConditionChange(issuesData, processChangeData, totalCount, focus, kbText, categoryMsgs) {
+  // ★ 영역 12-AE2: quality 메시지도 입력에 추가 — STK-4-B3 같은 NG+setting 이중 메시지 누락 방지
+  // quality로 분류된 메시지 중 setting/parameter 정보가 있는 것 (Stack NG ... setting z cut 등)
+  const qualityWithSetting = (categoryMsgs.quality || []).slice(0, 8).map((m, i) => ({
+    no: i + 1,
+    date: m.date || "",
+    time: m.time || "",
+    sender: m.sender || "",
+    text: (m.text || "").slice(0, 350).replace(/\n/g, " | "),
+  }));
+
   const sys = `${FACTORY_PHILOSOPHY}
 
 당신은 AZS 배터리 공장의 ${PERSONAS.Cell_PE.role.replace(" - Cell 공정", "")}입니다.
@@ -1317,24 +1330,21 @@ async function curationPart2_RecurringConditionChange(issuesData, processChangeD
 ${focus}
 
 [★ 최우선 지시 — 절대 누락 금지]
-입력의 부동 이슈 데이터에서 카테고리별/호기별 반복을 빠짐없이 집계하세요.
-조건변경 메시지가 있으면 conditionChanges 4개 그룹에 모두 분류하세요.
+1) 입력의 부동 이슈 데이터에서 카테고리별/호기별 반복을 빠짐없이 집계
+2) 조건변경 메시지가 있으면 conditionChanges 4개 그룹에 모두 분류
+3) **★ 핵심: 같은 호기에 여러 파라미터를 변경한 그룹은 conditionChangeGroups에 풀로 정리하세요**
+   - 메시지에 "Countermeasures:" "- Check ..." "- Setting Gap..." 같은 다중 파라미터 리스트가 있으면 모두 추출
+   - 메시지에 "Stack NG / Caused / Countermeasures" 형식의 보고는 conditionChangeGroups에 그룹으로 추출
+   - quality 메시지에 setting/parameter 변경이 있으면 (예: "setting z cut stack table") conditionChangeGroups에도 포함
 
 [필수 출력 — JSON만, 다른 텍스트 금지]
 {
   "recurringByCategory": [
-    {"category":"카테고리명 (예: Tab Width/NG, Sensor cable, Servo Fault, Vision NG)","count":건수,"equipments":["STK-1-A4 (×2)","STK-2-D5"]}
+    {"category":"카테고리명 (예: Servo Fault, Ejector Timeout)","count":건수,"equipments":["STK-1-A4 (×2)","STK-2-D5"]}
   ],
   "recurringSameEquipment": [
-    {
-      "equipment":"호기",
-      "count":건수,
-      "detail":"발생 내역 요약",
-
-      "gapAnalysis":"(옵셔널) 재발 간격 분석, 단발이면 ''",
-      "totalDuration":"(옵셔널) 누적 N분, 1건이면 ''",
-      "partsReplaced":"(옵셔널) 교체 부품, 없으면 ''"
-    }
+    {"equipment":"호기","count":건수,"detail":"발생 내역 요약",
+     "gapAnalysis":"(옵셔널)","totalDuration":"(옵셔널)","partsReplaced":"(옵셔널)"}
   ],
   "conditionChanges": {
     "visionOffset": [{"date":"YY/M/D","time":"HH:MM","equipment":"호기","change":"변경 내용","reason":"사유"}],
@@ -1342,26 +1352,36 @@ ${focus}
     "cutter": [{"date":"YY/M/D","time":"HH:MM","equipment":"호기","change":"변경 내용"}],
     "other": [{"date":"YY/M/D","equipment":"호기","change":"기타 조건 변경","pic":"담당자"}]
   },
-  "conditionChangeGroups": []
+  "conditionChangeGroups": [
+    {
+      "title":"호기별 그룹 제목 (예: 'STK-3-B2 Overhang 대응')",
+      "equipment":"STK-3-B2",
+      "timeRange":"발생 시각 (예: '08:10, Shift 1')",
+      "shift":"Shift 정보",
+      "picReason":"PIC + 사유 (예: 'PIC: Group C · 사유: Anode X value spec 초과')",
+      "parameters":[
+        {"parameter":"파라미터명 (예: 'Gap 2nd PnP (+) Down Loading')","before":"변경 전 값","after":"변경 후 값"},
+        {"parameter":"...","before":"...","after":"..."}
+      ],
+      "verification":"검증 결과 (예: '3 sample CT scan 결과 OK, monitoring 진행')"
+    }
+  ]
 }
 
-[★ 옵셔널 필드 — 데이터에 명백한 단서 있을 때만]
-gapAnalysis / totalDuration / partsReplaced / conditionChangeGroups 등은
-데이터에 명백히 있을 때만 채우고, 없으면 빈 배열/빈 문자열로 빠르게 응답.
-풍부함보다 응답 속도와 핵심 누락 방지가 우선.
-
-[조건변경 그룹 (옵셔널 conditionChangeGroups)]
-같은 호기에 여러 파라미터를 동시 변경한 경우만 하나의 그룹으로 묶음:
-{"title":"STK-3-B2 Overhang 대응", "equipment":"STK-3-B2", "timeRange":"06:00~06:40", "shift":"Shift 1",
- "picReason":"PIC: Rijal · 사유: Anode X value spec 초과",
- "parameters":[{"parameter":"...","before":"...","after":"..."}],
- "verification":"3 sample CT scan OK"}
-명백히 그룹이 없으면 빈 배열 [].
+[★ conditionChangeGroups — 핵심 출력 규칙]
+- ★ 입력 메시지에 같은 호기에 대한 복수 파라미터 변경/점검 항목이 있으면 반드시 그룹으로 추출
+- ★ 메시지의 "Countermeasures:" 또는 "- Check ..." 형식 다중 항목을 parameters 배열에 모두 채우세요 (10개도 가능)
+- ★ "Setting Gap 2nd PnP", "Setting align table", "Idle mandrel pressure" 같이 명시된 파라미터를 빠짐없이 추출
+- ★ 값 (Before → After)이 명시 안 됐을 때는 "→ Check/조정", "→ setting 조정" 같은 표현으로 명시
+- ★ Stack NG / Caused / Countermeasures 형식 보고도 그룹으로 추출 (problem 호기 중심)
+- ★ Cutter Splicing / Auto Splicing / VB Overload 같은 cutter 조정도 그룹으로 추출
+- ★ 그룹이 명백히 없으면 빈 배열 []
 
 [규칙]
 - recurringByCategory: 키워드 카테고리 — 모든 카테고리 빠짐없이 집계
 - recurringSameEquipment: 같은 호기 2건 이상 발생만
-- conditionChanges 4개 하위 그룹 — 메시지 데이터 모두 분류, 없으면 빈 배열 []
+- conditionChanges 4개 하위 그룹 — 데이터 있는 만큼 모두 분류
+- 옵셔널 필드 (gapAnalysis 등) — 명백한 단서 있을 때만
 - 모든 수치는 숫자만`;
 
   const userMsg = `[부동 이슈 데이터 - ${totalCount}건]
@@ -1370,10 +1390,15 @@ ${JSON.stringify(issuesData, null, 1)}
 [공정/설비 조건변경 메시지 - ${processChangeData.length}건]
 ${processChangeData.length > 0 ? JSON.stringify(processChangeData, null, 1) : "(없음)"}
 
-위 데이터를 2번 반복 + 3번 조건변경 형식으로 정리하세요.
-옵셔널 필드(gapAnalysis, conditionChangeGroups 등)는 명백한 단서 있을 때만 채우고, 없으면 빈 값으로 빠르게 응답하세요.`;
+[참고: quality 메시지 중 setting/parameter 정보 있을 수 있는 것 - ${qualityWithSetting.length}건]
+${qualityWithSetting.length > 0 ? JSON.stringify(qualityWithSetting, null, 1) : "(없음)"}
+※ 위 quality 메시지에 "setting z cut", "parameter 변경" 등이 있으면 conditionChangeGroups에 포함
 
-  return await callCurationPart(sys, userMsg, "Part2-Recurring/ConditionChange");
+위 데이터를 2번 반복 + 3번 조건변경 형식으로 정리하세요.
+★ conditionChangeGroups를 풀로 채우세요 — 같은 호기 다중 파라미터 그룹은 빠짐없이 추출.
+★ 메시지의 "Countermeasures:" 다중 항목은 parameters 배열에 모두 포함.`;
+
+  return await callCurationPart(sys, userMsg, "Part2-Recurring/ConditionChange", [], {}, 2200);
 }
 
 // ─── Part 3: 4번 테스트/PM + 5번 품질NG ───────────────────────────────────────
@@ -2742,24 +2767,25 @@ export default function App() {
         console.log(`[모호 분류] skip ${ambigResult.skip.length}건 (어디에도 분류 안 됨)`);
       }
 
-      // ★ 영역 12-AE0: 카테고리별 raw 메시지 샘플 출력 (LLM에 들어가는 데이터 확인용)
+      // ★ 영역 12-AE0 + AE3: 카테고리별 raw 메시지 샘플 출력 (LLM에 들어가는 데이터 확인용)
       // 사용자 정답 레포트 (24일자) 5개 그룹 (STK-3-B2 Overhang, Cutter 2C, STK-4-B1, STK-4-B3, STK-2-A1)이
       // 실제 데이터에 있는지 확인 — 풍부도 갭의 원인 진단 (데이터 부족 vs LLM 부족)
+      // AE3: 250자 → 500자로 확장 (Cutter 2C, STK-2-A1 등 데이터 유무 정확 확인)
       console.log(`[process_change 메시지 raw — ${categoryMsgs.process_change.length}건 중 최대 10건]`);
       categoryMsgs.process_change.slice(0, 10).forEach((m, i) => {
-        const preview = (m.text || "").replace(/\n/g, " | ").slice(0, 250);
-        console.log(`  [PC-${i+1}] ${m.date || "?"} ${m.time || "?"} ${m.sender || "?"}: ${preview}${m.text.length > 250 ? "..." : ""}`);
+        const preview = (m.text || "").replace(/\n/g, " | ").slice(0, 500);
+        console.log(`  [PC-${i+1}] ${m.date || "?"} ${m.time || "?"} ${m.sender || "?"}: ${preview}${m.text.length > 500 ? "..." : ""}`);
       });
       console.log(`[test 메시지 raw — ${categoryMsgs.test.length}건 중 최대 10건]`);
       categoryMsgs.test.slice(0, 10).forEach((m, i) => {
-        const preview = (m.text || "").replace(/\n/g, " | ").slice(0, 250);
-        console.log(`  [TST-${i+1}] ${m.date || "?"} ${m.time || "?"} ${m.sender || "?"}: ${preview}${m.text.length > 250 ? "..." : ""}`);
+        const preview = (m.text || "").replace(/\n/g, " | ").slice(0, 500);
+        console.log(`  [TST-${i+1}] ${m.date || "?"} ${m.time || "?"} ${m.sender || "?"}: ${preview}${m.text.length > 500 ? "..." : ""}`);
       });
       if (categoryMsgs.quality.length > 0) {
         console.log(`[quality 메시지 raw — ${categoryMsgs.quality.length}건 중 최대 5건]`);
         categoryMsgs.quality.slice(0, 5).forEach((m, i) => {
-          const preview = (m.text || "").replace(/\n/g, " | ").slice(0, 250);
-          console.log(`  [QL-${i+1}] ${m.date || "?"} ${m.time || "?"} ${m.sender || "?"}: ${preview}${m.text.length > 250 ? "..." : ""}`);
+          const preview = (m.text || "").replace(/\n/g, " | ").slice(0, 500);
+          console.log(`  [QL-${i+1}] ${m.date || "?"} ${m.time || "?"} ${m.sender || "?"}: ${preview}${m.text.length > 500 ? "..." : ""}`);
         });
       }
 

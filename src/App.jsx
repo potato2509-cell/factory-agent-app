@@ -1065,8 +1065,8 @@ ${testData.length > 0 ? JSON.stringify(testData, null, 1) : "(없음)"}
   try {
     await new Promise(r => setTimeout(r, 500));
     const raw = await callClaudeRaw(sys, userMsg, {
-      model: MODEL_REASONING,  // 영역 11: Sonnet (v9 동일 — 검증 안 된 추측 수정 회귀)
-      max_tokens: 5500,  // 영역 11: 35단계 actionSequence 포함 응답을 위해
+      model: MODEL_FAST,  // ★ 영역 11: Haiku 사용 — Sonnet은 5500 토큰 응답에 25초+ → Netlify 10초 한도 초과 (확인됨)
+      max_tokens: 4000,  // 영역 11: Haiku는 빠르므로 약간 여유 — 풍부 응답 가능
     });
     const parsed = safeJSON(raw);
     return normalizeBriefing(parsed);

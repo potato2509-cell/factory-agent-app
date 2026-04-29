@@ -498,6 +498,36 @@ function getQuickRange(preset, todayDateStr) {
   };
   return helpers[preset] ? helpers[preset]() : null;
 }
+
+// ─── 영역 11-J: 06시 생산일자 룰 기반 분석 기간 라벨 ─────────────────────────
+// 예: ["26/4/28"] → "2026년 4월 28일 06:00 ~ 4월 29일 06:00"
+function buildProductionRangeLabel(selDates) {
+  if (!selDates || selDates.length === 0) return "";
+  const sorted = [...selDates].sort();
+  const startStr = sorted[0];
+  const endStr = sorted[sorted.length - 1];
+
+  const startD = dateStrToDate(startStr);
+  const endD = dateStrToDate(endStr);
+  const endNext = new Date(endD);
+  endNext.setDate(endNext.getDate() + 1);
+
+  const fmt = (d, includeYear = false) => {
+    const y = d.getFullYear();
+    const m = d.getMonth() + 1;
+    const day = d.getDate();
+    return includeYear ? `${y}년 ${m}월 ${day}일` : `${m}월 ${day}일`;
+  };
+
+  const sameYear = startD.getFullYear() === endNext.getFullYear();
+  const startLabel = fmt(startD, true);
+  const endLabel = fmt(endNext, !sameYear);
+  const hours = Math.round((endNext - startD) / (1000 * 60 * 60));
+  const days = sorted.length;
+
+  return `${startLabel} 06:00 ~ ${endLabel} 06:00 (${days}일, 약 ${hours}시간)`;
+}
+
 // 보고서 헤더용 라벨 빌더
 function buildRangeLabel(selRange) {
   if (!selRange || !selRange.start || !selRange.end) return "";
@@ -641,101 +671,71 @@ ${ambiguousMsgs.map((m, i) => `${i + 1}. ${m.text.slice(0, 200).replace(/\n/g, "
   }
 }
 
-function classifyPriority(downtime) {
-  const equipCount = {}, partCount = {};
+// ─── 영역 11-A: 다운타임 → 모든 이슈 추출 (priority 분류 폐기) ─────────────────
+// 기존 classifyPriority/scoreIssue/selectKeyIssues는 영역 11에서 폐기됨.
+// 모든 이슈는 동등하게 추출되고, tags(LONG_DOWNTIME/HIGH_FREQUENCY/...)로만 분류.
+// 자동 선정 = LONG_DOWNTIME 또는 HIGH_FREQUENCY tag 보유.
+// 사용자 추가 = STEP 3 체크박스로 자유롭게 선택.
+// ─── 영역 6: 이슈 안정 ID (체크박스 추적용) — 모듈 최상위 (모든 컴포넌트 공유) ─
+function getIssueId(issue) {
+  return `${issue.date || "?"}_${issue.time || "?"}_${issue.eq || "?"}_${(issue.prob || "").slice(0, 20)}`;
+}
+
+function extractAllIssues(downtime) {
+  const equipCount = {}, partCount = {}, alarmCount = {};
+  // 사전 카운트 (반복 횟수 계산용)
   downtime.forEach(d => {
     const eq = extractField(d.text, "Equipment");
     const part = extractField(d.text, "Part Replacement");
+    const alarmMatch = (d.text || "").match(/\*?Alarm\*?\s*[:：]\s*([^\n]+)/i);
+    const alarm = alarmMatch ? alarmMatch[1].trim() : "";
     if (eq) equipCount[eq] = (equipCount[eq] || 0) + 1;
     if (part && part !== "-" && part.length > 2) partCount[part] = (partCount[part] || 0) + 1;
+    if (alarm) alarmCount[alarm] = (alarmCount[alarm] || 0) + 1;
   });
 
-  const urgent = [], important = [], normal = [];
-  downtime.forEach(d => {
-    const result = extractField(d.text, "Result").toLowerCase();
+  return downtime.map(d => {
+    const result = extractField(d.text, "Result");
     const durStr = extractField(d.text, "Duration");
     const durMin = parseInt(durStr) || 0;
-    const stopStatus = extractField(d.text, "Stop Status").toLowerCase();
+    const stopStatus = extractField(d.text, "Stop Status");
     const eq = extractField(d.text, "Equipment");
     const part = extractField(d.text, "Part Replacement");
-
-    const isUnsolved = result.includes("not solved") || result.includes("unsolved") || result === "";
-    const isLong = durMin >= 60;
-    const isRepeat = eq && equipCount[eq] >= 2;
-    const isFullStop = stopStatus.includes("full_stop");
-    const isRepeatPart = part && part !== "-" && part.length > 2 && partCount[part] >= 2;
-
-    const eq_ = extractField(d.text, "Equipment");
     const prob = extractField(d.text, "Problem");
     const cause = extractField(d.text, "Cause");
-    const result_ = extractField(d.text, "Result");
+    const action = extractField(d.text, "Action");
     const pic = extractField(d.text, "PIC");
-    // 영역 5: 점수 계산용 반복 횟수 (호기 또는 부품 중 큰 값)
+    const alarmMatch = (d.text || "").match(/\*?Alarm\*?\s*[:：]\s*([^\n]+)/i);
+    const alarm = alarmMatch ? alarmMatch[1].trim() : "";
     const repeatCount = Math.max(
-      eq_ ? (equipCount[eq_] || 1) : 1,
+      eq ? (equipCount[eq] || 1) : 1,
       (part && part !== "-" && part.length > 2) ? (partCount[part] || 1) : 1,
     );
-    const issueInfo = { ...d, eq: eq_, prob, cause, result: result_, pic, durMin, reasons: [], repeatCount };
-
-    if (isUnsolved || isLong) {
-      issueInfo.reasons = [isUnsolved && "미해결", isLong && `${durMin}분 이상`].filter(Boolean);
-      urgent.push(issueInfo);
-    } else if (isRepeat || isFullStop || isRepeatPart) {
-      issueInfo.reasons = [isRepeat && "반복 고장", isFullStop && "완전 정지", isRepeatPart && "부품 반복 교체"].filter(Boolean);
-      important.push(issueInfo);
-    } else {
-      normal.push(issueInfo);
-    }
+    return {
+      ...d,
+      eq, prob, cause, result, action, pic, durMin,
+      stopStatus, repeatCount, _alarm: alarm,
+      reasons: [],
+    };
   });
-  return { urgent, important, normal };
 }
 
-// ─── 영역 5-D: 이슈 점수 계산 ────────────────────────────────────────────────
-// 점수 = 부동(분)/30 + 반복횟수×3 + 안전환경(+10) + 미해결(+5) + FullStop(+5)
-function scoreIssue(issue) {
-  const breakdown = {
-    downtime: (issue.durMin || 0) / 30,
-    repeat: ((issue.repeatCount || 1) >= 2) ? (issue.repeatCount * 3) : 0,
-    safety_env: 0,
-    unsolved: 0,
-    full_stop: 0,
-  };
-
-  // 안전/환경 키워드 보너스 (+10)
-  const fullText = [issue.eq, issue.prob, issue.cause, issue.result, issue.text || ""]
-    .join(" ").toLowerCase();
-  const safetyEnvKw = [...DEEP_FORCE_KEYWORDS.안전, ...DEEP_FORCE_KEYWORDS.환경];
-  if (safetyEnvKw.some(kw => fullText.includes(kw.toLowerCase()))) {
-    breakdown.safety_env = 10;
-  }
-
-  // 미해결 보너스 (+5)
-  if (issue.reasons?.some(r => r.includes("미해결"))) breakdown.unsolved = 5;
-
-  // Full Stop 보너스 (+5)
-  if (issue.reasons?.some(r => r.includes("완전 정지"))) breakdown.full_stop = 5;
-
-  const total = Object.values(breakdown).reduce((a, b) => a + b, 0);
-  return { total: Math.round(total * 10) / 10, breakdown };
-}
-
-function selectKeyIssues(priority) {
-  // urgent(장기부동/미해결) + important(반복/FullStop/부품반복) 모두 후보
-  const candidates = [...priority.urgent, ...priority.important];
-
-  // 점수 계산 후 score 필드 부착
+// 점수 계산 (영역 11 기본 점수 함수 — 기존 scoreIssue 대체)
+// scoreIssueMatrix는 그대로 활용 (영역 9-C에 이미 정의됨).
+// 자동 선정 시 점수 내림차순으로 정렬 후 TOP MAX_ISSUES.
+function selectKeyIssuesV2(taggedIssues, maxIssues = MAX_ISSUES) {
+  const candidates = taggedIssues.filter(i =>
+    i.tags.includes("LONG_DOWNTIME") || i.tags.includes("HIGH_FREQUENCY")
+  );
   const scored = candidates.map(issue => {
-    const s = scoreIssue(issue);
+    const s = scoreIssueMatrix(issue);
     return { ...issue, score: s.total, scoreBreakdown: s.breakdown };
   });
-
-  // 점수 내림차순, 동률 시 부동시간 내림차순
   scored.sort((a, b) => {
     if (b.score !== a.score) return b.score - a.score;
     return (b.durMin || 0) - (a.durMin || 0);
   });
-
-  return scored.slice(0, MAX_ISSUES);
+  return scored.slice(0, maxIssues);
 }
 
 // ═════════════════════════════════════════════════════════════════════════════
@@ -746,9 +746,12 @@ function selectKeyIssues(priority) {
 // 한 이슈가 여러 카테고리(tags)에 속할 수 있음.
 // 입력: classifyPriority가 반환한 priority 객체 (urgent/important/normal 모두 활용)
 // 출력: 모든 이슈에 tags: [] 부착 + 카운트 정보
-function classifyIssues5Category(priority, options = {}) {
+// 입력: 평면 배열 (영역 11) 또는 priority 객체 (하위호환)
+function classifyIssues5Category(input, options = {}) {
   const { longDowntimeThresholdMin = 60, repeatThreshold = 2 } = options;
-  const allIssues = [...priority.urgent, ...priority.important, ...priority.normal];
+  const allIssues = Array.isArray(input)
+    ? input
+    : [...(input.urgent || []), ...(input.important || []), ...(input.normal || [])];
 
   // (a) 설비별 카운트 (HIGH_FREQUENCY 판정용)
   const eqCounts = {};
@@ -759,11 +762,14 @@ function classifyIssues5Category(priority, options = {}) {
   // (b) 알람별 카운트
   const alarmCounts = {};
   for (const i of allIssues) {
-    // alarm 필드는 기존 classifyPriority에서 추출 안 됨 → text에서 alarm 라인 추출 시도
-    const alarmMatch = (i.text || "").match(/\*?Alarm\*?\s*[:：]\s*([^\n]+)/i);
-    const alarm = alarmMatch ? alarmMatch[1].trim() : "";
+    // alarm 필드: extractAllIssues가 _alarm 캐싱 → 우선 사용. 없으면 text에서 추출
+    let alarm = i._alarm || "";
+    if (!alarm) {
+      const alarmMatch = (i.text || "").match(/\*?Alarm\*?\s*[:：]\s*([^\n]+)/i);
+      alarm = alarmMatch ? alarmMatch[1].trim() : "";
+      i._alarm = alarm;
+    }
     if (alarm) alarmCounts[alarm] = (alarmCounts[alarm] || 0) + 1;
-    i._alarm = alarm;  // 캐싱
   }
   // (c) 원인 카테고리 매칭 (이중 방지: CAUSE_PRIORITY 순서대로)
   const matchCauseCategory = (issue) => {
@@ -888,41 +894,40 @@ function selectKeyIssuesFromTags(taggedIssues, maxIssues = MAX_ISSUES) {
 
 // ─── 0. PE 사전 큐레이션 (전체 이슈 1회 호출) ────────────────────────────────
 async function runPreCuration(allIssues, kbPE, reportType, categoryMsgs = {}) {
-  // 모든 이슈를 한 번에 PE에게 보내서 일자별 표 + 장기부동 + 반복항목 정리
-  // 호출 1회로 전체 그림 작성 (토큰 비용 효율적)
-  // 영역 5: categoryMsgs = { quality: [...], process_change: [...], test: [...] }
+  // ★ 영역 11-C: 사용자 업로드 레포트 (HTML) 1~5번 구조로 출력
+  // 1. 핵심 요약 (TL;DR)
+  // 2. 장기부동 (분할 보고 통합 적용 - LLM이 같은 호기 + 24h 내 + 동일 알람코드/root cause 묶음 판단)
+  // 3. 발생빈도 (카테고리별 + 동일 설비 다발)
+  // 4. 조건 변경 (Vision Offset / Setting / Cutter)
+  // 5. 테스트/PM (그룹별)
+  // 6. NG 품질 (트렌드)
+  //
+  // 6/7번 (가장 주목할 사항 / 액션 후속)은 페르소나 논의 후 별도 호출 (영역 11-E)
 
   const qualityList = categoryMsgs.quality || [];
   const processChangeList = categoryMsgs.process_change || [];
   const testList = categoryMsgs.test || [];
 
   if (!allIssues || allIssues.length === 0) {
-    return {
-      summary_text: "분석 대상 이슈 없음",
-      daily_table: [],
-      long_downtime: [],
-      recurring: [],
-      quality_issues: [],
-      process_changes: [],
-      tests_inspections: [],
-    };
+    return emptyBriefing();
   }
 
-  // 이슈 데이터를 JSON으로 변환 (PE가 읽기 쉽게)
+  // 이슈 데이터를 JSON으로 변환 (긴 필드는 자르기 — 페이로드 크기 한도 고려)
   const issuesData = allIssues.map((issue, idx) => ({
     no: idx + 1,
     date: issue.date || "",
     time: issue.time,
     equipment: issue.eq,
-    problem: issue.prob,
-    cause: issue.cause,
-    result: issue.result,
-    pic: issue.pic,
+    problem: (issue.prob || "").slice(0, 150),
+    cause: (issue.cause || "").slice(0, 150),
+    action: (issue.action || "").slice(0, 200),
+    result: (issue.result || "").slice(0, 100),
+    pic: (issue.pic || "").slice(0, 60),
     duration_min: issue.durMin,
-    reasons: issue.reasons,
+    stop_status: issue.stopStatus || "",
+    alarm: (issue._alarm || "").slice(0, 100),
   }));
 
-  // 영역 5: 카테고리 메시지를 PE 입력용으로 변환 (각 최대 20건)
   const formatMsgs = (arr, max = 20) => arr.slice(0, max).map((m, i) => ({
     no: i + 1,
     date: m.date || "",
@@ -937,46 +942,111 @@ async function runPreCuration(allIssues, kbPE, reportType, categoryMsgs = {}) {
 
   const focus = REPORT_FOCUS[reportType] || REPORT_FOCUS.meeting;
   const kbText = kbPE ? `\n\n[학습 내용 일부]\n${kbPE.slice(0, 300)}` : "";
+  const isWeekly = reportType === "weekly";
+  const longThreshold = isWeekly ? 60 : 30;
 
   const sys = `${FACTORY_PHILOSOPHY}
 
 당신은 AZS 배터리 공장의 ${PERSONAS.Cell_PE.role.replace(" - Cell 공정", "")}입니다.
-이번 작업은 단일 이슈 분석이 아니라, 주어진 모든 이슈를 한눈에 보고 큐레이션 정리하는 역할입니다.${kbText}
+이 작업은 일일 이슈 브리핑 생성 — 사용자 레포트 양식 1~5번 형태로 정리합니다.${kbText}
 
-${focus} 다음 이슈 데이터 전체를 검토하여 보고서 첫머리에 들어갈 큐레이션을 작성하세요.
+${focus}
+
+[중요: 분할 보고 통합 룰]
+같은 호기에서 시간 인접 (24시간 내) + 동일 알람 코드 또는 동일 root cause 키워드를 보이는 BM Bot 보고가 여러 건이면,
+하나의 누적 이슈로 묶어 longDowntime에 표시. 분할 시간을 명시 (예: "21:20~21:55 (35분, full stop) → 22:00~04:56 (416분, no_prod) → 누적 451분").
+불확실하면 묶지 말고 분리 표시 (보수적 적용).
 
 [필수 출력 - JSON만, 다른 텍스트 금지]
 {
-  "summary_text": "전체 이슈 흐름의 핵심 트렌드 요약 (예: '주요 트러블은 Stacking 공정에 집중', 200자 이내)",
-  "daily_table": [
-    {"date":"발생일자","equipment":"발생호기","issue":"주요내용 (50자)","action":"조치사항 (50자)","downtime":부동시간_분단위_숫자}
+  "summary_text": "전체 이슈 흐름의 핵심 트렌드 요약 — 1~3문장 (예: '가장 주목할 점은 STK-1-A4의 9.65시간 부동, Z2 servo coupling 파손이 root cause')",
+
+  "criticalSummary": [
+    "최장 부동: [설비명] [부동시간] — 근본 원인: [원인]",
+    "기타 주요 이벤트: [설비1] [내용], [설비2] [내용]",
+    "품질 추세: [핵심 메시지]",
+    "주목 패턴: [패턴 설명]"
   ],
-  "long_downtime": [
-    {"equipment":"호기","reason":"장기 부동 사유","since":"시작일자","status":"현재상태 (진행형/완료/대기)","duration_note":"누적 시간 또는 기간 메모"}
+
+  "longDowntime": [
+    {
+      "isTop": true,
+      "equipment": "호기명",
+      "title": "[설비명] [문제 요약] — N분 (M시간) Full Stop",
+      "occurrence": "발생 시간 (분할 시 통합 표기, 예: '04/28 21:20 ~ 04/29 07:19, two splits')",
+      "alarm": "알람 메시지",
+      "splitNote": "두 차례 분할 보고 — 21:20~21:55 (35분) → 22:00~04:56 (416분) → 누적 451분 (분할 보고 시에만)",
+      "rootCause": "근본 원인 (mechanical/electrical/quality 명시)",
+      "partReplaced": "교체 부품명 + 코드",
+      "pic": "PIC 또는 Tech 시퀀스",
+      "result": "결과 (Solved/Unsolved/Monitoring)",
+      "durationMin": 부동시간_분,
+      "actionSequence": [
+        "1. 첫 번째 조치",
+        "2. 두 번째 조치",
+        "..."
+      ]
+    }
   ],
-  "recurring": [
-    {"item":"반복 항목명 (예: Align Table Ejector Time Out)","lines":["발생 호기 배열"],"count":발생_횟수,"cause":"주요 원인"}
+
+  "recurringByCategory": [
+    {"category":"카테고리명 (예: Tab Width / NG, 2nd PnP / Ejector)","count":건수,"equipments":["STK-1-A4 (×2)","STK-2-D5 (×2)"]}
   ],
-  "quality_issues": [
-    {"date":"발생일자","time":"시간","item":"품질 이슈 내용 요약 (50자)","note":"비고 (담당자/처리상태 등)"}
+
+  "recurringSameEquipment": [
+    {"equipment":"호기","count":건수,"detail":"발생 내역 요약"}
   ],
-  "process_changes": [
-    {"date":"발생일자","time":"시간","item":"변경 내용 요약 (50자)","who":"담당자 또는 작업자"}
-  ],
-  "tests_inspections": [
-    {"date":"발생일자","time":"시간","item":"테스트/시험 내용 요약 (50자)","purpose":"목적 또는 결과"}
-  ]
+
+  "conditionChanges": {
+    "visionOffset": [
+      {"date":"YY/M/D","time":"HH:MM","equipment":"호기","change":"변경 내용","reason":"사유"}
+    ],
+    "settingChange": [
+      {"equipment":"호기 (해당 시)","parameter":"파라미터명","before":"변경 전","after":"변경 후"}
+    ],
+    "cutter": [
+      {"date":"YY/M/D","time":"HH:MM","equipment":"호기","change":"변경/조정 내용"}
+    ],
+    "other": [
+      {"date":"YY/M/D","equipment":"호기","change":"기타 조건 변경","pic":"담당자"}
+    ]
+  },
+
+  "testPm": {
+    "linePM": [
+      {"date":"YY/M/D","line":"라인명 (예: Line 1A)","status":"상태 — 미수행/진행중/Stop No Production"}
+    ],
+    "fmvs": [
+      {"date":"YY/M/D","action":"FMVS 작업 (예: Reposition)","equipments":"대상 설비 목록"}
+    ],
+    "cutter": [
+      {"date":"YY/M/D","time":"HH:MM","item":"테스트 항목","resultIcon":"✅/❌/🔄","note":"결과 비고"}
+    ],
+    "stackingSepa": [
+      {"date":"YY/M/D","equipment":"호기","issue":"문제 내용","resultIcon":"❌"}
+    ]
+  },
+
+  "qualityNg": {
+    "table": [
+      {"date":"YY/M/D","sepaFold":숫자,"electrodeExpose":숫자,"nonResponse":숫자,"dimOverkill":숫자,"contactNg":숫자}
+    ],
+    "trend": "트렌드 박스 텍스트 (예: 'Sepa Fold 27 → 7 EA로 급감 (-74%). Electrode Expose 횡보 (11 → 12). Non Response 증가 (3 → 6).')"
+  }
 }
 
 [규칙]
-- daily_table은 모든 이슈가 아니라 주요 이슈만 (각 일자 대표 이슈, 최대 10건)
-- long_downtime은 60분 이상 또는 미해결 이슈
-- recurring은 같은 항목이 2회 이상 발생한 것 (Equipment 또는 Problem 기준)
-- quality_issues / process_changes / tests_inspections는 [품질 메시지], [공정변경 메시지], [테스트 메시지] 섹션 참고하여 정리 (각 최대 15건)
-  · 입력 메시지가 없으면 빈 배열 []
-  · 명백한 잡담이나 분류 오류로 보이면 제외
-- 부동시간(downtime)은 반드시 숫자만 (단위 제외)
-- 이슈 데이터의 PIC, 사유 등은 무시하고 객관적 사실만 정리`;
+- 장기부동 임계값: ${longThreshold}분 이상
+- longDowntime의 actionSequence는 PIC가 자유 텍스트로 보고한 조치 내용을 시간순/의미순으로 정리 (1~10단계, isTop=true인 경우 더 풍부)
+- isTop=true는 가장 큰 부동 1~2건만 (그 외 longDowntime은 isTop=false 또는 생략)
+- splitNote는 분할 보고 통합한 경우만 작성. 단일 보고면 빈 문자열 ""
+- recurringByCategory: 키워드 카테고리 (Tab Width/NG, 2nd PnP/Ejector/Suction, Hang Error, Servo Fault, Sensor cable, NG Dimension/Align 등)
+- recurringSameEquipment: 같은 호기에서 2건 이상 발생한 것
+- conditionChanges는 4개 하위 그룹으로 나눔 — 데이터 없으면 빈 배열 []
+- testPm도 4개 하위 그룹 — 데이터 없으면 빈 배열 []
+- qualityNg.trend는 데이터에 명시된 일별 NG 메시지 (*Tgl/*Daily NG 형식)에서만 추출. 없으면 "데이터 없음"
+- 모든 수치는 숫자만 (단위 제외)
+- 명백한 잡담/분류 오류는 제외`;
 
   const userMsg = `[전체 부동 이슈 데이터 - ${allIssues.length}건]
 ${JSON.stringify(issuesData, null, 1)}
@@ -990,232 +1060,171 @@ ${processChangeData.length > 0 ? JSON.stringify(processChangeData, null, 1) : "(
 [테스트/양산외 생산 메시지 - ${testData.length}건]
 ${testData.length > 0 ? JSON.stringify(testData, null, 1) : "(없음)"}
 
-위 모든 데이터를 검토하여 큐레이션 JSON을 작성하세요.`;
+위 데이터를 사용자 레포트 양식 1~5번 구조로 정리해주세요. 분할 보고 통합 룰을 보수적으로 적용하세요.`;
 
   try {
     await new Promise(r => setTimeout(r, 500));
     const raw = await callClaudeRaw(sys, userMsg, {
-      model: MODEL_REASONING,
-      max_tokens: 2500,  // 영역 5: 3개 카테고리 추가로 출력 늘어남
+      model: MODEL_REASONING,  // 영역 11: Sonnet (v9 동일 — 검증 안 된 추측 수정 회귀)
+      max_tokens: 5500,  // 영역 11: 35단계 actionSequence 포함 응답을 위해
     });
     const parsed = safeJSON(raw);
-    return {
-      summary_text: parsed.summary_text || "큐레이션 요약 생성 실패",
-      daily_table: Array.isArray(parsed.daily_table) ? parsed.daily_table : [],
-      long_downtime: Array.isArray(parsed.long_downtime) ? parsed.long_downtime : [],
-      recurring: Array.isArray(parsed.recurring) ? parsed.recurring : [],
-      quality_issues: Array.isArray(parsed.quality_issues) ? parsed.quality_issues : [],
-      process_changes: Array.isArray(parsed.process_changes) ? parsed.process_changes : [],
-      tests_inspections: Array.isArray(parsed.tests_inspections) ? parsed.tests_inspections : [],
-    };
+    return normalizeBriefing(parsed);
   } catch (e) {
+    // 영역 11: 상세 에러 정보 출력 (사용자 진단 용이)
     console.error("[PE 큐레이션 실패]", e);
-    // 폴백: 데이터 기반 자동 생성 (API 호출 없이)
+    console.error("[PE 큐레이션 실패] 메시지:", e?.message);
+    console.error("[PE 큐레이션 실패] 페이로드 크기:", {
+      sys_chars: sys.length,
+      userMsg_chars: userMsg.length,
+      total_kb: Math.round((sys.length + userMsg.length) / 1024),
+      issues_count: allIssues.length,
+    });
     return buildFallbackCuration(allIssues, categoryMsgs);
   }
 }
 
+// ─── 영역 11-C: 빈/정규화 헬퍼 ──────────────────────────────────────────────────
+function emptyBriefing() {
+  return {
+    summary_text: "분석 대상 이슈 없음",
+    criticalSummary: [],
+    longDowntime: [],
+    recurringByCategory: [],
+    recurringSameEquipment: [],
+    conditionChanges: { visionOffset: [], settingChange: [], cutter: [], other: [] },
+    testPm: { linePM: [], fmvs: [], cutter: [], stackingSepa: [] },
+    qualityNg: { table: [], trend: "데이터 없음" },
+    // 하위호환: 옛 필드명도 빈 배열 (일부 코드가 참조)
+    daily_table: [], long_downtime: [], recurring: [],
+    quality_issues: [], process_changes: [], tests_inspections: [],
+  };
+}
+
+function normalizeBriefing(parsed) {
+  const arr = (v) => Array.isArray(v) ? v : [];
+  const obj = (v) => (v && typeof v === "object" && !Array.isArray(v)) ? v : {};
+
+  const result = {
+    summary_text: parsed.summary_text || "",
+    criticalSummary: arr(parsed.criticalSummary),
+    longDowntime: arr(parsed.longDowntime),
+    recurringByCategory: arr(parsed.recurringByCategory),
+    recurringSameEquipment: arr(parsed.recurringSameEquipment),
+    conditionChanges: {
+      visionOffset: arr(obj(parsed.conditionChanges).visionOffset),
+      settingChange: arr(obj(parsed.conditionChanges).settingChange),
+      cutter: arr(obj(parsed.conditionChanges).cutter),
+      other: arr(obj(parsed.conditionChanges).other),
+    },
+    testPm: {
+      linePM: arr(obj(parsed.testPm).linePM),
+      fmvs: arr(obj(parsed.testPm).fmvs),
+      cutter: arr(obj(parsed.testPm).cutter),
+      stackingSepa: arr(obj(parsed.testPm).stackingSepa),
+    },
+    qualityNg: {
+      table: arr(obj(parsed.qualityNg).table),
+      trend: obj(parsed.qualityNg).trend || "데이터 없음",
+    },
+  };
+
+  // 하위호환: 일부 코드가 옛 필드명으로 참조 (long_downtime, recurring 등)
+  result.long_downtime = result.longDowntime.map(d => ({
+    equipment: d.equipment, reason: d.rootCause || d.title, since: "",
+    status: d.result, duration_note: `${d.durationMin}분`,
+  }));
+  result.recurring = result.recurringByCategory.map(r => ({
+    item: r.category, lines: r.equipments || [], count: r.count, cause: "",
+  }));
+  result.daily_table = [];
+  result.quality_issues = [];
+  result.process_changes = [];
+  result.tests_inspections = [];
+
+  return result;
+}
+
 // PE 큐레이션 폴백 - 데이터 기반 자동 생성
+// ─── 영역 11-C: PE 큐레이션 폴백 (LLM 호출 실패 시 데이터 기반 자동 생성) ───
 function buildFallbackCuration(allIssues, categoryMsgs = {}) {
-  // 일자별 정리 (각 일자에서 가장 부동시간 긴 이슈)
+  if (!allIssues || allIssues.length === 0) return emptyBriefing();
+
+  // 일자별 합계
   const byDate = {};
   for (const issue of allIssues) {
     const d = issue.date || "?";
-    if (!byDate[d] || (issue.durMin || 0) > (byDate[d].durMin || 0)) {
-      byDate[d] = issue;
-    }
+    if (!byDate[d]) byDate[d] = { date: d, count: 0, totalMin: 0 };
+    byDate[d].count += 1;
+    byDate[d].totalMin += (issue.durMin || 0);
   }
-  const daily_table = Object.entries(byDate).map(([date, issue]) => ({
-    date,
-    equipment: issue.eq || "-",
-    issue: (issue.prob || "").slice(0, 50),
-    action: (issue.result || "").slice(0, 50),
-    downtime: issue.durMin || 0,
-  })).slice(0, 10);
 
-  // 장기 부동 (60분 이상 또는 미해결)
-  const long_downtime = allIssues
-    .filter(i => (i.durMin || 0) >= 60 || (i.result || "").toLowerCase().includes("not solved"))
-    .slice(0, 5)
-    .map(i => ({
-      equipment: i.eq || "-",
-      reason: (i.cause || i.prob || "").slice(0, 60),
-      since: i.date || "",
-      status: (i.result || "").toLowerCase().includes("solved") ? "완료" : "진행형",
-      duration_note: `${i.durMin || 0}분`,
-    }));
-
-  // 반복 항목 (Equipment 기준 2회 이상)
-  const eqCount = {};
-  for (const i of allIssues) {
-    if (!i.eq) continue;
-    eqCount[i.eq] = (eqCount[i.eq] || 0) + 1;
-  }
-  const recurring = Object.entries(eqCount)
-    .filter(([, c]) => c >= 2)
-    .slice(0, 5)
-    .map(([eq, count]) => ({
-      item: eq,
-      lines: [eq],
-      count,
-      cause: "(데이터 기반 자동 추출 - 상세 원인 추가 분석 필요)",
-    }));
-
-  // 영역 5: 카테고리 메시지를 단순 매핑하여 폴백 생성
-  const mapMsgs = (arr, extraField) => (arr || []).slice(0, 15).map(m => ({
-    date: m.date || "",
-    time: m.time || "",
-    item: (m.text || "").slice(0, 50).replace(/\n/g, " "),
-    [extraField]: m.sender || "-",
+  // 장기부동 (durMin 기준 내림차순 TOP 5, isTop은 가장 큰 1건)
+  const sorted = [...allIssues].sort((a, b) => (b.durMin || 0) - (a.durMin || 0));
+  const longDowntime = sorted.slice(0, 5).map((i, idx) => ({
+    isTop: idx === 0,
+    equipment: i.eq || "-",
+    title: `${i.eq || "?"} ${(i.prob || "").slice(0, 40)} — ${i.durMin || 0}분`,
+    occurrence: `${i.date || ""} ${i.time || ""}`,
+    alarm: i._alarm || "",
+    splitNote: "",
+    rootCause: (i.cause || "").slice(0, 80),
+    partReplaced: "",
+    pic: i.pic || "",
+    result: i.result || "",
+    durationMin: i.durMin || 0,
+    actionSequence: i.action ? [i.action.slice(0, 100)] : [],
   }));
 
-  return {
-    summary_text: `[PE 큐레이션 폴백] 총 ${allIssues.length}건의 부동 이슈 발생. AI 큐레이션 호출 실패로 자동 정리됨.`,
-    daily_table,
-    long_downtime,
-    recurring,
-    quality_issues: mapMsgs(categoryMsgs.quality, "note"),
-    process_changes: mapMsgs(categoryMsgs.process_change, "who"),
-    tests_inspections: mapMsgs(categoryMsgs.test, "purpose"),
-  };
-}
-
-// ═════════════════════════════════════════════════════════════════════════════
-// ★ 영역 9-E: 간단모드 보고서 빌더 (명세서 §6 표 형태)
-// ═════════════════════════════════════════════════════════════════════════════
-function buildSimpleReport({ dateStr, selDates, taggedResult, priority, reportType, process, curation }) {
-  const { issues, counts, eqCounts, alarmCounts } = taggedResult;
-  const isWeekly = reportType === "weekly";
-
-  // 카테고리별 점수 매긴 후 정렬
-  const scoreEach = (arr) => arr.map(i => {
-    const s = scoreIssueMatrix(i);
-    return { ...i, score: s.total, scoreBreakdown: s.breakdown };
-  }).sort((a, b) => {
-    if (b.score !== a.score) return b.score - a.score;
-    return (b.durMin || 0) - (a.durMin || 0);
-  });
-
-  // 1. LONG_DOWNTIME 상위
-  const longDowntime = scoreEach(issues.filter(i => i.tags.includes("LONG_DOWNTIME")))
-    .slice(0, isWeekly ? 10 : 5);
-
-  // 2. HIGH_FREQUENCY (3축)
-  // (a) 설비별 TOP 10
-  const eqRanked = Object.entries(eqCounts)
+  // 반복 (설비별)
+  const eqCount = {};
+  for (const i of allIssues) {
+    if (i.eq) eqCount[i.eq] = (eqCount[i.eq] || 0) + 1;
+  }
+  const recurringSameEquipment = Object.entries(eqCount)
     .filter(([, c]) => c >= 2)
     .sort((a, b) => b[1] - a[1])
     .slice(0, 10)
-    .map(([eq, count]) => {
-      const samples = issues.filter(i => i.eq === eq).slice(0, 3);
-      return { equipment: eq, count, samples };
-    });
-  // (b) 알람별 TOP 10
-  const alarmRanked = Object.entries(alarmCounts)
-    .filter(([, c]) => c >= 2)
+    .map(([equipment, count]) => ({
+      equipment,
+      count,
+      detail: allIssues.filter(i => i.eq === equipment).slice(0, 2).map(i => (i.prob || "").slice(0, 30)).join(" / "),
+    }));
+
+  // 카테고리별 (단순화 — causeCategory 사용)
+  const catCount = {};
+  for (const i of allIssues) {
+    if (i.causeCategory) catCount[i.causeCategory] = (catCount[i.causeCategory] || 0) + 1;
+  }
+  const recurringByCategory = Object.entries(catCount)
     .sort((a, b) => b[1] - a[1])
     .slice(0, 10)
-    .map(([alarm, count]) => ({ alarm, count }));
-  // (c) 원인 카테고리별
-  const causeCategoryStats = {};
-  issues.forEach(i => {
-    if (i.causeCategory) {
-      causeCategoryStats[i.causeCategory] = (causeCategoryStats[i.causeCategory] || 0) + 1;
-    }
-  });
-  const causeCategoryRanked = Object.entries(causeCategoryStats)
-    .sort((a, b) => b[1] - a[1])
-    .map(([cat, count]) => ({ category: cat, count }));
-
-  // 3. CONDITION_CHANGE — 큐레이션의 process_changes 활용 + 5-카테고리 분류 결과
-  const conditionChanges = [
-    ...(curation?.process_changes || []),
-    ...issues.filter(i => i.tags.includes("CONDITION_CHANGE") && !i.tags.includes("LONG_DOWNTIME"))
-              .slice(0, 10)
-              .map(i => ({ date: i.date, time: i.time, item: (i.prob || "").slice(0, 60), who: i.pic || "-" })),
-  ].slice(0, 15);
-
-  // 4. TEST_PM
-  const testPm = [
-    ...(curation?.tests_inspections || []),
-    ...issues.filter(i => i.tags.includes("TEST_PM") && !i.tags.includes("LONG_DOWNTIME"))
-              .slice(0, 10)
-              .map(i => ({ date: i.date, time: i.time, item: (i.prob || "").slice(0, 60), purpose: i.cause || "-" })),
-  ].slice(0, 15);
-
-  // 5. QUALITY_NG — 큐레이션의 quality_issues 활용
-  const qualityNg = [
-    ...(curation?.quality_issues || []),
-    ...issues.filter(i => i.tags.includes("QUALITY_NG") && !i.tags.includes("LONG_DOWNTIME"))
-              .slice(0, 10)
-              .map(i => ({ date: i.date, time: i.time, item: (i.prob || "").slice(0, 60), note: i.cause || "-" })),
-  ].slice(0, 15);
-
-  // 6. 미해결 / 모니터링 필요 이슈
-  const unresolved = issues.filter(i => {
-    const r = (i.result || "").toLowerCase();
-    return r.includes("not solved") || r.includes("unsolved") || (i.reasons || []).some(rs => rs.includes("미해결"));
-  }).slice(0, 10);
-
-  // 7. 일일 합계
-  const dailyTotals = {};
-  issues.forEach(i => {
-    const d = i.date || "?";
-    if (!dailyTotals[d]) dailyTotals[d] = { date: d, count: 0, totalMin: 0 };
-    dailyTotals[d].count += 1;
-    dailyTotals[d].totalMin += (i.durMin || 0);
-  });
-  const dailyOverview = Object.values(dailyTotals).sort((a, b) => a.date.localeCompare(b.date));
-
-  // 8. 자동 인사이트 (룰 기반)
-  const insights = [];
-  // 동일 설비 4회+ : RCA 권장
-  Object.entries(eqCounts).filter(([, c]) => c >= 4).slice(0, 3).forEach(([eq, c]) => {
-    insights.push(`설비 ${eq} 만성화: ${selDates.length}일 내 ${c}회 발생 — RCA(근본원인분석) 필요`);
-  });
-  // 동일 알람 5회+ : 부품/로직 점검
-  Object.entries(alarmCounts).filter(([, c]) => c >= 5).slice(0, 3).forEach(([al, c]) => {
-    insights.push(`알람 "${al.slice(0, 50)}" ${c}회 다발 — 부품 품질 또는 로직 점검 필요`);
-  });
-  // 미해결 이슈 다수
-  if (unresolved.length >= 3) {
-    insights.push(`미해결 이슈 ${unresolved.length}건 — TFT 구성 또는 우선 해결 권장`);
-  }
-  // 큐레이션 요약 활용
-  if (curation?.summary_text) {
-    insights.push(`PE 종합: ${curation.summary_text}`);
-  }
+    .map(([category, count]) => ({
+      category,
+      count,
+      equipments: [...new Set(allIssues.filter(i => i.causeCategory === category).map(i => i.eq).filter(Boolean))].slice(0, 5),
+    }));
 
   return {
-    title: `${process} 공정 ${dateStr} 이슈 정리 (간단모드)`,
-    date: dateStr,
-    attendees: "(간단모드 — 페르소나 논의 없음)",
-    agenda: `[${process} 공정] ${dateStr} 이슈 정리 (간단모드)`,
-    sections: [
-      { heading: "📊 일별 부동 현황", items: dailyOverview.map(d => `${d.date}: ${d.count}건 / ${d.totalMin}분`) },
-      { heading: "🔴 장기부동", items: longDowntime.map(i => `${i.eq} (${i.durMin}분, 점수${i.score}) — ${(i.prob||"").slice(0,40)}`) },
-      { heading: "🔁 반복 발생", items: eqRanked.map(e => `${e.equipment}: ${e.count}회`) },
-      { heading: "💡 인사이트", items: insights },
-    ],
-    // 간단모드 전용 데이터 (UI에서 표 렌더링)
-    simple: {
-      dailyOverview,
-      longDowntime,
-      eqRanked,
-      alarmRanked,
-      causeCategoryRanked,
-      conditionChanges,
-      testPm,
-      qualityNg,
-      unresolved,
-      insights,
-      counts,
-      threshold: isWeekly ? 60 : 30,
-    },
-    analytics: { totalIssues: issues.length, counts },
-    grouped: { DEEP: [], STANDARD: [], LITE: [] },  // 호환용 빈 배열
+    summary_text: `[큐레이션 폴백] 총 ${allIssues.length}건 부동 (LLM 호출 실패 — 데이터 기반 자동 정리)`,
+    criticalSummary: [],
+    longDowntime,
+    recurringByCategory,
+    recurringSameEquipment,
+    conditionChanges: { visionOffset: [], settingChange: [], cutter: [], other: [] },
+    testPm: { linePM: [], fmvs: [], cutter: [], stackingSepa: [] },
+    qualityNg: { table: [], trend: "데이터 없음" },
+    // 하위호환
+    daily_table: Object.values(byDate).map(d => ({ date: d.date, equipment: "(통합)", issue: `${d.count}건`, action: "", downtime: d.totalMin })),
+    long_downtime: longDowntime.map(d => ({ equipment: d.equipment, reason: d.rootCause, since: "", status: d.result, duration_note: `${d.durationMin}분` })),
+    recurring: recurringByCategory.map(r => ({ item: r.category, lines: r.equipments || [], count: r.count, cause: "" })),
+    quality_issues: [],
+    process_changes: [],
+    tests_inspections: [],
   };
 }
+
+
 
 // ─── 1. 모드 분류 (키워드 → 우선순위 → 폴백) ───────────────────────────────────
 function classifyDiscussionMode(issue, isPriUrgent, isPriImportant) {
@@ -1807,7 +1816,7 @@ async function generateReport(date, dates, discussions, priority, reportType, kb
 
   const ctx = `날짜: ${dateStr}
 보고서 종류: ${reportTitle}
-긴급: ${priority.urgent.length}건 / 중요: ${priority.important.length}건 / 일반: ${priority.normal.length}건
+본문 논의: ${priority.urgent.length + priority.important.length + priority.normal.length}건 (LONG_DOWNTIME ${priority.urgent.length} / HIGH_FREQUENCY ${priority.important.length})
 모드별 분석: DEEP ${grouped.DEEP.length} / STANDARD ${grouped.STANDARD.length} / LITE ${grouped.LITE.length}
 
 [시간대별 발생 TOP 5]
@@ -1876,7 +1885,7 @@ ${discussionSummary}`;
     title: `${dateStr} ${reportTitle}`,
     date: dateStr,
     attendees: "선택된 공정 PE/ME/TE + 추가 에이전트",
-    agenda: `다운타임 ${priority.urgent.length + priority.important.length + priority.normal.length}건 분석 및 대책 수립`,
+    agenda: `본문 논의 ${priority.urgent.length + priority.important.length + priority.normal.length}건 분석 및 대책 수립`,
     sections,
     discussions,
     detailCards,    // ★ 이슈별 상세 카드 (모드별 차등)
@@ -1942,7 +1951,7 @@ export default function App() {
   const [selRange, setSelRange]   = useState({ start: null, end: null, unit: "day" });
   const [reportType, setReportType] = useState("meeting");
   // ★ 영역 9-D: 보고서 생성 모드 (간단=명세서 표 형태, 상세=페르소나 8명 논의)
-  const [reportMode, setReportMode] = useState("simple");  // 기본값: 간단모드
+  // 영역 11: reportMode (간단/상세 모드) 폐기. 단일 흐름.
   // ★ 영역 9: 명세서 5-카테고리 분류 결과 (간단모드 표 출력용)
   const [taggedIssues, setTaggedIssues] = useState(null);
   const [classified, setClassified] = useState(null);
@@ -2009,16 +2018,15 @@ export default function App() {
     setError("");
   };
 
-  // ★ 영역 6: 이슈 안정 ID (체크박스 추적용)
-  const getIssueId = (issue) => `${issue.date || "?"}_${issue.time || "?"}_${issue.eq || "?"}_${(issue.prob || "").slice(0, 20)}`;
+  // ★ 영역 6: getIssueId는 모듈 최상위 함수로 이동 (BriefingDisplay 등에서도 사용)
 
   const handleReportConfirm = async () => {
     setError("");
     const dayMsgs = filterByDates(allMsgs, selDates);
     const cl = classifyMessages(dayMsgs);
-    const pri = classifyPriority(cl.downtime);
+    const allIssuesFlat = extractAllIssues(cl.downtime);  // 영역 11-A: priority 객체 대신 평면 배열
     setClassified(cl);
-    setPriority(pri);
+    setPriority(allIssuesFlat);  // priority state는 이제 평면 배열을 보유
 
     // ★ 영역 6-B: STEP 3 진입 전에 PE 큐레이션을 미리 실행 (사용자가 자동 선정 결과를 바로 보고 추가 선택할 수 있도록)
     setCurating(true);
@@ -2051,7 +2059,7 @@ export default function App() {
       };
 
       // PE 큐레이션 실행 (KB 없이 진행 — STEP 3에선 빠르게)
-      const allIssuesForCuration = [...pri.urgent, ...pri.important, ...pri.normal];
+      const allIssuesForCuration = allIssuesFlat;
       let curation;
       try {
         curation = await runPreCuration(allIssuesForCuration, "", reportType, categoryMsgs);
@@ -2061,15 +2069,29 @@ export default function App() {
         curation = buildFallbackCuration(allIssuesForCuration, categoryMsgs);
       }
 
-      // 자동 선정 (긴급 + 중요 후보 중 점수 상위 MAX_ISSUES건)
-      const autoTop = selectKeyIssues(pri);
-      const autoIds = autoTop.map(getIssueId);
+      // ★ 영역 11-B: 5-카테고리 분류 즉시 실행 (체크박스 + 큐레이션 모두 활용)
+      const taggedNow = classifyIssues5Category(allIssuesFlat, {
+        longDowntimeThresholdMin: reportType === "weekly" ? 60 : 30,
+        repeatThreshold: 2,
+      });
+      setTaggedIssues(taggedNow);
+
+      // ★ 영역 11-7-1: 자동 선정 = LONG_DOWNTIME 또는 HIGH_FREQUENCY tag 보유 이슈
+      const autoSelected = taggedNow.issues.filter(i =>
+        (i.tags || []).includes("LONG_DOWNTIME") || (i.tags || []).includes("HIGH_FREQUENCY")
+      );
+      // 점수순 정렬 후 MAX_ISSUES 제한
+      const autoScored = autoSelected.map(issue => {
+        const s = scoreIssueMatrix(issue);
+        return { ...issue, score: s.total };
+      }).sort((a, b) => b.score - a.score).slice(0, MAX_ISSUES);
+      const autoIds = autoScored.map(getIssueId);
 
       setPreCuration(curation);
       setPreCategoryMsgs(categoryMsgs);
       setAutoSelectedIds(autoIds);
       setSelectedIssueIds(autoIds);  // 초기값 = 자동 선정 (사용자가 추가/제거 가능)
-      setProgress(p => [...p, `🎯 자동 선정 ${autoIds.length}건. 추가 선택 후 분석 시작 가능.`]);
+      setProgress(p => [...p, `🎯 자동 선정 ${autoIds.length}건 (LONG_DOWNTIME/HIGH_FREQUENCY tag). 추가 선택 후 분석 시작 가능.`]);
     } catch (e) {
       setError(`STEP 3 준비 중 오류: ${e?.message || e}`);
     } finally {
@@ -2110,12 +2132,24 @@ export default function App() {
         setProgress(p => [...p, "⚠️ 학습 로드 실패 — 기본 역할로 진행"]);
       }
 
-      // ★ 영역 6: STEP 3에서 사용자가 체크한 이슈를 분석 대상으로 사용
+      // ★ 영역 11-A: priority가 평면 배열이라 직접 사용. taggedIssues가 5-카테고리 분류 결과.
       // 자동 선정 + 사용자 추가 = selectedIssueIds (체크박스로 자유 선택)
-      // 매뉴얼 추가 이슈는 점수 계산 후 score 부여 (정렬 일관성)
-      const candidates = [...priority.urgent, ...priority.important];
-      const candidatesScored = candidates.map(issue => {
-        const s = scoreIssue(issue);
+      // tagged.issues는 모든 이슈에 tags 부착된 상태
+      const allIssuesFlat = priority || [];
+
+      // 5-카테고리 분류는 STEP 3 진입 시 이미 실행됨 (taggedIssues state). 없으면 여기서 재계산.
+      let taggedResult = taggedIssues;
+      if (!taggedResult) {
+        taggedResult = classifyIssues5Category(allIssuesFlat, {
+          longDowntimeThresholdMin: reportType === "weekly" ? 60 : 30,
+          repeatThreshold: 2,
+        });
+        setTaggedIssues(taggedResult);
+      }
+
+      // 사용자가 STEP 3에서 체크한 이슈 = 본문 논의 대상 (DEEP/STANDARD/LITE 모드 자동 분류)
+      const candidatesScored = taggedResult.issues.map(issue => {
+        const s = scoreIssueMatrix(issue);
         return { ...issue, score: s.total, scoreBreakdown: s.breakdown };
       });
       const keyIssues = candidatesScored
@@ -2125,15 +2159,16 @@ export default function App() {
           return (b.durMin || 0) - (a.durMin || 0);
         });
 
-      const liteIssues = priority.normal.slice(0, MAX_ISSUES);
-      const allTargets = [...keyIssues, ...liteIssues];
+      // 영역 11: 체크 안 된 이슈는 본문 논의 대상 X (사용자 명시 선정만)
+      const liteIssues = [];  // 폐기: 사용자가 명시적으로 체크한 것만 분석
+      const allTargets = keyIssues;
 
       const autoCount = keyIssues.filter(i => autoSelectedIds.includes(getIssueId(i))).length;
       const manualCount = keyIssues.length - autoCount;
-      setProgress(p => [...p, `🔍 본문 논의: 자동 ${autoCount}건 + 매뉴얼 ${manualCount}건 = 총 ${keyIssues.length}건 + 일반(LITE) ${liteIssues.length}건`]);
+      setProgress(p => [...p, `🔍 본문 논의: 자동 ${autoCount}건 + 사용자 추가 ${manualCount}건 = 총 ${keyIssues.length}건`]);
 
       // ★ 영역 6-E: STEP 3에서 미리 실행한 큐레이션 재사용 (재호출 없음)
-      const allIssuesForCuration = [...priority.urgent, ...priority.important, ...priority.normal];
+      const allIssuesForCuration = allIssuesFlat;
       const categoryMsgs = preCategoryMsgs || {
         quality: classified?.qualityMsgs || [],
         process_change: classified?.processChangeMsgs || [],
@@ -2154,28 +2189,23 @@ export default function App() {
         }
       }
 
-      // ★ 영역 9-B: 명세서 기반 5-카테고리 분류 (모드 무관, 항상 실행 — Y-strict)
-      const taggedResult = classifyIssues5Category(priority, {
-        longDowntimeThresholdMin: reportType === "weekly" ? 60 : 30,  // 명세서 §4.2
-        repeatThreshold: 2,
-      });
-      setTaggedIssues(taggedResult);
-      setProgress(p => [...p, `🏷️ 5-카테고리 분류: 장기부동 ${taggedResult.counts.LONG_DOWNTIME} / 반복 ${taggedResult.counts.HIGH_FREQUENCY} / 조건변경 ${taggedResult.counts.CONDITION_CHANGE} / 테스트 ${taggedResult.counts.TEST_PM} / 품질 ${taggedResult.counts.QUALITY_NG}`]);
+      setProgress(p => [...p, `🏷️ 5-카테고리: 장기부동 ${taggedResult.counts.LONG_DOWNTIME} / 반복 ${taggedResult.counts.HIGH_FREQUENCY} / 조건변경 ${taggedResult.counts.CONDITION_CHANGE} / 테스트 ${taggedResult.counts.TEST_PM} / 품질 ${taggedResult.counts.QUALITY_NG}`]);
 
-      // 모드 분류 + 건별 논의
+      // 모드 분류 + 건별 논의 (영역 11: 간단 모드 폐기, 항상 페르소나 논의)
       const allDiscussions = [];
 
-      // ★ 영역 9-D: 간단 모드면 페르소나 논의 건너뛰기
-      if (reportMode === "simple") {
-        setProgress(p => [...p, `📊 간단 모드: 페르소나 논의 생략. 표 형태 보고서를 생성합니다.`]);
-      } else {
-        // 상세 모드: 기존 페르소나 논의 흐름
-        // 긴급+중요 처리
+      // 본문 논의 처리 — 영역 11: 사용자 추가 이슈 = DEEP, 자동 선정 = tags 기반
+      {
         for (let i = 0; i < keyIssues.length; i++) {
           const issue = keyIssues[i];
-          const isPriUrgent = priority.urgent.includes(issue);
-          const isPriImportant = priority.important.includes(issue);
-          const modeInfo = classifyDiscussionMode(issue, isPriUrgent, isPriImportant);
+          const isAutoSelected = autoSelectedIds.includes(getIssueId(issue));
+          const hasLongTag = (issue.tags || []).includes("LONG_DOWNTIME");
+          const hasFreqTag = (issue.tags || []).includes("HIGH_FREQUENCY");
+          // 영역 11-7-2: 사용자 추가 이슈는 무조건 DEEP
+          // 자동 선정 이슈: LONG_DOWNTIME → DEEP, HIGH_FREQUENCY만 → STANDARD
+          const modeInfo = !isAutoSelected
+            ? { mode: "DEEP", reason: "사용자 추가 (체크박스 선택)", source: "user" }
+            : classifyDiscussionMode(issue, hasLongTag, hasFreqTag);
           const mStyle = MODE_STYLE[modeInfo.mode];
 
           setProgress(p => [...p, `${mStyle.label} [${i+1}/${keyIssues.length}] ${issue.eq} (${modeInfo.reason})`]);
@@ -2187,18 +2217,8 @@ export default function App() {
           setDiscussions([...allDiscussions]);
         }
 
-        // 일반(LITE) 처리
-        for (let i = 0; i < liteIssues.length; i++) {
-          const issue = liteIssues[i];
-          const modeInfo = classifyDiscussionMode(issue, false, false);
-          if (modeInfo.mode === "DEEP") {
-            setProgress(p => [...p, `🚨 LITE 후보였으나 키워드 감지로 DEEP 강제: ${issue.eq}`]);
-          }
-          setProgress(p => [...p, `${MODE_STYLE[modeInfo.mode].label} [LITE-${i+1}/${liteIssues.length}] ${issue.eq}`]);
-          const result = await runIssueDiscussion(issue, modeInfo, kbResult.kb, reportType, allowedAgents);
-          allDiscussions.push(result);
-          setDiscussions([...allDiscussions]);
-        }
+        // 영역 11: 사용자가 체크하지 않은 이슈는 본문 논의 안 함 (LITE 루프 폐기)
+        // 만약 향후 자동 LITE 처리 추가 원하면 여기에 다시 작성 가능
       }
 
       // 보고서 생성
@@ -2207,44 +2227,34 @@ export default function App() {
       const dateStr = (selRange && selRange.start && selRange.end)
         ? buildRangeLabel(selRange)
         : (selDates.length > 1 ? `${selDates[0]}~${selDates[selDates.length-1]}` : selDates[0]);
-      const allIssuesForAnalytics = [...priority.urgent, ...priority.important, ...priority.normal];
+      const allIssuesForAnalytics = allIssuesFlat;
 
-      let report;
-      if (reportMode === "simple") {
-        // ★ 영역 9-E: 간단 모드 — 명세서 §6 표 형태 보고서 (페르소나 없음)
-        report = buildSimpleReport({
-          dateStr,
-          selDates,
-          taggedResult,
-          priority,
-          reportType,
-          process: selectedProcess,
-          curation,
-        });
-      } else {
-        // 상세 모드: 기존 페르소나 보고서
-        report = await generateReport(dateStr, selDates, allDiscussions, priority, reportType, kbResult.kb, allIssuesForAnalytics, selectedProcess, curation);
-      }
+      // 영역 11: 단일 흐름 — 페르소나 보고서 생성
+      // generateReport는 priority 객체를 기대하지만 평면 배열도 받도록 호환 처리
+      // (우선 평면 배열을 priority 형태로 wrap해서 호환 — 기존 generateReport 시그니처 유지)
+      const priorityCompat = {
+        urgent: keyIssues.filter(i => (i.tags || []).includes("LONG_DOWNTIME")),
+        important: keyIssues.filter(i => (i.tags || []).includes("HIGH_FREQUENCY") && !(i.tags || []).includes("LONG_DOWNTIME")),
+        normal: [],
+      };
+      const report = await generateReport(dateStr, selDates, allDiscussions, priorityCompat, reportType, kbResult.kb, allIssuesForAnalytics, selectedProcess, curation);
       // ★ 보고서에 공정/참여 에이전트 정보 추가
       report.process = selectedProcess;
       report.allowedAgents = allowedAgents;
       report.range = selRange;  // 영역 8: 보고서에 범위 정보 보존
-      report.mode = reportMode;  // 영역 9: 모드 보존
       report.tagged = taggedResult;  // 영역 9: 5-카테고리 결과 보존
       setMinutes(report);
 
       // 시트 저장
       setProgress(p => [...p, "💾 구글 시트 저장 중..."]);
-      // ★ 영역 9-E: 모드별 분기 (간단모드는 grouped 없음)
       const deepSummary = (report.grouped?.DEEP || []).map(d => `${d.issue.eq}: ${d.moderator.consensus}`).join(" | ");
       const stdSummary = (report.grouped?.STANDARD || []).map(d => `${d.issue.eq}: ${d.moderator.summary}`).join(" | ");
       const liteSummary = (report.grouped?.LITE || []).map(d => `${d.issue.eq}: ${d.moderator.supplement}`).join(" | ");
 
       const saved = await saveToSheets({
         date: dateStr,
-        agenda: `[${selectedProcess} 공정/${reportMode === "simple" ? "간단" : "상세"}모드] ${report.agenda}`,
-        issue_summary: `긴급${priority.urgent.length} 중요${priority.important.length} 일반${priority.normal.length} | 5-카테고리 LD${taggedResult.counts.LONG_DOWNTIME}/HF${taggedResult.counts.HIGH_FREQUENCY}/CC${taggedResult.counts.CONDITION_CHANGE}/TP${taggedResult.counts.TEST_PM}/QN${taggedResult.counts.QUALITY_NG}` +
-          (reportMode === "detailed" ? ` | DEEP${report.grouped.DEEP.length} STANDARD${report.grouped.STANDARD.length} LITE${report.grouped.LITE.length}` : ""),
+        agenda: `[${selectedProcess} 공정] ${report.agenda}`,
+        issue_summary: `5-카테고리 LD${taggedResult.counts.LONG_DOWNTIME}/HF${taggedResult.counts.HIGH_FREQUENCY}/CC${taggedResult.counts.CONDITION_CHANGE}/TP${taggedResult.counts.TEST_PM}/QN${taggedResult.counts.QUALITY_NG} | 본문논의 ${keyIssues.length}건 (자동 ${autoCount} + 사용자 추가 ${manualCount}) | DEEP${report.grouped.DEEP.length} STANDARD${report.grouped.STANDARD.length} LITE${report.grouped.LITE.length}`,
         pe_opinion: deepSummary.slice(0, 500),
         me_opinion: stdSummary.slice(0, 500),
         te_opinion: liteSummary.slice(0, 500),
@@ -2252,12 +2262,10 @@ export default function App() {
         action_items: report.sections?.[3]?.items?.join(" | ") || "",
         minutes_full: JSON.stringify({
           process: selectedProcess,
-          mode: reportMode,
           agents: allowedAgents,
           analytics: report.analytics,
-          modeStats: reportMode === "detailed"
-            ? { DEEP: report.grouped.DEEP.length, STANDARD: report.grouped.STANDARD.length, LITE: report.grouped.LITE.length }
-            : { tagged: taggedResult.counts },
+          modeStats: { DEEP: report.grouped.DEEP.length, STANDARD: report.grouped.STANDARD.length, LITE: report.grouped.LITE.length },
+          tagged: taggedResult.counts,
         }).slice(0, 1000),
       });
       setSheetSaved(saved);
@@ -2274,7 +2282,7 @@ export default function App() {
     t += `일시: ${minutes.date}\n참석: ${minutes.attendees}\n안건: ${minutes.agenda}\n`;
     if (minutes.process && minutes.allowedAgents) {
       t += `대상 공정: ${PROCESSES[minutes.process]?.label || minutes.process}\n`;
-      if (minutes.mode !== "simple") {
+      if (true) {  // 영역 11: 항상 페르소나 정보 출력
         t += `참여 에이전트 (${minutes.allowedAgents.length}명): ${minutes.allowedAgents.map(a => `${a}(${PERSONAS[a]?.label})`).join(", ")}\n`;
       } else {
         t += `생성 모드: 간단 (페르소나 논의 없음)\n`;
@@ -2282,7 +2290,7 @@ export default function App() {
     }
 
     // ★ 영역 9-E: 간단모드 전용 출력
-    if (minutes.mode === "simple" && minutes.simple) {
+    if (false) {  // 영역 11: 간단모드 TXT 분기 폐기
       const s = minutes.simple;
       t += `\n${"═".repeat(52)}\n📋 카테고리 분류 요약\n${"═".repeat(52)}\n`;
       t += `🔴 장기부동 ${s.counts.LONG_DOWNTIME} / 🔁 반복 ${s.counts.HIGH_FREQUENCY} / ⚙️ 조건변경 ${s.counts.CONDITION_CHANGE} / 🧪 테스트PM ${s.counts.TEST_PM} / 🟣 품질NG ${s.counts.QUALITY_NG}\n`;
@@ -2549,11 +2557,16 @@ export default function App() {
         parts.push(`분석 대상 일자: ${selDates.join(", ")}`);
       }
     }
-    if (priority) {
-      parts.push(`이슈 분류: 긴급 ${priority.urgent.length}건 / 중요 ${priority.important.length}건 / 일반 ${priority.normal.length}건`);
-      const top = [...priority.urgent, ...priority.important].slice(0, 15);
+    if (priority && Array.isArray(priority)) {
+      // 영역 11: priority는 평면 배열. tags로 분류 표시.
+      const longCount = priority.filter(i => (i.tags || []).includes("LONG_DOWNTIME")).length;
+      const freqCount = priority.filter(i => (i.tags || []).includes("HIGH_FREQUENCY")).length;
+      parts.push(`이슈 분류: 전체 ${priority.length}건 | 장기부동 ${longCount}건 / 반복 ${freqCount}건`);
+      const top = priority.filter(i =>
+        (i.tags || []).includes("LONG_DOWNTIME") || (i.tags || []).includes("HIGH_FREQUENCY")
+      ).slice(0, 15);
       if (top.length > 0) {
-        parts.push("\n[주요 이슈 목록 (상위 15건)]");
+        parts.push("\n[주요 이슈 목록 (상위 15건, tag 보유)]");
         top.forEach((d, i) => {
           parts.push(`${i+1}. [${d.date} ${d.time}] ${d.eq || "-"} | ${d.durMin}분 | Problem: ${d.prob || "-"} | Cause: ${d.cause || "-"} | Result: ${d.result || "-"}`);
         });
@@ -2735,7 +2748,7 @@ ${userText}
     setClassified(null); setPriority(null); setKbStats(null);
     setDiscussions([]); setMinutes(null); setProgress([]);
     setError(""); setSheetSaved(false); setReportType("meeting");
-    setReportMode("simple"); setTaggedIssues(null);
+    setTaggedIssues(null);
     setSelectedProcess("Cell"); setExtraAgents([]);
     // ★ 영역 6: 큐레이션 캐시 + 선택 상태 초기화
     setPreCuration(null); setPreCategoryMsgs(null);
@@ -2882,33 +2895,7 @@ ${userText}
               </div>
             )}
 
-            {/* ★ 영역 9-D: 보고서 모드 선택 (간단/상세) */}
-            <div style={{
-              background:"rgba(15,23,42,0.5)", border:"1px solid rgba(100,116,139,0.3)",
-              borderRadius:10, padding:"14px 16px", marginBottom:16,
-            }}>
-              <div style={{fontSize:11,color:"#cbd5e1",fontWeight:800,marginBottom:10}}>
-                📋 보고서 생성 방식
-              </div>
-              <div style={{display:"grid",gridTemplateColumns:"1fr 1fr",gap:10}}>
-                {[
-                  {id:"simple", icon:"📊", label:"간단 모드", desc:"표 형태 정리 보고서 (페르소나 논의 X). 빠르고 직관적, 비용 낮음.", color:"#34d399", bg:"rgba(52,211,153,0.12)"},
-                  {id:"detailed", icon:"🤖", label:"상세 모드", desc:"AI 페르소나 8명 논의 + 사회자 합의 (DEEP/STANDARD/LITE). 깊이 있지만 시간/비용 큼.", color:"#a78bfa", bg:"rgba(167,139,250,0.12)"},
-                ].map(m => (
-                  <button key={m.id} onClick={()=>setReportMode(m.id)} style={{
-                    padding:"12px 14px", textAlign:"left",
-                    background: reportMode===m.id ? m.bg : "rgba(20,30,50,0.5)",
-                    border:`2px solid ${reportMode===m.id ? m.color : "rgba(51,65,85,0.4)"}`,
-                    borderRadius:10, color: reportMode===m.id ? m.color : "#94a3b8",
-                    cursor:"pointer", transition:"all 0.2s",
-                  }}>
-                    <div style={{fontSize:20,marginBottom:4}}>{m.icon}</div>
-                    <div style={{fontSize:12,fontWeight:800,marginBottom:4}}>{m.label}</div>
-                    <div style={{fontSize:9,opacity:0.85,lineHeight:1.5}}>{m.desc}</div>
-                  </button>
-                ))}
-              </div>
-            </div>
+            {/* 영역 11: 모드 토글 폐기 (간단/상세 모드 폐기) */}
 
             <div style={{display:"flex",gap:10}}>
               <BackBtn onClick={()=>setStep(1)} label="← 날짜 선택"/>
@@ -2917,7 +2904,7 @@ ${userText}
                 background:"linear-gradient(135deg,#a78bfa,#7c3aed)",
                 border:"none", borderRadius:8, color:"#fff",
                 fontSize:13, fontWeight:800, cursor:"pointer",
-              }}>이슈 확인 →</button>
+              }}>이슈 브리핑 시작 →</button>
             </div>
           </div>
         )}
@@ -2927,7 +2914,10 @@ ${userText}
           <div>
             <div style={{marginBottom:14}}>
               <div style={{fontSize:17,fontWeight:800,color:"#f1f5f9",marginBottom:4}}>
-                {selDates.length > 1 ? `${selDates[0]} ~ ${selDates[selDates.length-1]}` : selDates[0]} 이슈 현황
+                AZS Factory 이슈 브리핑
+              </div>
+              <div style={{fontSize:11,color:"#94a3b8",lineHeight:1.6}}>
+                <strong style={{color:"#cbd5e1"}}>분석 기간:</strong> {buildProductionRangeLabel(selDates)}
               </div>
             </div>
 
@@ -3096,14 +3086,16 @@ ${userText}
               </div>
             )}
 
-            <div style={{display:"flex",gap:10,marginBottom:14}}>
+            <div style={{display:"flex",gap:8,marginBottom:14, flexWrap:"wrap"}}>
               {[
-                {label:"🔴 긴급",count:priority.urgent.length,color:"#ef4444",bg:"rgba(239,68,68,0.08)",border:"rgba(239,68,68,0.25)"},
-                {label:"🟡 중요",count:priority.important.length,color:"#f59e0b",bg:"rgba(245,158,11,0.08)",border:"rgba(245,158,11,0.25)"},
-                {label:"🟢 일반",count:priority.normal.length,color:"#22c55e",bg:"rgba(34,197,94,0.08)",border:"rgba(34,197,94,0.25)"},
+                {label:"🔴 장기부동",count:taggedIssues?.counts?.LONG_DOWNTIME || 0,color:"#ef4444",bg:"rgba(239,68,68,0.08)",border:"rgba(239,68,68,0.25)"},
+                {label:"🔁 반복",count:taggedIssues?.counts?.HIGH_FREQUENCY || 0,color:"#f59e0b",bg:"rgba(245,158,11,0.08)",border:"rgba(245,158,11,0.25)"},
+                {label:"⚙️ 조건변경",count:taggedIssues?.counts?.CONDITION_CHANGE || 0,color:"#34d399",bg:"rgba(52,211,153,0.08)",border:"rgba(52,211,153,0.25)"},
+                {label:"🧪 테스트/PM",count:taggedIssues?.counts?.TEST_PM || 0,color:"#22d3ee",bg:"rgba(34,211,238,0.08)",border:"rgba(34,211,238,0.25)"},
+                {label:"🟣 품질NG",count:taggedIssues?.counts?.QUALITY_NG || 0,color:"#a78bfa",bg:"rgba(167,139,250,0.08)",border:"rgba(167,139,250,0.25)"},
               ].map(p => (
                 <div key={p.label} style={{
-                  flex:1, background:p.bg, border:`1px solid ${p.border}`,
+                  flex:1, minWidth:90, background:p.bg, border:`1px solid ${p.border}`,
                   borderRadius:8, padding:"10px", textAlign:"center",
                 }}>
                   <div style={{fontSize:20,fontWeight:800,color:p.color}}>{p.count}</div>
@@ -3150,14 +3142,14 @@ ${userText}
               borderRadius:10, padding:"12px 14px", marginBottom:12,
             }}>
               <div style={{fontSize:10,color:"#a78bfa",fontWeight:800,marginBottom:8}}>
-                🔍 차등 논의 모드 (예상) · 참여 {PROCESSES[selectedProcess].auto.length + extraAgents.length}명
+                🔍 차등 논의 모드 안내 · 참여 {PROCESSES[selectedProcess].auto.length + extraAgents.length}명
               </div>
               <div style={{fontSize:11,color:"#cbd5e1",lineHeight:1.7}}>
-                🔴 DEEP: 긴급 {priority.urgent.length}건 (5섹션 풀 논의)<br/>
-                🟡 STANDARD: 중요 {priority.important.length}건 (액션 플랜)<br/>
-                🟢 LITE: 일반 최대 {Math.min(priority.normal.length, MAX_ISSUES)}건 (사회자 압축)<br/>
+                🔴 DEEP: 사용자 추가 또는 LONG_DOWNTIME tag → 5섹션 풀 논의<br/>
+                🟡 STANDARD: HIGH_FREQUENCY tag만 → 액션 플랜<br/>
+                🟢 LITE: 자동 분류 → 압축 평가<br/>
                 <span style={{color:"#a78bfa",fontWeight:800}}>
-                  총 {Math.min(priority.urgent.length + priority.important.length, MAX_ISSUES) + Math.min(priority.normal.length, MAX_ISSUES)}건 분석 예정
+                  체크박스로 선택한 이슈만 본문 논의 대상
                 </span>
               </div>
               <div style={{fontSize:9,color:"#475569",marginTop:6}}>
@@ -3179,124 +3171,60 @@ ${userText}
               </div>
             )}
 
-            {/* ★ 영역 6-C: 본문 논의 후보 목록 (긴급+중요 통합, 체크박스 + 자동선정 표시) */}
-            {!curating && (priority.urgent.length > 0 || priority.important.length > 0) && (() => {
-              // 긴급+중요 후보를 점수순으로 정렬해서 한 목록에 표시
-              const candidates = [...priority.urgent, ...priority.important];
-              const scored = candidates.map(issue => {
-                const s = scoreIssue(issue);
-                return { ...issue, score: s.total, scoreBreakdown: s.breakdown };
-              }).sort((a, b) => {
-                if (b.score !== a.score) return b.score - a.score;
-                return (b.durMin || 0) - (a.durMin || 0);
-              });
-              const total = scored.length;
-              const sel = selectedIssueIds.length;
-              return (
+            {/* ★ 영역 11-K: 이슈 브리핑 (HTML 1~5번) — 인라인 체크박스 통합 */}
+            {!curating && preCuration && taggedIssues && (
+              <div style={{marginBottom:14}}>
                 <div style={{
-                  background:"rgba(15,23,42,0.6)", border:"1px solid rgba(100,116,139,0.3)",
-                  borderRadius:10, padding:"12px 14px", marginBottom:12,
+                  display:"flex", alignItems:"center", justifyContent:"space-between",
+                  marginBottom:10, padding:"4px 0",
                 }}>
-                  <div style={{
-                    display:"flex", justifyContent:"space-between", alignItems:"center",
-                    marginBottom:8, paddingBottom:8, borderBottom:"1px solid rgba(51,65,85,0.4)",
-                  }}>
-                    <div style={{fontSize:11,color:"#cbd5e1",fontWeight:800}}>
-                      📋 본문 논의 후보 ({total}건) — 자동 선정 ⭐ 표시 / 체크박스로 자유 선택
-                    </div>
-                    <div style={{fontSize:10,color:"#22d3ee",fontWeight:700}}>
-                      선택 {sel}건 / {total}건
-                    </div>
+                  <div style={{fontSize:12,fontWeight:800,color:"#22d3ee"}}>
+                    📋 이슈 브리핑 — 본문에서 직접 체크하여 논의 대상 선정
                   </div>
-
-                  {/* 일괄 액션 버튼 */}
-                  <div style={{display:"flex",gap:6,marginBottom:8}}>
-                    <button onClick={()=>setSelectedIssueIds(scored.map(getIssueId))} style={{
-                      fontSize:9, padding:"3px 8px", borderRadius:4,
-                      background:"rgba(34,211,238,0.1)", border:"1px solid rgba(34,211,238,0.3)",
-                      color:"#22d3ee", cursor:"pointer", fontWeight:700,
-                    }}>전체 선택</button>
-                    <button onClick={()=>setSelectedIssueIds([])} style={{
-                      fontSize:9, padding:"3px 8px", borderRadius:4,
-                      background:"rgba(100,116,139,0.1)", border:"1px solid rgba(100,116,139,0.3)",
-                      color:"#94a3b8", cursor:"pointer", fontWeight:700,
-                    }}>전체 해제</button>
-                    <button onClick={()=>setSelectedIssueIds([...autoSelectedIds])} style={{
-                      fontSize:9, padding:"3px 8px", borderRadius:4,
-                      background:"rgba(245,158,11,0.1)", border:"1px solid rgba(245,158,11,0.3)",
-                      color:"#f59e0b", cursor:"pointer", fontWeight:700,
-                    }}>자동 선정만 (⭐)</button>
-                  </div>
-
-                  {/* 후보 목록 (스크롤) */}
-                  <div style={{maxHeight:360, overflowY:"auto"}}>
-                    {scored.map((d) => {
-                      const id = getIssueId(d);
-                      const isAuto = autoSelectedIds.includes(id);
-                      const isChecked = selectedIssueIds.includes(id);
-                      const isUrgent = priority.urgent.includes(d);
-                      const tagColor = isUrgent ? "#ef4444" : "#f59e0b";
-                      const tagLabel = isUrgent ? "🔴 긴급" : "🟡 중요";
-                      return (
-                        <label key={id} style={{
-                          display:"flex", alignItems:"flex-start", gap:8,
-                          padding:"8px 10px", marginBottom:4, borderRadius:6,
-                          background: isChecked ? "rgba(34,211,238,0.06)" : "rgba(15,23,42,0.4)",
-                          border:`1px solid ${isChecked ? "rgba(34,211,238,0.3)" : "rgba(51,65,85,0.3)"}`,
-                          cursor:"pointer",
-                        }}>
-                          <input type="checkbox" checked={isChecked}
-                            onChange={()=>toggleIssueSelection(id)}
-                            style={{marginTop:3, cursor:"pointer", accentColor:"#22d3ee"}}/>
-                          <div style={{flex:1, fontSize:10, lineHeight:1.5}}>
-                            <div style={{display:"flex",gap:6,alignItems:"center",flexWrap:"wrap",marginBottom:3}}>
-                              <span style={{
-                                fontSize:9, padding:"1px 6px", borderRadius:3,
-                                background:`${tagColor}22`, color:tagColor, fontWeight:700,
-                              }}>{tagLabel}</span>
-                              {isAuto && (
-                                <span style={{
-                                  fontSize:9, padding:"1px 6px", borderRadius:3,
-                                  background:"rgba(245,158,11,0.15)", color:"#fbbf24", fontWeight:700,
-                                }}>⭐ 자동선정</span>
-                              )}
-                              <span style={{color:"#94a3b8"}}>{d.date} {d.time}</span>
-                              <span style={{color:"#cbd5e1",fontWeight:700}}>{d.eq}</span>
-                              <span style={{color:"#94a3b8"}}>· {d.durMin}분</span>
-                              <span style={{
-                                marginLeft:"auto",
-                                fontSize:9, padding:"1px 6px", borderRadius:3,
-                                background:"rgba(34,211,238,0.1)", color:"#22d3ee", fontWeight:700,
-                              }}>점수 {d.score}</span>
-                            </div>
-                            {d.prob && d.prob !== "-" && (
-                              <div style={{color:"#cbd5e1",marginBottom:2}}>
-                                <span style={{color:"#64748b"}}>Problem:</span> {d.prob}
-                              </div>
-                            )}
-                            {d.cause && d.cause !== "-" && (
-                              <div style={{color:"#94a3b8",marginBottom:2}}>
-                                <span style={{color:"#64748b"}}>Cause:</span> {d.cause}
-                              </div>
-                            )}
-                            {d.result && d.result !== "-" && (
-                              <div style={{color:"#94a3b8",marginBottom:2}}>
-                                <span style={{color:"#64748b"}}>Result:</span> {d.result}
-                              </div>
-                            )}
-                            {d.reasons?.length > 0 && (
-                              <div style={{color:"#64748b",fontSize:9}}>
-                                ({d.reasons.join(", ")})
-                              </div>
-                            )}
-                          </div>
-                        </label>
-                      );
-                    })}
+                  <div style={{fontSize:10,color:"#22d3ee",fontWeight:700}}>
+                    선택 {selectedIssueIds.length}건 / 자동 {autoSelectedIds.length}건 / 전체 {(taggedIssues.issues || []).length}건
                   </div>
                 </div>
-              );
-            })()}
+
+                {/* 일괄 액션 버튼 */}
+                <div style={{display:"flex",gap:6,marginBottom:10, flexWrap:"wrap"}}>
+                  <button onClick={()=>setSelectedIssueIds((taggedIssues.issues || []).map(getIssueId))} style={{
+                    fontSize:9, padding:"3px 8px", borderRadius:4,
+                    background:"rgba(34,211,238,0.1)", border:"1px solid rgba(34,211,238,0.3)",
+                    color:"#22d3ee", cursor:"pointer", fontWeight:700,
+                  }}>전체 선택</button>
+                  <button onClick={()=>setSelectedIssueIds([])} style={{
+                    fontSize:9, padding:"3px 8px", borderRadius:4,
+                    background:"rgba(100,116,139,0.1)", border:"1px solid rgba(100,116,139,0.3)",
+                    color:"#94a3b8", cursor:"pointer", fontWeight:700,
+                  }}>전체 해제</button>
+                  <button onClick={()=>setSelectedIssueIds([...autoSelectedIds])} style={{
+                    fontSize:9, padding:"3px 8px", borderRadius:4,
+                    background:"rgba(245,158,11,0.1)", border:"1px solid rgba(245,158,11,0.3)",
+                    color:"#f59e0b", cursor:"pointer", fontWeight:700,
+                  }}>자동 선정만 (⭐)</button>
+                </div>
+
+                <BriefingDisplay
+                  curation={preCuration}
+                  allIssues={taggedIssues.issues || []}
+                  selectedIds={selectedIssueIds}
+                  autoSelectedIds={autoSelectedIds}
+                  onToggle={toggleIssueSelection}
+                  onToggleMany={(ids, shouldCheck) => {
+                    setSelectedIssueIds(prev => {
+                      if (shouldCheck) {
+                        const next = new Set(prev);
+                        ids.forEach(id => next.add(id));
+                        return Array.from(next);
+                      } else {
+                        return prev.filter(id => !ids.includes(id));
+                      }
+                    });
+                  }}
+                />
+              </div>
+            )}
 
             <div style={{
               background:"rgba(167,139,250,0.06)", border:"1px solid rgba(167,139,250,0.2)",
@@ -3453,10 +3381,10 @@ ${userText}
             </div>
 
             {/* ★ 영역 9-E: 간단 모드 — SimpleReport 컴포넌트 (페르소나 논의/큐레이션 박스/기존 보고서 모두 대체) */}
-            {minutes.mode === "simple" && <SimpleReport minutes={minutes}/>}
+            {/* 영역 11: 단일 흐름 — SimpleReport 비활성 */}
 
             {/* ★ PE 사전 큐레이션 (보고서 1부 - 전체 정리) — 상세 모드만 표시 */}
-            {minutes.mode !== "simple" && minutes.curation && (
+            {minutes.curation && (
               <div style={{
                 background:"rgba(15,23,42,0.7)",
                 border:"1px solid rgba(59,130,246,0.3)",
@@ -3632,7 +3560,7 @@ ${userText}
             )}
 
             {/* 모드별 분석 결과 — 상세 모드만 표시 */}
-            {minutes.mode !== "simple" && discussions.length > 0 && (
+            {discussions.length > 0 && (
               <div style={{marginBottom:16}}>
                 <div style={{
                   fontSize:12, fontWeight:800, color:"#f1f5f9", marginBottom:10,
@@ -3668,7 +3596,7 @@ ${userText}
             )}
 
             {/* 보고서 — 상세 모드만 표시 */}
-            {minutes.mode !== "simple" && (
+            {(
             <div style={{
               background:"rgba(248,250,252,0.97)", borderRadius:12,
               color:"#1e293b", padding:"28px 32px", marginBottom:14,
@@ -4291,227 +4219,599 @@ function DateRangePicker({ availableDates, selRange, onChange }) {
 }
 
 // ─── ★ 영역 9-E: 간단모드 보고서 컴포넌트 (명세서 §6 표 형태) ──────────────────
-function SimpleReport({ minutes }) {
-  const s = minutes.simple;
-  if (!s) return <div style={{color:"#ef4444"}}>간단모드 데이터 없음</div>;
+// ─── ★ 영역 11-D + 11-K: 이슈 브리핑 표시 컴포넌트 (HTML 레포트 1~5번 + 인라인 체크박스) ──────────
+// props:
+//   curation: PE 큐레이션 결과 (영역 11-C 스키마)
+//   allIssues: taggedIssues.issues (체크 매칭에 사용)
+//   selectedIds: 현재 체크된 이슈 ID 배열
+//   autoSelectedIds: 자동 선정 ID (⭐ 표시용)
+//   onToggle: (issueId) => void
+//   onToggleMany: (issueIds[], shouldCheck) => void  (그룹 일괄)
+function BriefingDisplay({ curation, allIssues = [], selectedIds = [], autoSelectedIds = [], onToggle, onToggleMany }) {
+  if (!curation) return null;
 
   const sectionStyle = {
-    background:"rgba(15,23,42,0.6)",
-    border:"1px solid rgba(100,116,139,0.25)",
+    background:"rgba(15,23,42,0.6)", border:"1px solid rgba(100,116,139,0.25)",
     borderRadius:10, padding:"14px 16px", marginBottom:14,
   };
-  const headingStyle = { fontSize:13, fontWeight:800, marginBottom:10, paddingBottom:6, borderBottom:"1px solid rgba(51,65,85,0.4)" };
+  const headingStyle = {
+    fontSize:13, fontWeight:800, marginBottom:10,
+    paddingBottom:6, borderBottom:"1px solid rgba(51,65,85,0.4)",
+  };
   const tableStyle = { width:"100%", fontSize:10.5, color:"#cbd5e1", borderCollapse:"collapse" };
-  const thStyle = { padding:"5px 8px", background:"rgba(51,65,85,0.4)", color:"#94a3b8", fontWeight:700, textAlign:"left", border:"1px solid rgba(51,65,85,0.4)" };
+  const thStyle = {
+    padding:"5px 8px", background:"rgba(51,65,85,0.4)",
+    color:"#94a3b8", fontWeight:700, textAlign:"left",
+    border:"1px solid rgba(51,65,85,0.4)",
+  };
   const tdStyle = { padding:"5px 8px", border:"1px solid rgba(51,65,85,0.3)", verticalAlign:"top" };
   const empty = (msg) => <div style={{fontSize:10,color:"#64748b",padding:"8px 0"}}>{msg}</div>;
 
+  // ─── 영역 11-K: 매칭/체크박스 헬퍼 ─────────────────────────────────────────
+  // 큐레이션 longDowntime[i] → 실제 allIssues에서 매칭되는 이슈 찾기
+  // 매칭 룰: equipment + (분 또는 시간 ±10분)
+  const findMatchingIssue = (curationItem) => {
+    if (!curationItem.equipment) return null;
+    const candidates = allIssues.filter(i => i.eq === curationItem.equipment);
+    if (candidates.length === 0) return null;
+    if (candidates.length === 1) return candidates[0];
+    // 부동시간으로 좁히기
+    if (curationItem.durationMin) {
+      const byDur = candidates.find(i => Math.abs((i.durMin || 0) - curationItem.durationMin) < 5);
+      if (byDur) return byDur;
+    }
+    // 가장 긴 부동 선택
+    return candidates.sort((a, b) => (b.durMin || 0) - (a.durMin || 0))[0];
+  };
+  // 카테고리/설비별 이슈 묶음 추출 — equipments 배열에서 STK 코드 파싱
+  const findIssuesByEquipmentList = (equipmentsList) => {
+    if (!Array.isArray(equipmentsList)) return [];
+    const eqCodes = equipmentsList.map(s => {
+      // "STK-1-A4(×2)" 또는 "STK-1-A4 (관련)" → "STK-1-A4"
+      const m = (s || "").match(/(STK[-\d\w]+|Cutter[\s\d\w()+\-]+)/i);
+      return m ? m[1].trim() : (s || "").split(/[\s(×]/)[0].trim();
+    }).filter(Boolean);
+    return allIssues.filter(i => i.eq && eqCodes.some(eq => i.eq.includes(eq) || eq.includes(i.eq)));
+  };
+  const findIssuesByEquipment = (equipment) => {
+    if (!equipment) return [];
+    return allIssues.filter(i => i.eq === equipment);
+  };
+  // 그룹 체크 상태 계산 (all/none/partial)
+  const groupCheckState = (issueIds) => {
+    if (issueIds.length === 0) return "none";
+    const checked = issueIds.filter(id => selectedIds.includes(id)).length;
+    if (checked === 0) return "none";
+    if (checked === issueIds.length) return "all";
+    return "partial";
+  };
+  // 인라인 체크박스 렌더 (이슈 1건)
+  const IssueCheckbox = ({ issue, label = null, compact = false }) => {
+    if (!issue || !onToggle) return null;
+    const id = getIssueId(issue);
+    const checked = selectedIds.includes(id);
+    const isAuto = autoSelectedIds.includes(id);
+    return (
+      <label style={{
+        display:"inline-flex", alignItems:"center", gap:6, cursor:"pointer",
+        padding: compact ? "0" : "2px 4px", borderRadius:4,
+        background: checked ? "rgba(34,211,238,0.08)" : "transparent",
+      }}>
+        <input type="checkbox" checked={checked}
+          onChange={() => onToggle(id)}
+          style={{cursor:"pointer", accentColor:"#22d3ee", margin:0}}/>
+        {isAuto && <span style={{fontSize:10,color:"#fbbf24",fontWeight:700}}>⭐</span>}
+        {label && <span style={{fontSize:10,color: checked ? "#22d3ee" : "#94a3b8"}}>{label}</span>}
+      </label>
+    );
+  };
+  // 그룹 헤더 체크박스 (3-state)
+  const GroupCheckbox = ({ issueIds, label = null }) => {
+    if (issueIds.length === 0 || !onToggleMany) return null;
+    const state = groupCheckState(issueIds);
+    return (
+      <label style={{display:"inline-flex", alignItems:"center", gap:6, cursor:"pointer"}}>
+        <input
+          type="checkbox"
+          checked={state === "all"}
+          ref={el => { if (el) el.indeterminate = state === "partial"; }}
+          onChange={() => onToggleMany(issueIds, state !== "all")}
+          style={{cursor:"pointer", accentColor:"#22d3ee", margin:0}}/>
+        {label && <span style={{fontSize:10,color: state === "all" ? "#22d3ee" : "#94a3b8"}}>{label}</span>}
+      </label>
+    );
+  };
+  // 펼침 토글 state
+  const [expandedGroups, setExpandedGroups] = useState({});
+  const [showShortDowntime, setShowShortDowntime] = useState(false);
+  const toggleGroup = (key) => setExpandedGroups(prev => ({ ...prev, [key]: !prev[key] }));
+
+  // 1번에 표시되지 않은 짧은 부동 이슈 (펼침 영역용)
+  const longDowntimeMatched = (curation.longDowntime || []).map(findMatchingIssue).filter(Boolean);
+  const longDowntimeIds = longDowntimeMatched.map(getIssueId);
+  const shortDowntimeIssues = allIssues.filter(i => !longDowntimeIds.includes(getIssueId(i)));
+
   return (
     <div>
-      {/* 카테고리 카운트 요약 */}
-      <div style={{...sectionStyle, padding:"12px 16px"}}>
-        <div style={{fontSize:11,color:"#94a3b8",fontWeight:700,marginBottom:8}}>📋 카테고리 분류 요약</div>
-        <div style={{display:"flex",gap:8,flexWrap:"wrap"}}>
-          {[
-            {label:"🔴 장기부동", count:s.counts.LONG_DOWNTIME, color:"#ef4444", bg:"rgba(239,68,68,0.1)"},
-            {label:"🔁 반복", count:s.counts.HIGH_FREQUENCY, color:"#f59e0b", bg:"rgba(245,158,11,0.1)"},
-            {label:"⚙️ 조건변경", count:s.counts.CONDITION_CHANGE, color:"#34d399", bg:"rgba(52,211,153,0.1)"},
-            {label:"🧪 테스트/PM", count:s.counts.TEST_PM, color:"#22d3ee", bg:"rgba(34,211,238,0.1)"},
-            {label:"🟣 품질NG", count:s.counts.QUALITY_NG, color:"#a78bfa", bg:"rgba(167,139,250,0.1)"},
-          ].map(c => (
-            <div key={c.label} style={{padding:"6px 12px",background:c.bg,border:`1px solid ${c.color}33`,borderRadius:6,fontSize:11,color:c.color,fontWeight:700}}>
-              {c.label}: <span style={{fontSize:14}}>{c.count}</span>
+      {/* 0. 핵심 요약 박스 (TL;DR) */}
+      {(curation.criticalSummary?.length > 0 || curation.summary_text) && (
+        <div style={{
+          background:"rgba(167,139,250,0.06)",
+          border:"2px solid rgba(167,139,250,0.3)",
+          borderRadius:10, padding:"14px 18px", marginBottom:14,
+        }}>
+          <div style={{fontSize:13,fontWeight:800,color:"#a78bfa",marginBottom:8}}>
+            📋 핵심 요약
+          </div>
+          {curation.summary_text && (
+            <div style={{fontSize:11,color:"#cbd5e1",marginBottom:8,fontStyle:"italic",lineHeight:1.6}}>
+              {curation.summary_text}
             </div>
-          ))}
-        </div>
-      </div>
-
-      {/* 1. 일별 부동 현황 */}
-      <div style={sectionStyle}>
-        <div style={{...headingStyle,color:"#22d3ee"}}>📊 일별 부동 현황</div>
-        {s.dailyOverview.length === 0 ? empty("데이터 없음") : (
-          <table style={tableStyle}>
-            <thead><tr><th style={thStyle}>날짜</th><th style={{...thStyle,textAlign:"right"}}>이벤트 수</th><th style={{...thStyle,textAlign:"right"}}>총 부동시간(분)</th></tr></thead>
-            <tbody>
-              {s.dailyOverview.map(d => (
-                <tr key={d.date}><td style={tdStyle}>{d.date}</td><td style={{...tdStyle,textAlign:"right"}}>{d.count}</td><td style={{...tdStyle,textAlign:"right",fontWeight:d.totalMin>=120?700:400,color:d.totalMin>=120?"#fca5a5":"#cbd5e1"}}>{d.totalMin}</td></tr>
+          )}
+          {curation.criticalSummary?.length > 0 && (
+            <ul style={{margin:"6px 0 0 0",paddingLeft:18,fontSize:11,color:"#cbd5e1",lineHeight:1.7}}>
+              {curation.criticalSummary.map((item, i) => (
+                <li key={i} style={{marginBottom:3}}>{item}</li>
               ))}
-              <tr style={{background:"rgba(34,211,238,0.08)"}}>
-                <td style={{...tdStyle,fontWeight:800,color:"#22d3ee"}}>합계</td>
-                <td style={{...tdStyle,textAlign:"right",fontWeight:800,color:"#22d3ee"}}>{s.dailyOverview.reduce((a,b)=>a+b.count,0)}</td>
-                <td style={{...tdStyle,textAlign:"right",fontWeight:800,color:"#22d3ee"}}>{s.dailyOverview.reduce((a,b)=>a+b.totalMin,0)}</td>
-              </tr>
-            </tbody>
-          </table>
-        )}
-      </div>
-
-      {/* 2. 장기부동 */}
-      <div style={sectionStyle}>
-        <div style={{...headingStyle,color:"#ef4444"}}>🔴 장기부동 ({s.threshold}분 이상)</div>
-        {s.longDowntime.length === 0 ? empty(`${s.threshold}분 이상 부동 이슈 없음`) : (
-          <table style={tableStyle}>
-            <thead><tr><th style={thStyle}>날짜/시간</th><th style={thStyle}>설비</th><th style={{...thStyle,textAlign:"right"}}>부동(분)</th><th style={{...thStyle,textAlign:"right"}}>점수</th><th style={thStyle}>문제</th><th style={thStyle}>조치</th></tr></thead>
-            <tbody>
-              {s.longDowntime.map((i, idx) => (
-                <tr key={idx}>
-                  <td style={tdStyle}>{i.date} {i.time}</td>
-                  <td style={{...tdStyle,fontFamily:"monospace",color:"#fcd34d",fontWeight:700}}>{i.eq || "-"}</td>
-                  <td style={{...tdStyle,textAlign:"right",fontWeight:700,color:i.durMin>=60?"#ef4444":"#f59e0b"}}>{i.durMin || "-"}</td>
-                  <td style={{...tdStyle,textAlign:"right",color:"#22d3ee",fontWeight:700}}>{i.score}</td>
-                  <td style={tdStyle}>{(i.prob || "-").slice(0,80)}</td>
-                  <td style={tdStyle}>{(i.result || "-").slice(0,60)}</td>
-                </tr>
-              ))}
-            </tbody>
-          </table>
-        )}
-      </div>
-
-      {/* 3. 반복 (3축) */}
-      <div style={sectionStyle}>
-        <div style={{...headingStyle,color:"#f59e0b"}}>🔁 반복 발생</div>
-
-        <div style={{marginBottom:10}}>
-          <div style={{fontSize:11,fontWeight:700,color:"#fcd34d",marginBottom:6}}>설비별 TOP {s.eqRanked.length}</div>
-          {s.eqRanked.length === 0 ? empty("2회 이상 반복된 설비 없음") : (
-            <table style={tableStyle}>
-              <thead><tr><th style={thStyle}>설비</th><th style={{...thStyle,textAlign:"right"}}>발생 횟수</th></tr></thead>
-              <tbody>
-                {s.eqRanked.map(e => (
-                  <tr key={e.equipment}>
-                    <td style={{...tdStyle,fontFamily:"monospace",color:"#fcd34d"}}>{e.equipment}</td>
-                    <td style={{...tdStyle,textAlign:"right",fontWeight:700,color:e.count>=4?"#ef4444":"#f59e0b"}}>{e.count}</td>
-                  </tr>
-                ))}
-              </tbody>
-            </table>
+            </ul>
           )}
         </div>
+      )}
 
-        <div style={{marginBottom:10}}>
-          <div style={{fontSize:11,fontWeight:700,color:"#fcd34d",marginBottom:6}}>알람별 TOP {s.alarmRanked.length}</div>
-          {s.alarmRanked.length === 0 ? empty("2회 이상 반복된 알람 없음") : (
-            <table style={tableStyle}>
-              <thead><tr><th style={thStyle}>알람</th><th style={{...thStyle,textAlign:"right"}}>횟수</th></tr></thead>
-              <tbody>
-                {s.alarmRanked.map((a, idx) => (
-                  <tr key={idx}>
-                    <td style={{...tdStyle,fontSize:10}}>{a.alarm.slice(0, 90)}</td>
-                    <td style={{...tdStyle,textAlign:"right",fontWeight:700,color:a.count>=5?"#ef4444":"#f59e0b"}}>{a.count}</td>
-                  </tr>
-                ))}
-              </tbody>
-            </table>
-          )}
-        </div>
-
-        {s.causeCategoryRanked.length > 0 && (
+      {/* 1. 장기부동 상세 */}
+      <div style={sectionStyle}>
+        <div style={{...headingStyle,color:"#ef4444"}}>🚨 1. 장기부동 건 — 상세</div>
+        {(!curation.longDowntime || curation.longDowntime.length === 0) ? empty("장기부동 이슈 없음") : (
           <div>
-            <div style={{fontSize:11,fontWeight:700,color:"#fcd34d",marginBottom:6}}>원인 카테고리</div>
+            {curation.longDowntime.map((d, idx) => {
+              const isTop = d.isTop;
+              const matchedIssue = findMatchingIssue(d);
+              return (
+                <div key={idx} style={{
+                  background: isTop ? "rgba(239,68,68,0.08)" : "rgba(245,158,11,0.06)",
+                  border:`1px solid ${isTop ? "#ef4444" : "#f59e0b"}33`,
+                  borderLeft:`5px solid ${isTop ? "#ef4444" : "#f59e0b"}`,
+                  borderRadius:6, padding:"10px 14px", marginBottom:10,
+                }}>
+                  <div style={{
+                    display:"flex", alignItems:"center", gap:10,
+                    marginBottom:6,
+                  }}>
+                    {matchedIssue && (
+                      <IssueCheckbox issue={matchedIssue} compact={true}/>
+                    )}
+                    <div style={{fontSize:12,fontWeight:800,color:isTop?"#ef4444":"#f59e0b",flex:1}}>
+                      {isTop ? "🔴 [TOP] " : "🔴 "}{d.title || `${d.equipment} (${d.durationMin}분)`}
+                    </div>
+                    {matchedIssue && autoSelectedIds.includes(getIssueId(matchedIssue)) && (
+                      <span style={{fontSize:9,padding:"1px 6px",borderRadius:3,
+                        background:"rgba(245,158,11,0.15)",color:"#fbbf24",fontWeight:700}}>⭐ 자동선정</span>
+                    )}
+                  </div>
+                  <table style={{...tableStyle, fontSize:10.5}}>
+                    <tbody>
+                      {d.occurrence && <tr><th style={{...thStyle,width:"22%"}}>발생</th><td style={tdStyle}>{d.occurrence}</td></tr>}
+                      {d.alarm && <tr><th style={thStyle}>알람</th><td style={{...tdStyle,fontFamily:"monospace",fontSize:9.5}}>{d.alarm}</td></tr>}
+                      {d.splitNote && <tr><th style={thStyle}>보고 형태</th><td style={{...tdStyle,color:"#fcd34d"}}>{d.splitNote}</td></tr>}
+                      {d.rootCause && <tr><th style={thStyle}>근본 원인</th><td style={{...tdStyle,fontWeight:700,color:"#fca5a5"}}>{d.rootCause}</td></tr>}
+                      {d.partReplaced && <tr><th style={thStyle}>부품 교체</th><td style={{...tdStyle,fontWeight:700}}>{d.partReplaced}</td></tr>}
+                      {d.pic && <tr><th style={thStyle}>PIC</th><td style={tdStyle}>{d.pic}</td></tr>}
+                      {d.result && <tr><th style={thStyle}>결과</th><td style={{...tdStyle,color:d.result.toLowerCase().includes("solved")?"#34d399":"#fbbf24"}}>{d.result}</td></tr>}
+                    </tbody>
+                  </table>
+                  {d.actionSequence?.length > 0 && (
+                    <div style={{marginTop:10}}>
+                      <div style={{fontSize:11,fontWeight:700,color:"#94a3b8",marginBottom:4}}>
+                        적용 조치 ({d.actionSequence.length}단계)
+                      </div>
+                      <ol style={{margin:0,paddingLeft:18,fontSize:10,color:"#cbd5e1",lineHeight:1.6}}>
+                        {d.actionSequence.map((step, si) => (
+                          <li key={si} style={{marginBottom:2}}>{step}</li>
+                        ))}
+                      </ol>
+                    </div>
+                  )}
+                </div>
+              );
+            })}
+          </div>
+        )}
+
+        {/* 영역 11-K: 짧은 부동 이슈 펼침 영역 (1번 섹션 안) */}
+        {shortDowntimeIssues.length > 0 && (
+          <div style={{marginTop:10, paddingTop:10, borderTop:"1px dashed rgba(100,116,139,0.3)"}}>
+            <button onClick={() => setShowShortDowntime(!showShortDowntime)} style={{
+              fontSize:10, padding:"5px 10px", borderRadius:5,
+              background:"rgba(100,116,139,0.1)", border:"1px solid rgba(100,116,139,0.3)",
+              color:"#94a3b8", cursor:"pointer", fontWeight:700,
+            }}>
+              {showShortDowntime ? "▼" : "▶"} 기타 짧은 부동 이슈 ({shortDowntimeIssues.length}건) — 추가 논의 후보
+            </button>
+            {showShortDowntime && (
+              <div style={{marginTop:8, maxHeight:240, overflowY:"auto"}}>
+                {shortDowntimeIssues.map((i) => {
+                  const id = getIssueId(i);
+                  const checked = selectedIds.includes(id);
+                  return (
+                    <label key={id} style={{
+                      display:"flex", alignItems:"flex-start", gap:8,
+                      padding:"6px 8px", marginBottom:3, borderRadius:5,
+                      background: checked ? "rgba(34,211,238,0.05)" : "rgba(15,23,42,0.3)",
+                      border:`1px solid ${checked ? "rgba(34,211,238,0.25)" : "rgba(51,65,85,0.25)"}`,
+                      cursor:"pointer", fontSize:10,
+                    }}>
+                      <input type="checkbox" checked={checked}
+                        onChange={() => onToggle(id)}
+                        style={{marginTop:2, cursor:"pointer", accentColor:"#22d3ee"}}/>
+                      <div style={{flex:1, lineHeight:1.5}}>
+                        <span style={{color:"#94a3b8"}}>{i.date} {i.time}</span>
+                        {" · "}
+                        <span style={{color:"#cbd5e1",fontWeight:700,fontFamily:"monospace"}}>{i.eq || "-"}</span>
+                        {" · "}
+                        <span style={{color:"#94a3b8"}}>{i.durMin}분</span>
+                        {i.prob && <div style={{color:"#cbd5e1",fontSize:9.5}}>{i.prob.slice(0, 80)}</div>}
+                      </div>
+                    </label>
+                  );
+                })}
+              </div>
+            )}
+          </div>
+        )}
+      </div>
+
+      {/* 2. 발생빈도 — 영역 11-K: 그룹 헤더 체크박스 + 펼침 시 개별 체크박스 */}
+      <div style={sectionStyle}>
+        <div style={{...headingStyle,color:"#f59e0b"}}>🔁 2. 발생빈도 높은 이슈</div>
+
+        {/* 카테고리별 */}
+        <div style={{marginBottom:14}}>
+          <div style={{fontSize:11,fontWeight:700,color:"#fcd34d",marginBottom:6}}>카테고리별</div>
+          {(!curation.recurringByCategory || curation.recurringByCategory.length === 0) ? empty("반복 카테고리 없음") : (
+            <div>
+              {curation.recurringByCategory.map((c, i) => {
+                const groupKey = `cat-${i}`;
+                const groupIssues = findIssuesByEquipmentList(c.equipments);
+                const groupIds = groupIssues.map(getIssueId);
+                const expanded = expandedGroups[groupKey];
+                const state = groupCheckState(groupIds);
+                return (
+                  <div key={i} style={{
+                    marginBottom:4,
+                    border:"1px solid rgba(51,65,85,0.3)", borderRadius:5,
+                    background: state === "all" ? "rgba(34,211,238,0.04)" : "rgba(15,23,42,0.4)",
+                  }}>
+                    {/* 헤더 행 */}
+                    <div style={{
+                      display:"flex", alignItems:"center", gap:8,
+                      padding:"6px 10px",
+                    }}>
+                      <GroupCheckbox issueIds={groupIds}/>
+                      <button onClick={() => toggleGroup(groupKey)} style={{
+                        background:"transparent", border:"none", cursor:"pointer",
+                        color:"#94a3b8", fontSize:10, padding:"0 4px",
+                      }}>{expanded ? "▼" : "▶"}</button>
+                      <div style={{flex:1, fontSize:10.5, fontWeight:700, color:"#cbd5e1"}}>
+                        {c.category}
+                      </div>
+                      <span style={{
+                        fontSize:10, fontWeight:700,
+                        color:c.count>=3?"#ef4444":"#f59e0b",
+                      }}>{c.count}건</span>
+                      <span style={{fontSize:9, color:"#64748b", fontFamily:"monospace", maxWidth:280, overflow:"hidden", textOverflow:"ellipsis", whiteSpace:"nowrap"}}>
+                        {(c.equipments || []).join(", ")}
+                      </span>
+                    </div>
+                    {/* 펼침 시 개별 이슈 */}
+                    {expanded && groupIssues.length > 0 && (
+                      <div style={{padding:"4px 10px 8px 32px"}}>
+                        {groupIssues.map(iss => {
+                          const id = getIssueId(iss);
+                          const checked = selectedIds.includes(id);
+                          const isAuto = autoSelectedIds.includes(id);
+                          return (
+                            <label key={id} style={{
+                              display:"flex", alignItems:"flex-start", gap:6,
+                              padding:"3px 4px", marginBottom:2, fontSize:9.5,
+                              color:checked ? "#cbd5e1" : "#94a3b8",
+                              cursor:"pointer",
+                            }}>
+                              <input type="checkbox" checked={checked}
+                                onChange={() => onToggle(id)}
+                                style={{cursor:"pointer", accentColor:"#22d3ee", margin:"2px 0"}}/>
+                              {isAuto && <span style={{color:"#fbbf24",fontWeight:700}}>⭐</span>}
+                              <span style={{flex:1}}>
+                                <span style={{fontFamily:"monospace",fontWeight:700}}>{iss.eq || "-"}</span>
+                                {" · "}{iss.date} {iss.time}
+                                {" · "}{iss.durMin}분
+                                {iss.prob && <span style={{color:"#64748b"}}> — {iss.prob.slice(0, 50)}</span>}
+                              </span>
+                            </label>
+                          );
+                        })}
+                      </div>
+                    )}
+                  </div>
+                );
+              })}
+            </div>
+          )}
+        </div>
+
+        {/* 동일 설비 다발 */}
+        {curation.recurringSameEquipment?.length > 0 && (
+          <div>
+            <div style={{fontSize:11,fontWeight:700,color:"#fcd34d",marginBottom:6}}>동일 설비 다발</div>
+            <div>
+              {curation.recurringSameEquipment.map((e, i) => {
+                const groupKey = `eq-${i}`;
+                const groupIssues = findIssuesByEquipment(e.equipment);
+                const groupIds = groupIssues.map(getIssueId);
+                const expanded = expandedGroups[groupKey];
+                const state = groupCheckState(groupIds);
+                return (
+                  <div key={i} style={{
+                    marginBottom:4,
+                    border:"1px solid rgba(51,65,85,0.3)", borderRadius:5,
+                    background: state === "all" ? "rgba(34,211,238,0.04)" : "rgba(15,23,42,0.4)",
+                  }}>
+                    <div style={{display:"flex", alignItems:"center", gap:8, padding:"6px 10px"}}>
+                      <GroupCheckbox issueIds={groupIds}/>
+                      <button onClick={() => toggleGroup(groupKey)} style={{
+                        background:"transparent", border:"none", cursor:"pointer",
+                        color:"#94a3b8", fontSize:10, padding:"0 4px",
+                      }}>{expanded ? "▼" : "▶"}</button>
+                      <span style={{fontFamily:"monospace",fontWeight:700,color:"#fcd34d", fontSize:10.5}}>{e.equipment}</span>
+                      <span style={{fontSize:10, color:"#cbd5e1", flex:1}}>
+                        {": "}{e.count}건{e.detail ? ` — ${e.detail}` : ""}
+                      </span>
+                    </div>
+                    {expanded && groupIssues.length > 0 && (
+                      <div style={{padding:"4px 10px 8px 32px"}}>
+                        {groupIssues.map(iss => {
+                          const id = getIssueId(iss);
+                          const checked = selectedIds.includes(id);
+                          const isAuto = autoSelectedIds.includes(id);
+                          return (
+                            <label key={id} style={{
+                              display:"flex", alignItems:"flex-start", gap:6,
+                              padding:"3px 4px", marginBottom:2, fontSize:9.5,
+                              color:checked ? "#cbd5e1" : "#94a3b8", cursor:"pointer",
+                            }}>
+                              <input type="checkbox" checked={checked}
+                                onChange={() => onToggle(id)}
+                                style={{cursor:"pointer", accentColor:"#22d3ee", margin:"2px 0"}}/>
+                              {isAuto && <span style={{color:"#fbbf24",fontWeight:700}}>⭐</span>}
+                              <span style={{flex:1}}>
+                                {iss.date} {iss.time} · {iss.durMin}분
+                                {iss.prob && <span style={{color:"#64748b"}}> — {iss.prob.slice(0, 60)}</span>}
+                              </span>
+                            </label>
+                          );
+                        })}
+                      </div>
+                    )}
+                  </div>
+                );
+              })}
+            </div>
+          </div>
+        )}
+      </div>
+
+      {/* 3. 조건 변경 */}
+      <div style={sectionStyle}>
+        <div style={{...headingStyle,color:"#34d399"}}>⚙️ 3. 설비/공정 조건 변경</div>
+
+        {curation.conditionChanges?.visionOffset?.length > 0 && (
+          <div style={{marginBottom:10}}>
+            <div style={{fontSize:11,fontWeight:700,color:"#86efac",marginBottom:6}}>Vision Offset 적용</div>
             <table style={tableStyle}>
-              <thead><tr><th style={thStyle}>카테고리</th><th style={{...thStyle,textAlign:"right"}}>횟수</th></tr></thead>
+              <thead><tr><th style={thStyle}>시간</th><th style={thStyle}>설비</th><th style={thStyle}>변경 내용</th><th style={thStyle}>사유</th></tr></thead>
               <tbody>
-                {s.causeCategoryRanked.map(c => (
-                  <tr key={c.category}>
-                    <td style={tdStyle}>{c.category}</td>
-                    <td style={{...tdStyle,textAlign:"right",fontWeight:700}}>{c.count}</td>
+                {curation.conditionChanges.visionOffset.map((c, i) => (
+                  <tr key={i}>
+                    <td style={tdStyle}>{c.date} {c.time}</td>
+                    <td style={{...tdStyle,fontWeight:700,fontFamily:"monospace"}}>{c.equipment}</td>
+                    <td style={tdStyle}>{c.change}</td>
+                    <td style={tdStyle}>{c.reason || "-"}</td>
                   </tr>
                 ))}
               </tbody>
             </table>
           </div>
         )}
+
+        {curation.conditionChanges?.settingChange?.length > 0 && (
+          <div style={{marginBottom:10}}>
+            <div style={{fontSize:11,fontWeight:700,color:"#86efac",marginBottom:6}}>Setting 변경 (Before → After)</div>
+            <table style={tableStyle}>
+              <thead><tr><th style={thStyle}>설비</th><th style={thStyle}>파라미터</th><th style={thStyle}>Before → After</th></tr></thead>
+              <tbody>
+                {curation.conditionChanges.settingChange.map((s, i) => (
+                  <tr key={i}>
+                    <td style={{...tdStyle,fontFamily:"monospace"}}>{s.equipment || "-"}</td>
+                    <td style={tdStyle}>{s.parameter}</td>
+                    <td style={tdStyle}>{s.before} → <strong style={{color:"#34d399"}}>{s.after}</strong></td>
+                  </tr>
+                ))}
+              </tbody>
+            </table>
+          </div>
+        )}
+
+        {curation.conditionChanges?.cutter?.length > 0 && (
+          <div style={{marginBottom:10}}>
+            <div style={{fontSize:11,fontWeight:700,color:"#86efac",marginBottom:6}}>Cutter 조정</div>
+            <table style={tableStyle}>
+              <thead><tr><th style={thStyle}>시간</th><th style={thStyle}>설비</th><th style={thStyle}>변경 내용</th></tr></thead>
+              <tbody>
+                {curation.conditionChanges.cutter.map((c, i) => (
+                  <tr key={i}>
+                    <td style={tdStyle}>{c.date} {c.time}</td>
+                    <td style={{...tdStyle,fontFamily:"monospace"}}>{c.equipment}</td>
+                    <td style={tdStyle}>{c.change}</td>
+                  </tr>
+                ))}
+              </tbody>
+            </table>
+          </div>
+        )}
+
+        {curation.conditionChanges?.other?.length > 0 && (
+          <div>
+            <div style={{fontSize:11,fontWeight:700,color:"#86efac",marginBottom:6}}>기타</div>
+            <table style={tableStyle}>
+              <thead><tr><th style={thStyle}>날짜</th><th style={thStyle}>설비</th><th style={thStyle}>변경 내용</th><th style={thStyle}>담당</th></tr></thead>
+              <tbody>
+                {curation.conditionChanges.other.map((c, i) => (
+                  <tr key={i}>
+                    <td style={tdStyle}>{c.date}</td>
+                    <td style={{...tdStyle,fontFamily:"monospace"}}>{c.equipment}</td>
+                    <td style={tdStyle}>{c.change}</td>
+                    <td style={tdStyle}>{c.pic || "-"}</td>
+                  </tr>
+                ))}
+              </tbody>
+            </table>
+          </div>
+        )}
+
+        {(!curation.conditionChanges ||
+          (!curation.conditionChanges.visionOffset?.length &&
+           !curation.conditionChanges.settingChange?.length &&
+           !curation.conditionChanges.cutter?.length &&
+           !curation.conditionChanges.other?.length)) && empty("조건 변경 없음")}
       </div>
 
-      {/* 4. 조건 변경 */}
+      {/* 4. 테스트/PM */}
       <div style={sectionStyle}>
-        <div style={{...headingStyle,color:"#34d399"}}>⚙️ 설비/공정 조건 변경 ({s.conditionChanges.length}건)</div>
-        {s.conditionChanges.length === 0 ? empty("관련 메시지 없음") : (
-          <table style={tableStyle}>
-            <thead><tr><th style={thStyle}>날짜/시간</th><th style={thStyle}>변경 내용</th><th style={thStyle}>담당</th></tr></thead>
-            <tbody>
-              {s.conditionChanges.map((c, idx) => (
-                <tr key={idx}>
-                  <td style={tdStyle}>{c.date} {c.time}</td>
-                  <td style={tdStyle}>{(c.item || "").slice(0, 100)}</td>
-                  <td style={tdStyle}>{c.who || "-"}</td>
-                </tr>
+        <div style={{...headingStyle,color:"#22d3ee"}}>🧪 4. 테스트 / PM 활동</div>
+
+        {curation.testPm?.linePM?.length > 0 && (
+          <div style={{marginBottom:10}}>
+            <div style={{fontSize:11,fontWeight:700,color:"#7dd3fc",marginBottom:6}}>Line PM 계획</div>
+            <table style={tableStyle}>
+              <thead><tr><th style={thStyle}>일자</th><th style={thStyle}>라인</th><th style={thStyle}>상태</th></tr></thead>
+              <tbody>
+                {curation.testPm.linePM.map((p, i) => (
+                  <tr key={i}>
+                    <td style={tdStyle}>{p.date}</td>
+                    <td style={{...tdStyle,fontWeight:700}}>{p.line}</td>
+                    <td style={tdStyle}>{p.status}</td>
+                  </tr>
+                ))}
+              </tbody>
+            </table>
+          </div>
+        )}
+
+        {curation.testPm?.fmvs?.length > 0 && (
+          <div style={{marginBottom:10}}>
+            <div style={{fontSize:11,fontWeight:700,color:"#7dd3fc",marginBottom:6}}>FMVS (Vision Camera)</div>
+            <table style={tableStyle}>
+              <thead><tr><th style={thStyle}>일자</th><th style={thStyle}>작업</th><th style={thStyle}>대상 설비</th></tr></thead>
+              <tbody>
+                {curation.testPm.fmvs.map((f, i) => (
+                  <tr key={i}>
+                    <td style={tdStyle}>{f.date}</td>
+                    <td style={tdStyle}>{f.action}</td>
+                    <td style={{...tdStyle,fontSize:9.5}}>{f.equipments}</td>
+                  </tr>
+                ))}
+              </tbody>
+            </table>
+          </div>
+        )}
+
+        {curation.testPm?.cutter?.length > 0 && (
+          <div style={{marginBottom:10}}>
+            <div style={{fontSize:11,fontWeight:700,color:"#7dd3fc",marginBottom:6}}>Cutter 테스트</div>
+            <table style={tableStyle}>
+              <thead><tr><th style={thStyle}>시간</th><th style={thStyle}>항목</th><th style={thStyle}>결과</th></tr></thead>
+              <tbody>
+                {curation.testPm.cutter.map((c, i) => (
+                  <tr key={i}>
+                    <td style={tdStyle}>{c.date} {c.time}</td>
+                    <td style={tdStyle}>{c.item}</td>
+                    <td style={tdStyle}>
+                      <span style={{
+                        fontSize:14,
+                        color: c.resultIcon === "✅" ? "#34d399" :
+                               c.resultIcon === "❌" ? "#ef4444" : "#fbbf24",
+                      }}>{c.resultIcon}</span>
+                      {" "}{c.note}
+                    </td>
+                  </tr>
+                ))}
+              </tbody>
+            </table>
+          </div>
+        )}
+
+        {curation.testPm?.stackingSepa?.length > 0 && (
+          <div>
+            <div style={{fontSize:11,fontWeight:700,color:"#7dd3fc",marginBottom:6}}>Stacking Sepa Run 문제</div>
+            <ul style={{margin:0,paddingLeft:18,fontSize:10.5,color:"#cbd5e1",lineHeight:1.7}}>
+              {curation.testPm.stackingSepa.map((s, i) => (
+                <li key={i} style={{marginBottom:2}}>
+                  <span style={{fontWeight:700,fontFamily:"monospace"}}>{s.date} {s.equipment}</span>
+                  {": "}{s.issue}{" "}
+                  <span style={{color:"#ef4444"}}>{s.resultIcon}</span>
+                </li>
               ))}
-            </tbody>
-          </table>
+            </ul>
+          </div>
+        )}
+
+        {(!curation.testPm ||
+          (!curation.testPm.linePM?.length &&
+           !curation.testPm.fmvs?.length &&
+           !curation.testPm.cutter?.length &&
+           !curation.testPm.stackingSepa?.length)) && empty("테스트/PM 활동 없음")}
+      </div>
+
+      {/* 5. NG 품질 실적 */}
+      <div style={sectionStyle}>
+        <div style={{...headingStyle,color:"#a78bfa"}}>📊 5. 일일 NG 품질 실적</div>
+
+        {(!curation.qualityNg?.table || curation.qualityNg.table.length === 0) ? empty("NG 품질 데이터 없음") : (
+          <>
+            <table style={tableStyle}>
+              <thead><tr>
+                <th style={thStyle}>일자</th>
+                <th style={{...thStyle,textAlign:"right"}}>Sepa Fold</th>
+                <th style={{...thStyle,textAlign:"right"}}>Electrode Expose</th>
+                <th style={{...thStyle,textAlign:"right"}}>Non Response</th>
+                <th style={{...thStyle,textAlign:"right"}}>Dim Overkill</th>
+                <th style={{...thStyle,textAlign:"right"}}>Contact NG</th>
+              </tr></thead>
+              <tbody>
+                {curation.qualityNg.table.map((row, i) => (
+                  <tr key={i}>
+                    <td style={tdStyle}>{row.date}</td>
+                    <td style={{...tdStyle,textAlign:"right",fontWeight:row.sepaFold>=20?700:400,color:row.sepaFold>=20?"#ef4444":"#cbd5e1"}}>{row.sepaFold ?? "-"}</td>
+                    <td style={{...tdStyle,textAlign:"right"}}>{row.electrodeExpose ?? "-"}</td>
+                    <td style={{...tdStyle,textAlign:"right"}}>{row.nonResponse ?? "-"}</td>
+                    <td style={{...tdStyle,textAlign:"right"}}>{row.dimOverkill ?? "-"}</td>
+                    <td style={{...tdStyle,textAlign:"right"}}>{row.contactNg ?? "-"}</td>
+                  </tr>
+                ))}
+              </tbody>
+            </table>
+            {curation.qualityNg.trend && curation.qualityNg.trend !== "데이터 없음" && (
+              <div style={{
+                marginTop:10, padding:"10px 14px",
+                background:"rgba(41,128,185,0.08)", border:"1px solid rgba(41,128,185,0.25)",
+                borderLeft:"4px solid #2980b9", borderRadius:6,
+                fontSize:10.5, color:"#cbd5e1", lineHeight:1.6,
+              }}>
+                <strong style={{color:"#60a5fa"}}>추세:</strong> {curation.qualityNg.trend}
+              </div>
+            )}
+          </>
         )}
       </div>
-
-      {/* 5. 테스트/PM */}
-      <div style={sectionStyle}>
-        <div style={{...headingStyle,color:"#22d3ee"}}>🧪 테스트 / PM ({s.testPm.length}건)</div>
-        {s.testPm.length === 0 ? empty("관련 메시지 없음") : (
-          <table style={tableStyle}>
-            <thead><tr><th style={thStyle}>날짜/시간</th><th style={thStyle}>내용</th><th style={thStyle}>목적/결과</th></tr></thead>
-            <tbody>
-              {s.testPm.map((t, idx) => (
-                <tr key={idx}>
-                  <td style={tdStyle}>{t.date} {t.time}</td>
-                  <td style={tdStyle}>{(t.item || "").slice(0, 100)}</td>
-                  <td style={tdStyle}>{t.purpose || "-"}</td>
-                </tr>
-              ))}
-            </tbody>
-          </table>
-        )}
-      </div>
-
-      {/* 6. 품질 NG */}
-      <div style={sectionStyle}>
-        <div style={{...headingStyle,color:"#a78bfa"}}>🟣 품질 / NG ({s.qualityNg.length}건)</div>
-        {s.qualityNg.length === 0 ? empty("관련 메시지 없음") : (
-          <table style={tableStyle}>
-            <thead><tr><th style={thStyle}>날짜/시간</th><th style={thStyle}>내용</th><th style={thStyle}>비고</th></tr></thead>
-            <tbody>
-              {s.qualityNg.map((q, idx) => (
-                <tr key={idx}>
-                  <td style={tdStyle}>{q.date} {q.time}</td>
-                  <td style={tdStyle}>{(q.item || "").slice(0, 100)}</td>
-                  <td style={tdStyle}>{q.note || "-"}</td>
-                </tr>
-              ))}
-            </tbody>
-          </table>
-        )}
-      </div>
-
-      {/* 7. 미해결 */}
-      {s.unresolved.length > 0 && (
-        <div style={sectionStyle}>
-          <div style={{...headingStyle,color:"#ef4444"}}>🚨 미해결 / 모니터링 필요 ({s.unresolved.length}건)</div>
-          <table style={tableStyle}>
-            <thead><tr><th style={thStyle}>날짜</th><th style={thStyle}>설비</th><th style={thStyle}>문제</th><th style={thStyle}>현재 상태</th></tr></thead>
-            <tbody>
-              {s.unresolved.map((i, idx) => (
-                <tr key={idx}>
-                  <td style={tdStyle}>{i.date} {i.time}</td>
-                  <td style={{...tdStyle,fontFamily:"monospace",color:"#fcd34d"}}>{i.eq || "-"}</td>
-                  <td style={tdStyle}>{(i.prob || "-").slice(0, 80)}</td>
-                  <td style={tdStyle}>{(i.result || "-").slice(0, 60)}</td>
-                </tr>
-              ))}
-            </tbody>
-          </table>
-        </div>
-      )}
-
-      {/* 8. 인사이트 */}
-      {s.insights.length > 0 && (
-        <div style={{...sectionStyle, background:"rgba(167,139,250,0.06)", borderColor:"rgba(167,139,250,0.25)"}}>
-          <div style={{...headingStyle,color:"#a78bfa"}}>💡 핵심 시사점</div>
-          {s.insights.map((ins, idx) => (
-            <div key={idx} style={{fontSize:11,color:"#cbd5e1",marginBottom:6,paddingLeft:14,position:"relative"}}>
-              <span style={{position:"absolute",left:0,color:"#a78bfa"}}>{idx+1}.</span> {ins}
-            </div>
-          ))}
-        </div>
-      )}
     </div>
   );
 }

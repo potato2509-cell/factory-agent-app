@@ -47,6 +47,17 @@ const PROCESS_CHANGE_KEYWORDS = [
   "파라미터", "parameter",
   // 명세서 §10.2 CONDITION_CHANGE 패턴
   "setting", "adjust",
+  // ★ 영역 12-AB1: 4월 데이터 패턴 추가
+  "Overhang", "overhang", "spec 초과", "Splicing", "splicing",
+  "Stack NG", "stack ng", "Sepa Wrinkle", "sepa wrinkle",
+  "Vision F/I check", "vision f/i", "monitoring 진행",
+  "Tab guide", "tab guide", "Z cut", "z cut",
+  "Magazine lift", "magazine lift", "Idle mandrel", "idle mandrel",
+  "Sepa dancer", "sepa dancer", "Ejector blow", "ejector blow",
+  "Down Loading", "down loading", "Down Unloading", "down unloading",
+  "Set Point", "set point", "Vacuum Set", "vacuum set",
+  "PnP", "Anode X", "anode x", "X value", "Y value",
+  "PIC:", "pic:",  // PIC 명시 메시지 (일반적으로 setting 변경 보고)
 ];
 
 const TEST_KEYWORDS = [
@@ -56,6 +67,16 @@ const TEST_KEYWORDS = [
   "engineering run", "pilot",
   // 명세서 §10.2 TEST_PM 패턴
   "swap", "swab", "calibration", "PM", "monitoring",
+  // ★ 영역 12-AB2: 4월 데이터 패턴 추가
+  "UBM", "ubm", "UBM Limit", "ubm limit", "Irregular Maintenance", "irregular maintenance",
+  "Cleaning", "cleaning", "Check DE", "check de",
+  "Cutter Sear", "cutter sear", "Top Cutter", "top cutter", "Bottom Cutter", "bottom cutter",
+  "Bottom flip", "bottom flip", "Cutter 교체", "cutter 교체",
+  "Sepa Run", "sepa run", "JXT",  // JXT는 lot ID prefix
+  "Line PM", "line pm", "PM 일정", "pm 일정",
+  "1AB", "1-AB", "Stacking 1", "stacking 1",
+  "CPC 이상", "cpc 이상", "CPC monitoring", "cpc monitoring",
+  "Stack vision", "stack vision", "F/I check", "f/i check",
 ];
 
 // 명세서 §5.2 키워드 가중치 매트릭스 (점수 보너스)
@@ -605,6 +626,23 @@ function classifyMessages(msgs) {
     if (PROCESS_CHANGE_KEYWORDS.some(kw => lowerText.includes(kw.toLowerCase()))) matched.push("process_change");
     if (TEST_KEYWORDS.some(kw => lowerText.includes(kw.toLowerCase()))) matched.push("test");
 
+    // ★ 영역 12-AB3: 패턴 매칭 — "숫자 → 숫자" 또는 "숫자->숫자" 패턴 발견 시 process_change 자동 분류
+    // 예: "39.6 → 40.0", "70.2 -> 70.6", "180 → 200"
+    if (!matched.includes("process_change")) {
+      const settingPattern = /\d+(?:\.\d+)?\s*(?:→|->|=>|>>)\s*\d+(?:\.\d+)?/;
+      if (settingPattern.test(m.text)) {
+        matched.push("process_change");
+      }
+    }
+
+    // ★ 영역 12-AB3: JXT lot ID 패턴 (예: JXT11251121022J66103) — quality 자동 분류
+    if (!matched.includes("quality")) {
+      const jxtPattern = /JXT\d{10,}/i;
+      if (jxtPattern.test(m.text)) {
+        matched.push("quality");
+      }
+    }
+
     const entry = { time: m.time, sender: m.sender, text: m.text, date: m.date, hour: m.hour };
 
     if (matched.length === 1) {
@@ -615,8 +653,23 @@ function classifyMessages(msgs) {
     } else if (matched.length >= 2) {
       // 2개 이상 카테고리에 걸침 → 모호 (AI 분류 대상, 5-C에서 처리)
       ambiguousMsgs.push({ ...entry, matched });
+    } else {
+      // matched.length === 0 → general 배열에만 남음 (AI 비용 절약)
+      general.push(entry);
     }
-    // matched.length === 0 → general에만 남고 카테고리 미할당 (AI 비용 절약)
+  }
+  // ★ 영역 12-AB4: 분류 안 된 일반 메시지 진단 로그
+  if (typeof console !== "undefined") {
+    if (general.length > 0) {
+      console.log(`[메시지 분류 진단] 분류 안 됨(general) ${general.length}건. 샘플 5건 (3,4번 누락 진단용):`);
+      general.slice(0, 5).forEach((g, i) => {
+        const preview = (g.text || "").replace(/\n/g, " ").slice(0, 150);
+        console.log(`  [${i+1}] ${g.sender || "?"}: ${preview}${g.text.length > 150 ? "..." : ""}`);
+      });
+    }
+    if (processChangeMsgs.length === 0 && testMsgs.length === 0 && general.length > 5) {
+      console.warn(`[⚠️ 분류 경고] process_change/test 모두 0건 — 키워드 매칭 부족 가능. 위 general 샘플 확인 필요`);
+    }
   }
   return { downtime, equipment, general, qualityMsgs, processChangeMsgs, testMsgs, ambiguousMsgs };
 }
@@ -977,21 +1030,29 @@ async function runPreCuration(allIssues, kbPE, reportType, categoryMsgs = {}) {
   const elapsed = ((Date.now() - startTime) / 1000).toFixed(1);
   console.log(`[PE 큐레이션] 3분할 병렬 완료 (${elapsed}초)`);
 
-  // ★ 영역 12-Z3: 룰 백업 — LLM 응답에서 longDowntime 누락 시 코드로 자동 보정
-  // LLM이 504 timeout으로 빈 응답하거나 누락한 경우, 데이터에서 직접 30분+ 이슈를 추출
+  // ★ 영역 12-Z3 + 12-AB5: 룰 백업 — LLM 응답 누락 시 자동 보강
+  // 12-AB5: Haiku fallback이 max_tokens로 잘려서 일부만 응답한 경우(예: 4건 중 1건),
+  //         LLM 응답은 보존하고 누락된 30분+ 이슈만 추가 (LLM 결과 + 룰 보강)
   let backupLongDowntime = part1.longDowntime || [];
   const llmLongCount = backupLongDowntime.length;
-  const dataLongCount = allIssues.filter(i => (i.durMin || 0) >= longThreshold).length;
+  const dataLongIssues = allIssues.filter(i => (i.durMin || 0) >= longThreshold);
+  const dataLongCount = dataLongIssues.length;
 
-  if (llmLongCount === 0 && dataLongCount > 0) {
-    console.warn(`[PE 큐레이션 룰 백업] LLM이 longDowntime 0건 응답했으나 데이터에 ${dataLongCount}건 있음 → 자동 보정`);
-    // 30분+ 이슈를 부동시간 내림차순으로 정렬해 자동 추가
-    backupLongDowntime = allIssues
-      .filter(i => (i.durMin || 0) >= longThreshold)
+  if (llmLongCount < dataLongCount) {
+    // LLM이 다룬 equipment 집합 (이미 응답한 건은 제외)
+    const llmCoveredEqs = new Set(
+      backupLongDowntime.map(d => (d.equipment || "").trim()).filter(Boolean)
+    );
+
+    // 누락된 30분+ 이슈만 추출 (부동시간 내림차순, 최대 12건까지 채움)
+    const missingIssues = dataLongIssues
+      .filter(i => i.eq && !llmCoveredEqs.has(i.eq.trim()))
       .sort((a, b) => (b.durMin || 0) - (a.durMin || 0))
-      .slice(0, 12)  // 최대 12건
-      .map((i, idx) => ({
-        isTop: idx < 2,  // 상위 2건만 TOP
+      .slice(0, 12 - llmLongCount);
+
+    if (missingIssues.length > 0) {
+      const ruleBackupItems = missingIssues.map((i, idx) => ({
+        isTop: false,  // 룰 백업으로 추가된 건 isTop=false
         equipment: i.eq || "?",
         title: `${i.eq || "?"} ${(i.prob || "").slice(0, 60)}${i.prob && i.prob.length > 60 ? "..." : ""} — ${i.durMin}분`,
         occurrence: `${i.date || ""} ${i.time || ""}`,
@@ -1010,8 +1071,18 @@ async function runPreCuration(allIssues, kbPE, reportType, categoryMsgs = {}) {
         collateralDamage: "",
         historyPattern: "",
         actionAnalysis: "",
-        _ruleBackup: true,  // 룰 백업으로 생성된 항목 표시
+        _ruleBackup: true,
       }));
+
+      if (llmLongCount === 0) {
+        console.warn(`[PE 큐레이션 룰 백업] LLM 0건 → 데이터 ${dataLongCount}건 모두 자동 보정`);
+        // 0건이면 정렬 우선순위: 부동시간 ↓
+        backupLongDowntime = ruleBackupItems.map((item, idx) => ({ ...item, isTop: idx < 2 }));
+      } else {
+        console.warn(`[PE 큐레이션 룰 백업 강화] LLM ${llmLongCount}건 응답 + 데이터 ${dataLongCount}건 → 누락 ${missingIssues.length}건 자동 추가`);
+        backupLongDowntime = [...backupLongDowntime, ...ruleBackupItems];
+      }
+    }
   } else if (llmLongCount > 0) {
     console.log(`[PE 큐레이션] longDowntime 정상 (LLM ${llmLongCount}건, 데이터 기준 ${dataLongCount}건)`);
   }

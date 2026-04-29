@@ -1102,6 +1102,24 @@ async function runPreCuration(allIssues, kbPE, reportType, categoryMsgs = {}) {
     text: (m.text || "").slice(0, 350).replace(/\n/g, " | "),
   }));
 
+  // ★ 영역 12-AG1: Part 2b 전용 long format — Setting 항목 풀 추출 위해 10건 × 800자
+  // 기존 formatMsgs는 200자라 STK-3-B2 메시지 (1000자+)에서 Countermeasures 1~2개만 보임
+  const formatMsgsLong = (arr, max = 10) => arr.slice(0, max).map((m, i) => ({
+    no: i + 1,
+    date: m.date || "",
+    time: m.time || "",
+    sender: m.sender || "",
+    text: (m.text || "").slice(0, 800).replace(/\n/g, " | "),
+  }));
+  const processChangeDataLong = formatMsgsLong(processChangeList);
+  const qualityWithSettingLong = (categoryMsgs.quality || []).slice(0, 8).map((m, i) => ({
+    no: i + 1,
+    date: m.date || "",
+    time: m.time || "",
+    sender: m.sender || "",
+    text: (m.text || "").slice(0, 800).replace(/\n/g, " | "),
+  }));
+
   // ── ★ 영역 12-AF3: 4분할 병렬 호출 (Part 2를 2a/2b로 분할) ──
   // Part 2b가 conditionChangeGroups 전용 — Sonnet이 짧고 정확하게 처리
   console.log("[PE 큐레이션] Sonnet 4분할 병렬 호출 시작 (Part 2 → 2a + 2b)...");
@@ -1110,7 +1128,8 @@ async function runPreCuration(allIssues, kbPE, reportType, categoryMsgs = {}) {
   const [part1, part2a, part2b, part3] = await Promise.all([
     curationPart1_LongDowntime(issuesData, allIssues.length, focus, kbText, longThreshold, categoryMsgs),
     curationPart2a_RecurringSimple(issuesData, processChangeData, allIssues.length, focus, kbText, categoryMsgs),
-    curationPart2b_ConditionChangeGroups(processChangeData, qualityWithSetting, focus, kbText),
+    // ★ AG1: Part 2b는 long format (10건×800자) 사용
+    curationPart2b_ConditionChangeGroups(processChangeDataLong, qualityWithSettingLong, focus, kbText),
     curationPart3_TestPmQuality(testData, qualityData, focus, kbText, categoryMsgs),
   ]);
 
@@ -1393,21 +1412,24 @@ ${focus}
 
 [★ 핵심 작업 — 이 작업의 전부]
 입력 메시지에서 같은 호기에 대해 여러 파라미터를 변경한 그룹을 풀로 추출하세요.
-각 그룹의 모든 파라미터를 빠짐없이 parameters 배열에 포함하세요.
+★★ 각 그룹의 **모든** 파라미터를 빠짐없이 parameters 배열에 포함하세요. **10개 이상도 가능합니다.** ★★
+★★ 메시지의 Countermeasures 섹션에 5개, 8개, 10개 항목이 있으면 그 모든 항목을 parameters에 풀로 넣으세요. ★★
+★★ 절대 1~2개만 추출하고 끝내지 마세요. 메시지에 명시된 모든 항목을 끝까지 처리하세요. ★★
 
 [★ 인식 패턴]
 1) "Machine: Stack 3B2 / Problem: Issue Overhang / Caused: ... / Countermeasures: - Setting Gap ... - Setting Gap ..." 형식
-   → 하나의 conditionChangeGroup으로 묶고, Countermeasures의 모든 항목을 parameters 배열에 포함
+   → 하나의 conditionChangeGroup으로 묶고, **Countermeasures의 모든 항목을 빠짐없이** parameters 배열에 포함
 2) Countermeasures 안의 "- Setting Gap 2nd PnP (+) Down Loading 39.6 => 40.0" 같은 항목은
    parameter="Gap 2nd PnP (+) Down Loading", before="39.6", after="40.0"으로 추출
+   ★ "=>", "->", "to" 모두 Before/After 구분 기호로 인식
 3) "- check vision f/i" "- check gap" 같이 값 없이 점검 항목인 경우
    parameter="Vision f/i 점검", before="", after="Check"
 4) Stack NG / Stack Wrinkle 보고도 그룹으로 추출 (문제 호기 + Countermeasures)
 
-[★ Few-shot 예시]
-입력 메시지: "Machine: Stack 3B2 / Problem: Issue Overhang / Caused: anode X value exceeds the limit / Countermeasures: - Check Gap 2nd PnP (+) Down Loading - Setting Gap 2nd PnP (+) Down Loading 39.6 => 40.0 - Setting Gap 2nd PnP (+) Down Unloading 32.9 => 33.0 - Setting Gap 2nd PnP (-) Down Loading 40.0 => 40.1 / Time: 08:10 / PIC: Group C / Result: 3 sample CT scan OK"
+[★ Few-shot 예시 — 8개 파라미터 풀 추출]
+입력 메시지: "Machine: Stack 3B2 / Problem: Issue Overhang / Caused: anode X value exceeds the limit / Countermeasures: - Check Gap 2nd PnP (+) Down Loading & Unloading - Setting Gap 2nd PnP (+) Down Loading 39.6 => 40.0 - Setting Gap 2nd PnP (+) Down Unloading 32.9 => 33.0 - Check Gap 2nd PnP (-) Down Loading & Unloading - Setting Gap 2nd PnP (-) Down Loading 40.0 => 40.1 - Setting Gap 2nd PnP (-) Down unloading 33.0 => 33.2 - Setting Idle mandrel pressure 180 => 200 - Setting Sepa dancer static pressure 160 => 150 / Time: 08:10 / PIC: Group C / Result: 3 sample CT scan OK"
 
-출력:
+출력 (★ 메시지의 모든 항목 빠짐없이 ★):
 {
   "title": "STK-3-B2 Overhang 대응",
   "equipment": "STK-3-B2",
@@ -1415,13 +1437,18 @@ ${focus}
   "shift": "Shift 1",
   "picReason": "PIC: Group C · 사유: anode X value exceeds the limit",
   "parameters": [
-    {"parameter": "Gap 2nd PnP (+) Down Loading 점검", "before": "", "after": "Check"},
+    {"parameter": "Gap 2nd PnP (+) Down Loading & Unloading 점검", "before": "", "after": "Check"},
     {"parameter": "Gap 2nd PnP (+) Down Loading", "before": "39.6", "after": "40.0"},
     {"parameter": "Gap 2nd PnP (+) Down Unloading", "before": "32.9", "after": "33.0"},
-    {"parameter": "Gap 2nd PnP (-) Down Loading", "before": "40.0", "after": "40.1"}
+    {"parameter": "Gap 2nd PnP (-) Down Loading & Unloading 점검", "before": "", "after": "Check"},
+    {"parameter": "Gap 2nd PnP (-) Down Loading", "before": "40.0", "after": "40.1"},
+    {"parameter": "Gap 2nd PnP (-) Down Unloading", "before": "33.0", "after": "33.2"},
+    {"parameter": "Idle mandrel pressure", "before": "180", "after": "200"},
+    {"parameter": "Sepa dancer static pressure", "before": "160", "after": "150"}
   ],
   "verification": "3 sample CT scan OK"
 }
+★ 위 예시처럼 — 메시지에 8개 항목이 있으면 8개를 모두 parameters에 풀로 채우세요. 절대 일부만 추출하지 마세요.
 
 [필수 출력 — JSON만, 다른 텍스트 금지]
 {
@@ -1448,7 +1475,8 @@ ${focus}
 
 [규칙]
 - 그룹이 없으면 빈 배열 [] 반환
-- parameters는 메시지에 명시된 모든 항목 추출 — 풀로 (10개 이상도 가능)
+- ★★ parameters는 메시지에 명시된 **모든** 항목 추출 — 풀로 (10개 이상도 가능, 절대 일부만 X) ★★
+- ★★ "Setting X => Y" 형식 항목이 5개 있으면 5개 모두, 8개 있으면 8개 모두 parameters에 포함 ★★
 - 단발 변경 (Vision Offset 1건)은 그룹 아님 — 제외
 - 모든 수치는 숫자/문자열로 정확히 표기`;
 
@@ -1460,7 +1488,8 @@ ${qualityWithSetting.length > 0 ? JSON.stringify(qualityWithSetting, null, 1) : 
 ※ "setting z cut", "Stack NG ... Countermeasures" 같은 메시지에 호기별 다중 파라미터 변경 정보가 있을 수 있음
 
 위 메시지에서 같은 호기에 대한 다중 파라미터 변경 그룹을 풀로 추출하세요.
-★ 각 메시지의 Countermeasures 모든 항목을 parameters 배열에 포함.
+★★ 각 메시지의 Countermeasures **모든** 항목을 parameters 배열에 빠짐없이 포함하세요. ★★
+★★ "Setting X => Y" 형식 항목이 5개, 8개, 10개 있으면 그만큼 모두 parameters에 추출. 절대 1~2개만 추출 X. ★★
 ★ 호기명은 정규화 (Stack 3B2 → STK-3-B2).`;
 
   return await callCurationPart(sys, userMsg, "Part2b-ConditionChangeGroups", [], {}, 1800);

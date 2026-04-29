@@ -954,12 +954,66 @@ async function runPreCuration(allIssues, kbPE, reportType, categoryMsgs = {}) {
   const elapsed = ((Date.now() - startTime) / 1000).toFixed(1);
   console.log(`[PE 큐레이션] 3분할 병렬 완료 (${elapsed}초)`);
 
+  // ★ 영역 12-Z3: 룰 백업 — LLM 응답에서 longDowntime 누락 시 코드로 자동 보정
+  // LLM이 504 timeout으로 빈 응답하거나 누락한 경우, 데이터에서 직접 30분+ 이슈를 추출
+  let backupLongDowntime = part1.longDowntime || [];
+  const llmLongCount = backupLongDowntime.length;
+  const dataLongCount = allIssues.filter(i => (i.durMin || 0) >= longThreshold).length;
+
+  if (llmLongCount === 0 && dataLongCount > 0) {
+    console.warn(`[PE 큐레이션 룰 백업] LLM이 longDowntime 0건 응답했으나 데이터에 ${dataLongCount}건 있음 → 자동 보정`);
+    // 30분+ 이슈를 부동시간 내림차순으로 정렬해 자동 추가
+    backupLongDowntime = allIssues
+      .filter(i => (i.durMin || 0) >= longThreshold)
+      .sort((a, b) => (b.durMin || 0) - (a.durMin || 0))
+      .slice(0, 12)  // 최대 12건
+      .map((i, idx) => ({
+        isTop: idx < 2,  // 상위 2건만 TOP
+        equipment: i.eq || "?",
+        title: `${i.eq || "?"} ${(i.prob || "").slice(0, 60)}${i.prob && i.prob.length > 60 ? "..." : ""} — ${i.durMin}분`,
+        occurrence: `${i.date || ""} ${i.time || ""}`,
+        alarm: i._alarm || "",
+        rootCause: (i.cause || "").slice(0, 200) || "데이터 부족 — 추가 분석 필요",
+        partReplaced: "",
+        pic: i.pic || "",
+        result: i.result || "Unknown",
+        durationMin: i.durMin || 0,
+        actionSequence: (i.action || "").slice(0, 300)
+          ? [(i.action || "").slice(0, 300)]
+          : ["조치 정보 없음 — 원본 데이터 확인 필요"],
+        splitNote: "",
+        splitDetail: [],
+        recurrenceGap: "",
+        collateralDamage: "",
+        historyPattern: "",
+        actionAnalysis: "",
+        _ruleBackup: true,  // 룰 백업으로 생성된 항목 표시
+      }));
+  } else if (llmLongCount > 0) {
+    console.log(`[PE 큐레이션] longDowntime 정상 (LLM ${llmLongCount}건, 데이터 기준 ${dataLongCount}건)`);
+  }
+
+  // criticalSummary도 빈 경우 룰 백업
+  let backupCriticalSummary = part1.criticalSummary || [];
+  if (backupCriticalSummary.length === 0 && backupLongDowntime.length > 0) {
+    const top = backupLongDowntime[0];
+    backupCriticalSummary = [
+      `최장 부동: ${top.equipment} ${top.durationMin}분 — ${(top.rootCause || "").slice(0, 100)}`,
+      `30분+ 부동 이슈 ${dataLongCount}건 발생`,
+      `주목 패턴: 데이터 분석 필요`,
+      `품질 추세: 데이터 분석 필요`,
+      `특이사항: 큐레이션 LLM 응답 미흡 — 룰 백업 사용`,
+    ];
+  }
+
   // 결과 병합 — 영역 12-Y: 새 필드 (recordBreakdown, chronicIssues, conditionChangeGroups, chronic1AB, line3DCutterCpc) 보존
   return normalizeBriefing({
-    summary_text: part1.summary_text || "",
+    summary_text: part1.summary_text || (backupLongDowntime.length > 0
+      ? `총 ${allIssues.length}건 부동 이슈 발생, ${dataLongCount}건이 ${longThreshold}분 이상 장기부동`
+      : ""),
     recordBreakdown: part1.recordBreakdown || { bmDowntime: 0, ubm: 0, pdDowntime: 0, other: 0 },
-    criticalSummary: part1.criticalSummary || [],
-    longDowntime: part1.longDowntime || [],
+    criticalSummary: backupCriticalSummary,
+    longDowntime: backupLongDowntime,
     chronicIssues: part1.chronicIssues || [],  // ★ 12-Y4 만성 이슈 별도 섹션
     recurringByCategory: part2.recurringByCategory || [],
     recurringSameEquipment: part2.recurringSameEquipment || [],
@@ -974,31 +1028,42 @@ async function runPreCuration(allIssues, kbPE, reportType, categoryMsgs = {}) {
 
 // ─── 분할 헬퍼: 공통 호출 (Sonnet 1차 → 504 시 Haiku fallback) ─────────────────
 async function callCurationPart(sys, userMsg, partLabel, allIssuesForFallback = [], categoryMsgsForFallback = {}) {
+  // ★ 영역 12-Z4: 응답 시간 측정용
+  const t0 = Date.now();
   try {
     await new Promise(r => setTimeout(r, 200));
     const raw = await callClaudeRaw(sys, userMsg, {
       model: MODEL_REASONING,  // ★ Sonnet (품질 우선)
-      max_tokens: 2500,  // 영역 12-Y6: 2000→2500 — 풍부 응답 (timeout 위험 약간 ↑)
+      max_tokens: 1800,  // 영역 12-Z1: 2500→1800 — Netlify 10초 한계 안전선
     });
+    const elapsed = ((Date.now() - t0) / 1000).toFixed(1);
+    console.log(`[PE 큐레이션 ${partLabel}] Sonnet 1차 성공 (${elapsed}초)`);
+    console.log(`[PE 큐레이션 ${partLabel}] raw 응답 첫 200자:`, (raw || "").slice(0, 200));
     return safeJSON(raw);
   } catch (e) {
-    console.error(`[PE 큐레이션 ${partLabel} 1차 실패]`, e?.message);
+    const elapsed = ((Date.now() - t0) / 1000).toFixed(1);
+    console.error(`[PE 큐레이션 ${partLabel} 1차 실패] (${elapsed}초)`, e?.message?.slice(0, 200));
 
     // 504 timeout 시 Haiku로 fallback
     if (e?.message?.includes("504") || e?.message?.includes("Timeout") || e?.message?.includes("timeout")) {
+      const tFallback = Date.now();
       try {
-        console.log(`[PE 큐레이션 ${partLabel}] Haiku로 fallback 재시도...`);
+        console.log(`[PE 큐레이션 ${partLabel}] Haiku로 fallback 재시도 (max_tokens 1200)...`);
         await new Promise(r => setTimeout(r, 800));
         const raw2 = await callClaudeRaw(sys, userMsg, {
           model: MODEL_FAST,  // Haiku fallback
-          max_tokens: 1800,  // 12-Y6: 1500→1800
+          max_tokens: 1200,  // 영역 12-Z1: 1800→1200 — fallback timeout 방지
         });
+        const elapsedFb = ((Date.now() - tFallback) / 1000).toFixed(1);
+        console.log(`[PE 큐레이션 ${partLabel}] Haiku fallback 성공 (${elapsedFb}초)`);
+        console.log(`[PE 큐레이션 ${partLabel}] fallback raw 응답 첫 200자:`, (raw2 || "").slice(0, 200));
         return safeJSON(raw2);
       } catch (e2) {
-        console.error(`[PE 큐레이션 ${partLabel} fallback도 실패]`, e2?.message);
+        const elapsedFb = ((Date.now() - tFallback) / 1000).toFixed(1);
+        console.error(`[PE 큐레이션 ${partLabel} fallback도 실패] (${elapsedFb}초)`, e2?.message?.slice(0, 200));
       }
     }
-    // 최종 실패 — 빈 객체 반환 (병합 시 기본값 사용)
+    // 최종 실패 — 빈 객체 반환 (병합 시 룰 백업으로 보정)
     return {};
   }
 }
@@ -1008,101 +1073,66 @@ async function curationPart1_LongDowntime(issuesData, totalCount, focus, kbText,
   const sys = `${FACTORY_PHILOSOPHY}
 
 당신은 AZS 배터리 공장의 ${PERSONAS.Cell_PE.role.replace(" - Cell 공정", "")}입니다.
-이 작업은 일일 이슈 브리핑의 1번 섹션 (장기부동 + 만성 이슈 추적) 정리입니다.${kbText}
+이 작업은 일일 이슈 브리핑의 1번 섹션 (장기부동) 정리입니다.${kbText}
 
 ${focus}
 
-[★ 영역 12-Y1: 사용자 레포트 수준 출력 — 매우 중요]
-다음 정보들을 가능한 한 풍부하게 추출/분석하세요:
+[★ 최우선 지시 — 절대 누락 금지]
+입력 데이터의 부동 이슈 중 duration_min ≥ ${longThreshold} 인 모든 이슈를 longDowntime 배열에 반드시 포함하세요.
+빠짐없이 — 30분, 32분, 45분 같은 작은 건도 모두 포함. 30분 미만만 제외.
 
-1) **레코드 분류 (recordBreakdown)**: 이슈 데이터를 BM Downtime Bot / UBM (Unscheduled BM) / PD Downtime / Other로 분류해 카운트
-
-2) **분할 보고 정밀 분석**: 같은 호기 24h 내 동일 알람/root cause 보고가 여러 건이면 하나로 묶되:
-   - splitDetail에 "1차 — N분 (시각) / 2차 — M분 (시각, K분 만에 재발)" 형태로 분리 명시
-   - recurrenceGap (재발 간격, 분 단위)
-   - "1차 조치(homing/tunning)로는 근본 해결 안 됨" 같은 분석 명시 (어느 조치가 미흡했는지)
-
-3) **부수 피해 (collateralDamage)**: 다른 부품 파손 (Mandrel 파손, 충돌 피해 등) 명시
-
-4) **이력 패턴 (historyPattern)**: 동일 fault code (예: "31137 single turn"), 동일 부품 (예: "Servo R"), 동일 카테고리 (예: "Belt 1st PnP R 파손")가 다른 호기/날짜에서 발생한 이력 — KB나 입력 데이터에서 단서 찾으면 명시. 단서 없으면 빈 문자열
-
-5) **만성 이슈 (chronicIssues)**: 24시간 이상 open 상태이거나 여러 일자에 걸쳐 반복되는 이슈 별도 추적
-   - 예: "STK-1-D3 NG Tab Width — 04/22 04:30 시작 → 17시간+ open"
-   - 입력 데이터의 issuesData에서 미해결/Monitoring/not solved 결과를 가진 이슈 + KB의 이전 일자 동일 호기 이슈를 종합
-
-6) **criticalSummary 강화**: 5개 bullet 모두 풍부하게:
-   - "최장 부동: [설비명] [부동시간] — [근본 원인 + 조치 요약]"
-   - "동일 호기 다발 위험: [설비] [N분 간격 N회 발생, 부수 피해]"
-   - "주목 패턴: [패턴 설명, 예: 'STK-3-C4 Heat Press 영역 8분 간격 2회 발생, mechanical interference 가능성']"
-   - "품질 추세: [핵심 메시지]"
-   - "특이사항/경영진 개입: [매니저 직접 지시 등 — 데이터에 명시된 경우만, 없으면 '특이사항 없음']"
-
-[필수 출력 - JSON만, 다른 텍스트 금지]
+[필수 출력 — JSON만, 다른 텍스트 금지]
 {
-  "summary_text": "전체 이슈 흐름의 핵심 트렌드 요약 — 1~3문장",
-  "recordBreakdown": {
-    "bmDowntime": 숫자,
-    "ubm": 숫자,
-    "pdDowntime": 숫자,
-    "other": 숫자
-  },
+  "summary_text": "전체 이슈 흐름 1~3문장 요약",
+  "recordBreakdown": {"bmDowntime": 숫자, "ubm": 숫자, "pdDowntime": 숫자, "other": 숫자},
   "criticalSummary": [
-    "최장 부동: ...",
-    "동일 호기 다발 위험: ...",
-    "주목 패턴: ...",
-    "품질 추세: ...",
-    "특이사항: ..."
+    "최장 부동: [설비] [부동시간] — [원인]",
+    "동일 호기 다발: [있으면 명시, 없으면 '없음']",
+    "주목 패턴: [있으면 명시, 없으면 '없음']",
+    "품질 추세: [핵심]",
+    "특이사항: [있으면 명시, 없으면 '없음']"
   ],
   "longDowntime": [
     {
       "isTop": true,
       "equipment": "호기명",
-      "title": "[설비명] [문제 요약] — N분 (M시간) Full Stop",
-      "occurrence": "발생 시간 (분할 시 통합 표기)",
+      "title": "[설비명] [문제 요약] — N분",
+      "occurrence": "발생 시간",
       "alarm": "알람 메시지",
-      "splitNote": "분할 보고 시: '두 차례 분할 — 21:20~21:55 (35분) → 22:00~04:56 (416분) → 누적 451분'",
-      "splitDetail": [
-        {"order": 1, "duration": 38, "time": "14:17~14:55", "description": "Forward Over Run, Mandrel Y2 파손"},
-        {"order": 2, "duration": 28, "time": "15:42~16:10", "gapMin": 47, "description": "Total Fault, Servo 자체 교체"}
-      ],
-      "recurrenceGap": "1차 후 47분만에 재발 (있을 때만)",
-      "rootCause": "근본 원인 (mechanical/electrical/quality 명시)",
-      "partReplaced": "교체 부품명 + 코드 (예: 'BESMT0359 Servo Motor SIEMENS 1FK2204-6AF01-0MA0')",
-      "collateralDamage": "부수 피해 (Mandrel Y2 anode 파손 등, 없으면 빈 문자열)",
-      "historyPattern": "이력 패턴 (예: '31137 single turn은 04/22 STK-4-B1, 04/24 STK-4-B1에서도 동일 발생'), 단서 없으면 빈 문자열",
-      "pic": "PIC 또는 Tech 시퀀스",
-      "result": "결과 (Solved/Unsolved/Monitoring)",
-      "durationMin": 부동시간_분,
-      "actionSequence": ["1. 첫 번째 조치", "2. 두 번째 조치", "..."],
-      "actionAnalysis": "1차 조치로 해결됐는지/미흡했는지 분석 (예: '1차 조치(homing/tunning)로 미해결 → Servo 자체 결함이 1차부터 있었을 가능성'). 단발이면 빈 문자열"
+      "rootCause": "근본 원인",
+      "partReplaced": "교체 부품 (있으면)",
+      "pic": "PIC",
+      "result": "Solved/Unsolved/Monitoring",
+      "durationMin": 부동분,
+      "actionSequence": ["1. 조치", "2. 조치"],
+
+      "splitNote": "(옵셔널) 분할 보고 통합 시만 작성, 단일 보고면 빈 문자열 ''",
+      "splitDetail": [],
+      "recurrenceGap": "(옵셔널) 단발이면 빈 문자열 ''",
+      "collateralDamage": "(옵셔널) 부수 피해 있을 때만, 없으면 ''",
+      "historyPattern": "(옵셔널) KB에 단서 있을 때만, 없으면 ''",
+      "actionAnalysis": "(옵셔널) 1차 조치 미흡 분석, 해당 없으면 ''"
     }
   ],
-  "chronicIssues": [
-    {
-      "equipment": "호기명",
-      "title": "[설비명] [문제] — [총 영향 시간 또는 'N시간+ open']",
-      "startedAt": "시작 시각 (예: '04/22 04:30')",
-      "currentStatus": "현재 상태 (예: '17시간+ open', 'Monitoring')",
-      "history": ["04/22: 발생", "04/23: 17시간 후 재발", "..."],
-      "managerInvolved": "관련 매니저/지시 사항 (있으면, 없으면 빈 문자열)"
-    }
-  ]
+  "chronicIssues": []
 }
 
+[★ 옵셔널 필드 — 데이터에 명백한 단서 있을 때만 채우세요]
+splitDetail / recurrenceGap / collateralDamage / historyPattern / actionAnalysis / chronicIssues 등은
+데이터에 명백히 있을 때만 채우고, 없으면 빈 배열/빈 문자열로 빠르게 응답하세요.
+풍부함보다 응답 속도와 핵심 누락 방지가 우선입니다.
+
 [규칙]
-- 장기부동 임계값: ${longThreshold}분 이상
-- isTop=true는 가장 큰 부동 1~2건만 (그 외 longDowntime은 isTop=false)
-- actionSequence: 시간순 1~10단계, isTop인 경우 더 풍부하게
-- splitDetail은 분할 보고만 작성, 단일 보고면 빈 배열 []
-- chronicIssues: 24h+ open이거나 cross-day 반복 이슈만 (없으면 빈 배열 [])
-- KB 데이터를 적극 활용해 historyPattern과 chronicIssues 식별
+- 장기부동 임계값: ${longThreshold}분 이상 (이 임계값 절대 변경 금지)
+- isTop=true는 가장 큰 부동 1~2건만, 나머지는 isTop=false
+- chronicIssues는 24h+ open 또는 cross-day 반복일 때만 (KB에 단서 없으면 빈 배열)
 - 모든 수치는 숫자만`;
 
-  const userMsg = `[전체 부동 이슈 데이터 - ${totalCount}건]
+  const userMsg = `[부동 이슈 데이터 - ${totalCount}건]
 ${JSON.stringify(issuesData, null, 1)}
 
-위 데이터에서 1번 섹션 (핵심 요약 + 장기부동 + 만성 이슈 추적)을 풍부하게 정리하세요.
-KB가 제공된 경우 cross-day 패턴/만성 이슈/이력 패턴을 적극 활용하세요. 분할 보고는 splitDetail에 1차/2차 분리 명시하세요.`;
+위 데이터에서 duration_min >= ${longThreshold} 인 모든 부동 이슈를 longDowntime에 빠짐없이 정리하세요.
+옵셔널 필드(splitDetail, historyPattern 등)는 명백한 단서 있을 때만 채우고, 없으면 빈 값으로 응답해 응답 속도를 우선하세요.`;
 
   return await callCurationPart(sys, userMsg, "Part1-LongDowntime");
 }
@@ -1116,46 +1146,24 @@ async function curationPart2_RecurringConditionChange(issuesData, processChangeD
 
 ${focus}
 
-[★ 영역 12-Y2: 사용자 레포트 수준 출력]
+[★ 최우선 지시 — 절대 누락 금지]
+입력의 부동 이슈 데이터에서 카테고리별/호기별 반복을 빠짐없이 집계하세요.
+조건변경 메시지가 있으면 conditionChanges 4개 그룹에 모두 분류하세요.
 
-1) **재발 간격 분석 (recurringSameEquipment.gapAnalysis)**: 동일 호기 다발 시 시간차 명시
-   - 예: "2회 (38min + 28min, 같은 servo R, 47분 간격 재발) → 누적 66분, Mandrel Y2 + Servo R 모두 교체"
-   - "1차 조치 후 N분 만에 재발" 형태로 분석
-
-2) **조건변경 PIC + 사유 (picReason)**: 어떤 PIC이 어떤 사유로 변경했는지
-   - 예: "PIC: Rijal, Heriyanto, Prada PD, Azis SL · 사유: Anode X value spec 초과"
-
-3) **조건변경 verification**: 변경 후 결과/검증 (CT scan OK, monitoring 진행 등)
-
-4) **조건변경 그룹 헤더 — 호기별 그룹화**: 같은 호기에 여러 파라미터 동시 변경된 경우 하나의 그룹으로
-   - 예: "STK-3-B2 Overhang 대응 (06:00~06:40, Shift 1)" — 10개 파라미터 한 그룹
-
-[필수 출력 - JSON만, 다른 텍스트 금지]
+[필수 출력 — JSON만, 다른 텍스트 금지]
 {
   "recurringByCategory": [
-    {"category":"카테고리명","count":건수,"equipments":["STK-1-A4 (×2)","STK-2-D5 (×2)"]}
+    {"category":"카테고리명 (예: Tab Width/NG, Sensor cable, Servo Fault, Vision NG)","count":건수,"equipments":["STK-1-A4 (×2)","STK-2-D5"]}
   ],
   "recurringSameEquipment": [
     {
       "equipment":"호기",
       "count":건수,
-      "detail":"발생 내역 요약 (시간 + 부동분 + 핵심 원인)",
-      "gapAnalysis":"재발 간격 + 분석 (예: '47분 간격 재발, 1차 조치(homing) 미해결로 servo 자체 교체 필요')",
-      "totalDuration":"누적 N분",
-      "partsReplaced":"교체된 부품 모음 (있으면)"
-    }
-  ],
-  "conditionChangeGroups": [
-    {
-      "title":"그룹 제목 (예: 'STK-3-B2 Overhang 대응 (06:00~06:40, Shift 1)')",
-      "equipment":"대상 호기",
-      "timeRange":"시간 범위",
-      "shift":"Shift 정보 (있으면)",
-      "picReason":"PIC + 사유 (예: 'PIC: Rijal, Heriyanto · 사유: Anode X value spec 초과')",
-      "parameters":[
-        {"parameter":"파라미터명","before":"변경 전","after":"변경 후"}
-      ],
-      "verification":"변경 후 결과 (예: '3 sample CT scan 결과 OK, monitoring 진행')"
+      "detail":"발생 내역 요약",
+
+      "gapAnalysis":"(옵셔널) 재발 간격 분석, 단발이면 ''",
+      "totalDuration":"(옵셔널) 누적 N분, 1건이면 ''",
+      "partsReplaced":"(옵셔널) 교체 부품, 없으면 ''"
     }
   ],
   "conditionChanges": {
@@ -1163,23 +1171,37 @@ ${focus}
     "settingChange": [{"equipment":"호기","parameter":"파라미터명","before":"변경 전","after":"변경 후"}],
     "cutter": [{"date":"YY/M/D","time":"HH:MM","equipment":"호기","change":"변경 내용"}],
     "other": [{"date":"YY/M/D","equipment":"호기","change":"기타 조건 변경","pic":"담당자"}]
-  }
+  },
+  "conditionChangeGroups": []
 }
 
+[★ 옵셔널 필드 — 데이터에 명백한 단서 있을 때만]
+gapAnalysis / totalDuration / partsReplaced / conditionChangeGroups 등은
+데이터에 명백히 있을 때만 채우고, 없으면 빈 배열/빈 문자열로 빠르게 응답.
+풍부함보다 응답 속도와 핵심 누락 방지가 우선.
+
+[조건변경 그룹 (옵셔널 conditionChangeGroups)]
+같은 호기에 여러 파라미터를 동시 변경한 경우만 하나의 그룹으로 묶음:
+{"title":"STK-3-B2 Overhang 대응", "equipment":"STK-3-B2", "timeRange":"06:00~06:40", "shift":"Shift 1",
+ "picReason":"PIC: Rijal · 사유: Anode X value spec 초과",
+ "parameters":[{"parameter":"...","before":"...","after":"..."}],
+ "verification":"3 sample CT scan OK"}
+명백히 그룹이 없으면 빈 배열 [].
+
 [규칙]
-- recurringByCategory: 키워드 카테고리 (Tab Width/NG, Sensor cable, Servo Fault, Vision NG, Hang Error 등)
-- recurringSameEquipment: 같은 호기에서 2건 이상 발생, gapAnalysis 필수
-- conditionChangeGroups: 같은 호기에 여러 파라미터 동시 변경된 경우 하나의 그룹으로 묶기 (사용자 레포트 양식)
-- conditionChanges: 4개 하위 그룹별 표 형식 — conditionChangeGroups와 보완 관계 (둘 다 채움)
+- recurringByCategory: 키워드 카테고리 — 모든 카테고리 빠짐없이 집계
+- recurringSameEquipment: 같은 호기 2건 이상 발생만
+- conditionChanges 4개 하위 그룹 — 메시지 데이터 모두 분류, 없으면 빈 배열 []
 - 모든 수치는 숫자만`;
 
-  const userMsg = `[전체 부동 이슈 데이터 - ${totalCount}건]
+  const userMsg = `[부동 이슈 데이터 - ${totalCount}건]
 ${JSON.stringify(issuesData, null, 1)}
 
 [공정/설비 조건변경 메시지 - ${processChangeData.length}건]
 ${processChangeData.length > 0 ? JSON.stringify(processChangeData, null, 1) : "(없음)"}
 
-위 데이터를 2번 반복 + 3번 조건변경 형식으로 정리하세요. 동일 호기 다발 시 재발 간격을 분석하고, 조건변경은 호기별 그룹으로 묶으세요 (PIC + 사유 + 검증 결과 포함).`;
+위 데이터를 2번 반복 + 3번 조건변경 형식으로 정리하세요.
+옵셔널 필드(gapAnalysis, conditionChangeGroups 등)는 명백한 단서 있을 때만 채우고, 없으면 빈 값으로 빠르게 응답하세요.`;
 
   return await callCurationPart(sys, userMsg, "Part2-Recurring/ConditionChange");
 }
@@ -1193,69 +1215,51 @@ async function curationPart3_TestPmQuality(testData, qualityData, focus, kbText,
 
 ${focus}
 
-[★ 영역 12-Y3: 사용자 레포트 수준 출력]
+[★ 최우선 지시 — 누락 금지]
+입력의 테스트 메시지와 품질 메시지를 빠짐없이 분류해 testPm 4개 그룹 + qualityNg에 정리하세요.
 
-1) **Line PM 시작/완료 시각**: 단순 상태가 아니라 "04/24 07:58 시작 → 04/24 16:08 완료" 형태
-
-2) **PM 결과 명시**: 호기별 PM/Cleaning/Check DE 완료 여부
-
-3) **만성 NG 라인 별도 추적 (chronic1AB)**: 사용자 레포트에서 "Stacking 1-AB Sepa Run Issues (지속 모니터링)" 같은 만성 라인 별도 섹션
-   - 데이터에 1AB 라인 NG 누적 보고가 있으면 호기별 NG 패턴 정리
-   - 예: "1-A2: NG ETC YCS 5x Sepa wrinkle First stack" / "1-A3: 2 lot 연속" 등
-
-4) **3일치 품질 비교 (qualityNg.table 3일치)**: 어제, 오늘, 내일 데이터 모두 추출 (데이터에 있으면). KB에서 어제 데이터 활용 가능
-
-5) **품질 추세 분석 (trend)**: 단순 수치가 아니라 "Sepa Fold 17→18 (소폭 증가), Electrode Expose 6→10 (+67%), Dimension Overkill 0→1 발생 (주목)" 같은 비교 분석
-
-6) **Cutter UBM 정밀 정보**: UBM Limit, 교체 부품, 결과 (Solved/Monitoring) 명시
-
-[필수 출력 - JSON만, 다른 텍스트 금지]
+[필수 출력 — JSON만, 다른 텍스트 금지]
 {
   "testPm": {
     "linePM": [
-      {
-        "date":"YY/M/D",
-        "line":"라인명 (예: Line 4-2 PM)",
-        "status":"상태 — 미수행/진행중/Stop No Production/완료",
-        "startTime":"시작 시각 (HH:MM, 있으면)",
-        "endTime":"완료 시각 (HH:MM, 있으면)",
-        "details":[{"equipment":"호기","work":"작업 내용 (예: PM, Cleaning, Check DE)","result":"✅/🔄/❌"}]
-      }
+      {"date":"YY/M/D","line":"라인명","status":"상태",
+       "startTime":"(옵셔널) 시작 시각", "endTime":"(옵셔널) 완료 시각",
+       "details":[{"equipment":"호기","work":"PM/Cleaning 등","result":"✅/🔄/❌"}]}
     ],
     "fmvs": [{"date":"YY/M/D","action":"FMVS 작업","equipments":"대상 설비"}],
     "cutter": [
-      {"date":"YY/M/D","time":"HH:MM","equipment":"설비","item":"테스트 항목 (예: UBM Limit)","action":"조치 (예: Top Cutter Sear angle 1.8 교체 + Bottom flip)","resultIcon":"✅/❌/🔄","note":"결과 비고"}
+      {"date":"YY/M/D","time":"HH:MM","equipment":"설비 (있으면)","item":"테스트 항목","resultIcon":"✅/❌/🔄","note":"결과"}
     ],
-    "stackingSepa": [{"date":"YY/M/D","equipment":"호기","issue":"문제 내용","resultIcon":"❌"}]
-  },
-  "chronic1AB": {
-    "title":"Stacking 1-AB Sepa Run Issues (지속 모니터링) (있으면, 없으면 빈 객체)",
-    "patternSummary":"전반적 패턴 (예: 'Separator wrinkle / YCS / Sepa Fold 3 종류 NG 다발')",
-    "byEquipment":[
-      {"equipment":"1-A2","ngList":"NG ETC YCS 5x Sepa wrinkle First stack"},
-      {"equipment":"1-B2","ngList":"NG YCS First stack 7X (이번 기간 최다)"}
-    ]
-  },
-  "line3DCutterCpc": {
-    "status":"04/25 03:39 monitoring 결과 CPC 이상 재발견 (있으면 작성, 없으면 빈 객체)",
-    "details":["보고 시각 + 내용 1", "보고 시각 + 내용 2"]
+    "stackingSepa": [{"date":"YY/M/D","equipment":"호기","issue":"문제","resultIcon":"❌"}]
   },
   "qualityNg": {
-    "table": [
-      {"date":"YY/M/D (전전일)","sepaFold":숫자,"electrodeExpose":숫자,"nonResponse":숫자,"dimOverkill":숫자,"contactNg":숫자},
-      {"date":"YY/M/D (전일)","sepaFold":숫자,"electrodeExpose":숫자,"nonResponse":숫자,"dimOverkill":숫자,"contactNg":숫자},
-      {"date":"YY/M/D (당일, 진행중)","sepaFold":숫자,"electrodeExpose":숫자,"nonResponse":숫자,"dimOverkill":숫자,"contactNg":숫자}
-    ],
-    "trend": "비교 분석 (예: 'Sepa Fold 17→18 (소폭 증가), Electrode Expose 6→10 (+67%), Dimension Overkill 0→1 발생 (주목), Non Response 5→7 증가')"
-  }
+    "table": [{"date":"YY/M/D","sepaFold":숫자,"electrodeExpose":숫자,"nonResponse":숫자,"dimOverkill":숫자,"contactNg":숫자}],
+    "trend": "비교 분석 텍스트 (예: 'Sepa Fold 17→18 증가, Electrode Expose 6→10 (+67%)')"
+  },
+  "chronic1AB": null,
+  "line3DCutterCpc": null
 }
+
+[★ 옵셔널 필드 — 데이터에 명백한 단서 있을 때만]
+chronic1AB / line3DCutterCpc / linePM.startTime/endTime/details 등은
+데이터에 명백히 있을 때만 채우고, 없으면 null 또는 빈 값으로 빠르게 응답.
+
+[chronic1AB (옵셔널)]
+1AB 라인 만성 NG 보고가 있을 때만:
+{"title":"Stacking 1-AB Sepa Run Issues (지속 모니터링)",
+ "patternSummary":"패턴 요약",
+ "byEquipment":[{"equipment":"1-A2","ngList":"NG 내역"}]}
+없으면 null.
+
+[line3DCutterCpc (옵셔널)]
+Line 3D Cutter CPC 모니터링 보고가 있을 때만:
+{"status":"내용", "details":["보고1","보고2"]}
+없으면 null.
 
 [규칙]
 - testPm 4개 하위 그룹 — 데이터 없으면 빈 배열 []
-- chronic1AB는 1AB 라인의 만성 NG가 데이터에 있을 때만 작성
-- line3DCutterCpc는 데이터에 있을 때만 작성
-- qualityNg.table은 가능한 한 3일치 (데이터 + KB 종합)
-- qualityNg.trend는 비교 분석 형식 (단순 나열 X). 없으면 "데이터 없음"
+- qualityNg.table은 데이터에 있는 일자만 (3일치는 KB 활용 가능, 옵셔널)
+- qualityNg.trend는 비교 분석 형식, 1일치만 있으면 "1일치 데이터 — 비교 불가"
 - 모든 수치는 숫자만`;
 
   const userMsg = `[테스트/양산외 생산 메시지 - ${testData.length}건]
@@ -1264,7 +1268,8 @@ ${testData.length > 0 ? JSON.stringify(testData, null, 1) : "(없음)"}
 [품질 이슈 메시지 - ${qualityData.length}건]
 ${qualityData.length > 0 ? JSON.stringify(qualityData, null, 1) : "(없음)"}
 
-위 데이터를 4번 테스트/PM + 5번 품질NG 형식으로 정리하세요. 만성 1AB 라인은 별도 섹션, 품질은 3일치 비교, 추세는 비교 분석 형식으로.`;
+위 데이터를 4번 테스트/PM + 5번 품질NG 형식으로 정리하세요.
+옵셔널 필드(chronic1AB, line3DCutterCpc 등)는 명백한 단서 있을 때만, 없으면 null로 빠르게 응답하세요.`;
 
   return await callCurationPart(sys, userMsg, "Part3-TestPm/Quality");
 }

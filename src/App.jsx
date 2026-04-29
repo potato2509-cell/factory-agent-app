@@ -1168,11 +1168,10 @@ async function runPreCuration(allIssues, kbPE, reportType, categoryMsgs = {}) {
       backupLongDowntime.map(d => (d.equipment || "").trim()).filter(Boolean)
     );
 
-    // 누락된 30분+ 이슈만 추출 (부동시간 내림차순, 최대 12건까지 채움)
+    // 누락된 30분+ 이슈 모두 추출 (부동시간 내림차순) — ★ AI2: 12건 cap 제거, 모든 30분+ 호기 표시
     const missingIssues = dataLongIssues
       .filter(i => i.eq && !llmCoveredEqs.has(i.eq.trim()))
-      .sort((a, b) => (b.durMin || 0) - (a.durMin || 0))
-      .slice(0, 12 - llmLongCount);
+      .sort((a, b) => (b.durMin || 0) - (a.durMin || 0));
 
     if (missingIssues.length > 0) {
       const ruleBackupItems = missingIssues.map((i, idx) => ({
@@ -1355,8 +1354,10 @@ ${JSON.stringify(issuesData, null, 1)}
 위 데이터에서 duration_min >= ${longThreshold} 인 모든 부동 이슈를 longDowntime에 빠짐없이 정리하세요.
 옵셔널 필드(splitDetail, historyPattern 등)는 명백한 단서 있을 때만 채우고, 없으면 빈 값으로 응답해 응답 속도를 우선하세요.`;
 
-  // ★ 영역 12-AF4: Part 1 max_tokens 1500 (이전 1800 → 30.5초 timeout 직전, 안전 마진 확보)
-  return await callCurationPart(sys, userMsg, "Part1-LongDowntime", [], {}, 1500);
+  // ★ 영역 12-AI2: Part 1 max_tokens 1500 → 1800 (호기 9개+ 풀 추출 위해)
+  // 이전 1500은 timeout 안전 마진 위해 줄였지만 호기 4개로 누락 多 (정답 9개)
+  // 1800은 timeout 위험 약간 있지만 Sonnet 30초 직전 마지노선, fallback도 있음
+  return await callCurationPart(sys, userMsg, "Part1-LongDowntime", [], {}, 1800);
 }
 
 // ─── ★ 영역 12-AF: Part 2 분할 (2a: recurring + simple changes, 2b: conditionChangeGroups 전용) ──
@@ -1382,8 +1383,11 @@ ${focus}
     {"category":"Servo Fault","count":4,"equipments":["STK-4-B1 (×2)","STK-3-D5"]}
   ],
   "recurringSameEquipment": [
-    {"equipment":"호기","count":건수,"detail":"발생 내역",
-     "gapAnalysis":"(옵셔널)","totalDuration":"(옵셔널)","partsReplaced":"(옵셔널)"}
+    {"equipment":"호기","count":건수,
+     "detail":"★ 사건 단위 — 시각·분 명시 (예: '14:17 Servo Forward Over Run 38min + 15:42 Servo Total Fault 28min')",
+     "gapAnalysis":"★ 재발 간격 분석 (예: '47분 간격 재발', '8분 간격 연속 발생')",
+     "totalDuration":"누적 N분 (예: '누적 66분')",
+     "partsReplaced":"교체 부품 (예: 'Mandrel Y2 + Servo R 모두 교체')"}
   ],
   "conditionChanges": {
     "visionOffset": [{"date":"YY/M/D","time":"HH:MM","equipment":"호기","change":"변경 내용","reason":"사유"}],
@@ -1393,9 +1397,17 @@ ${focus}
   }
 }
 
+[★ 영역 12-AI3 — recurringSameEquipment 풍부도 강조]
+같은 호기 2건 이상 재발한 경우 다음을 반드시 추출:
+1) **detail에 시각·분 명시** — 단순 "2회 발생" 아닌 "14:17 38min + 15:42 28min" 형식
+2) **gapAnalysis에 간격 명시** — "47분 간격 재발", "8분 간격 연속 발생"
+3) **totalDuration 누적 분 표기** — "누적 66분"
+4) **partsReplaced 교체 부품** — "Mandrel Y2 + Servo R 모두 교체"
+★ 이 4개 필드는 옵셔널이지만 가능한 한 풍부하게 채울 것 (사건 단위 분석 핵심)
+
 [규칙]
 - recurringByCategory: 모든 카테고리 빠짐없이 집계
-- recurringSameEquipment: 같은 호기 2건 이상 발생만
+- recurringSameEquipment: 같은 호기 2건 이상 발생만 (★ detail에 시각·분, gap·누적·부품 풀로 추출)
 - conditionChanges 4개 하위 그룹 — 단발 변경/단순 항목만 (다중 파라미터 그룹은 제외)
 - 모든 수치는 숫자만`;
 
@@ -2386,7 +2398,7 @@ function buildTimeFreqAnalysis(allIssues, processName = "Cell") {
 // 환각 방지: confidence 라벨 + 근거 데이터 명시 (ii+iii)
 // 7번 P0/P1/P2 분류: LLM 판단 + 룰 검증 (Z)
 // ═════════════════════════════════════════════════════════════════════════════
-async function generateInsightsAndActions(curation, discussions, taggedResult, kbPE, reportType) {
+async function generateInsightsAndActions(curation, discussions, taggedResult, kbPE, reportType, categoryMsgs = {}) {
   const focus = REPORT_FOCUS[reportType] || REPORT_FOCUS.meeting;
   const kbText = kbPE ? `\n\n[학습 내용 일부]\n${kbPE.slice(0, 300)}` : "";
 
@@ -2414,19 +2426,48 @@ async function generateInsightsAndActions(curation, discussions, taggedResult, k
   // 5-카테고리 통계
   const counts = (taggedResult && taggedResult.counts) || {};
 
-  // 큐레이션 핵심만 추출 (핵심요약 + 장기부동 + 반복 카테고리)
+  // 큐레이션 핵심 + 그룹/만성 (★ 영역 12-AI1: conditionChangeGroups + chronic1AB도 6/7번 LLM에 전달)
   const cur = curation || {};
   const briefingSummary = {
     summary_text: cur.summary_text || "",
     criticalSummary: cur.criticalSummary || [],
-    longDowntime: (cur.longDowntime || []).slice(0, 5).map(d => ({
-      equipment: d.equipment, durationMin: d.durationMin,
+    longDowntime: (cur.longDowntime || []).slice(0, 8).map(d => ({
+      equipment: d.equipment, durationMin: d.durationMin, time: d.time || "",
       rootCause: d.rootCause, splitNote: d.splitNote || "",
+      partsReplaced: d.partsReplaced || "", recurrenceGap: d.recurrenceGap || "",
     })),
-    recurringByCategory: (cur.recurringByCategory || []).slice(0, 5).map(r => ({
-      category: r.category, count: r.count, equipments: (r.equipments || []).slice(0, 3),
+    recurringByCategory: (cur.recurringByCategory || []).slice(0, 8).map(r => ({
+      category: r.category, count: r.count, equipments: (r.equipments || []).slice(0, 5),
     })),
+    recurringSameEquipment: (cur.recurringSameEquipment || []).slice(0, 5).map(r => ({
+      equipment: r.equipment, count: r.count, detail: r.detail, gapAnalysis: r.gapAnalysis || "",
+      totalDuration: r.totalDuration || "", partsReplaced: r.partsReplaced || "",
+    })),
+    // ★ AI1: conditionChangeGroups — STK-3-B2 매니저 지시 같은 핵심 정보 활용
+    conditionChangeGroups: (cur.conditionChangeGroups || []).slice(0, 5).map(g => ({
+      title: g.title, equipment: g.equipment, picReason: g.picReason,
+      paramCount: (g.parameters || []).length, verification: g.verification || "",
+    })),
+    chronic1AB: cur.chronic1AB ? {
+      title: cur.chronic1AB.title || "",
+      patternSummary: cur.chronic1AB.patternSummary || "",
+      ngEquipmentCount: (cur.chronic1AB.byEquipment || []).length,
+      worstEquipment: (cur.chronic1AB.byEquipment || [])[0]?.equipment || "",
+    } : null,
     qualityTrend: cur.qualityNg?.trend || "",
+  };
+
+  // ★ AI1: raw 핵심 메시지 발췌 — 매니저 후속 보고 / chronic 1AB / 매니저 지시 (사건 단위 디테일)
+  // 6번/7번이 raw 메시지를 못 봐서 사건 단위 디테일 부족 → 풍부한 raw 컨텍스트 제공
+  const extractKeyEventMsgs = (msgs, max = 5) => (msgs || []).slice(0, max).map((m, i) => ({
+    no: i + 1,
+    date: m.date || "",
+    time: m.time || "",
+    text: (m.text || "").slice(0, 350).replace(/\n/g, " | "),
+  }));
+  const rawEventContext = {
+    process_change_top5: extractKeyEventMsgs(categoryMsgs.process_change, 5),
+    quality_top3: extractKeyEventMsgs(categoryMsgs.quality, 3),
   };
 
   const sys = `${FACTORY_PHILOSOPHY}
@@ -2448,6 +2489,28 @@ ${focus}
   - 7번 액션은 사회자 "개선안_합의"와 "재발방지책_합의"에서 직접 도출 (P0/P1/P2 분류)
   - "충돌점"이 있는 이슈는 "가설-검증필요" confidence + "추가 논의 필요" 액션으로 기재
 
+[★★★ 영역 12-AI1 — 사건 단위 디테일 작성 (가장 중요) ★★★]
+6번 인사이트는 **개념적 통계가 아니라 구체적 사건 단위**로 작성하세요.
+
+❌ 나쁜 예 (개념적, 통계만):
+  "STK-4호기 다발 부동 — 설비 정비 품질 악화 신호"
+  "Ejector 타임아웃 & Servo Fault 반복 — 근본조치 미완"
+
+✅ 좋은 예 (구체적, 시각·분·인과 명시):
+  "STK-4-B1 Stack Table R Servo 47분 간격 2회 발생: 14:17 Servo Forward Over Run → 2nd PnP(+) 충돌, 15:42 Servo Total Fault → Servo R 자체 교체. 1차 조치(homing/tunning)로 해결 안 됨, servo 자체 결함 가능성"
+  "STK-3-C4 Heat Press 영역 8분 간격 2회: 04:57 cable loose, 05:38 mechanical interference. 두 이슈가 timing fault로 연관 가능성"
+  "STK-3-B2 Overhang — 10개 파라미터 동시 변경 후 Agam 매니저 직접 개입 (Gearbox 교체 deep investigation 지시)"
+
+★ 입력 데이터의 conditionChangeGroups, recurringSameEquipment, raw 메시지를 활용해
+  시각, 호기명, 부품명, 분 수치, 매니저 지시 등 구체적 사실을 포함하세요.
+
+[★ 7번 액션 — P0 우선순위 명시 (가장 중요)]
+P0 (안전·환경, 매니저 직접 지시, horizontal deployment) 액션을 반드시 포함하세요.
+다음 패턴은 P0:
+  - 매니저 직접 지시 사항 (예: "Agam 매니저 → Gearbox 교체 deep investigation")
+  - 동일 호기 짧은 간격 재발 → horizontal deployment (예: "Servo R 31137 single turn fault 점검")
+  - mechanical interference 의심 → 합동 조사
+
 [환각 방지 규칙 — 매우 중요]
 - 각 인사이트와 액션에 confidence 라벨 (확실/가설-검증필요)을 반드시 명시
 - 가설(검증 필요)인 경우, 어느 데이터에서 도출했는지 근거(evidence) 명시
@@ -2455,8 +2518,8 @@ ${focus}
 - 알려지지 않은 과거 사례를 추측해서 만들지 마세요 — 직접 데이터에 없으면 언급 금지
 
 [7번 P0/P1/P2 분류 기준]
-- P0: 안전·환경 키워드, 9시간+ 부동, 공장 전체 영향, horizontal deployment 즉시 권장
-- P1: 미해결 이슈, spare 발주 필요, root cause 미파악, 4시간+ 부동
+- P0: 매니저 직접 지시, 안전·환경 키워드, horizontal deployment, mechanical interference 합동 조사
+- P1: 미해결 이슈, root cause 미파악, 4시간+ 부동, 예방 교체 cycle 표준화
 - P2: 모니터링, 일정 협의, 단일 설비 단발 이슈, 1시간 이하
 
 [필수 출력 - JSON만, 다른 텍스트 금지]
@@ -2465,11 +2528,11 @@ ${focus}
     {
       "title": "1) [핵심 키워드] — [설비/현상]",
       "bulletPoints": [
-        "1~2문장 인사이트 (60자 이내)",
-        "추가 관찰 (60자 이내)"
+        "★ 시각·호기·분·부품·인과를 포함한 구체적 사실 (80~120자)",
+        "추가 관찰 또는 패턴 (60~100자)"
       ],
       "confidence": "확실 또는 가설-검증필요",
-      "evidence": "어느 이슈/데이터에서 도출했는지 (예: 'STK-1-A4 longDowntime 데이터, recurringByCategory의 Tab Width 4건')"
+      "evidence": "어느 이슈/데이터에서 도출했는지"
     }
   ],
   "section7_actions": [
@@ -2484,9 +2547,10 @@ ${focus}
 }
 
 [규칙]
-- section6_insights: 5~6개 (사용자 레포트와 동일 분량)
-- section7_actions: P0 1~3개 + P1 1~3개 + P2 1~3개 (총 5~8개)
+- section6_insights: **5~6개** (사용자 레포트와 동일 분량)
+- section7_actions: **P0 2~3개 + P1 3~4개 + P2 2~3개 = 총 7~10개** (P0 반드시 포함)
 - 각 인사이트는 bulletPoints 1~3개
+- ★ 인사이트는 통계 카테고리가 아닌 **사건 단위**로 작성 (시각, 호기, 분, 부품, 인과)
 - 데이터 근거 없는 추측은 절대 만들지 마세요
 - confidence는 데이터로 명확히 검증된 것만 "확실", 추론/가설은 "가설-검증필요"`;
 
@@ -2496,17 +2560,24 @@ ${JSON.stringify(briefingSummary, null, 1)}
 [페르소나 논의 결과 — 사회자 4축 합의 (영역 12 방식 나)]
 ${moderatorSummary.length > 0 ? JSON.stringify(moderatorSummary, null, 1) : "(논의된 이슈 없음 — 큐레이션만으로 인사이트 도출)"}
 
+[★ 영역 12-AI1: raw 핵심 메시지 (사건 단위 디테일 추출용)]
+${JSON.stringify(rawEventContext, null, 1)}
+※ 위 process_change_top5에 매니저 지시 ("hadehh, please do investigation deeply ... gearbox change")나
+   동일 호기 다중 파라미터 변경 같은 정보가 있을 수 있음. 사건 단위 디테일에 활용.
+
 [5-카테고리 통계]
 장기부동: ${counts.LONG_DOWNTIME || 0} / 반복: ${counts.HIGH_FREQUENCY || 0} / 조건변경: ${counts.CONDITION_CHANGE || 0} / 테스트PM: ${counts.TEST_PM || 0} / 품질NG: ${counts.QUALITY_NG || 0}
 
-위 데이터를 바탕으로 6번 "가장 주목할 사항" 5~6건과 7번 "액션 후속 사항" P0/P1/P2 표를 작성하세요.
+위 데이터를 바탕으로:
+★ 6번 "가장 주목할 사항" 5~6건 — **사건 단위** (시각·호기·분·부품·인과 구체 명시)
+★ 7번 "액션 후속 사항" 총 7~10건 — **P0 2~3개 반드시 포함** (매니저 직접 지시, horizontal deployment 등)
 환각 방지를 위해 confidence와 evidence를 반드시 명시하세요.`;
 
   try {
     await new Promise(r => setTimeout(r, 500));
     const raw = await callClaudeRaw(sys, userMsg, {
-      model: MODEL_FAST,  // Haiku (빠른 응답, 6/7번 생성에 충분)
-      max_tokens: 3000,
+      model: MODEL_REASONING,  // ★ AI1: Haiku → Sonnet (사건 단위 디테일에 추론력 필요)
+      max_tokens: 3500,  // P0 포함 7~10개 액션 + 5~6개 인사이트 풀 작성
     });
     const parsed = safeJSON(raw);
 
@@ -3131,14 +3202,14 @@ export default function App() {
         normal: [],
       };
 
-      // ★ 영역 11-E: 6번 "가장 주목할 사항" + 7번 "액션 후속 사항" 생성
-      setProgress(p => [...p, "💡 6번 인사이트 + 7번 액션 후속 사항 생성 중..."]);
+      // ★ 영역 11-E + 12-AI1: 6번 "가장 주목할 사항" + 7번 "액션 후속 사항" 생성 (Sonnet + raw 메시지)
+      setProgress(p => [...p, "💡 6번 인사이트 + 7번 액션 후속 사항 생성 중 (Sonnet 사건 단위)..."]);
       let insightsAndActions = { section6_insights: [], section7_actions: [] };
       try {
         insightsAndActions = await generateInsightsAndActions(
           curation, allDiscussions, taggedResult,
           kbResult.kb["Cell_PE"] || kbResult.kb["Elec_PE"] || "",
-          reportType
+          reportType, categoryMsgs  // ★ AI1: raw 메시지 전달
         );
         setProgress(p => [...p, `✅ 인사이트 ${insightsAndActions.section6_insights.length}건 / 액션 ${insightsAndActions.section7_actions.length}건 생성 완료`]);
       } catch (e) {

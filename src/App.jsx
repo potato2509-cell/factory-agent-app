@@ -593,19 +593,75 @@ function classifyMessages(msgs) {
   const downtime = [], equipment = [], general = [];
   // 영역 5: 큐레이션 이력 카테고리
   const qualityMsgs = [], processChangeMsgs = [], testMsgs = [], ambiguousMsgs = [];
+
+  // ★ 영역 12-AC2: 안전망용 — 옛 형식 흡수된 sub-message 키워드 분류 헬퍼
+  const classifySubMessage = (subText, baseEntry) => {
+    if (!subText || subText.trim().length <= 5) return;
+    if (subText.includes("미디어 파일 제외됨")) return;
+    const lowerText = subText.toLowerCase();
+    const matched = [];
+    if (QUALITY_KEYWORDS.some(kw => lowerText.includes(kw.toLowerCase()))) matched.push("quality");
+    if (PROCESS_CHANGE_KEYWORDS.some(kw => lowerText.includes(kw.toLowerCase()))) matched.push("process_change");
+    if (TEST_KEYWORDS.some(kw => lowerText.includes(kw.toLowerCase()))) matched.push("test");
+    // 패턴 매칭
+    if (!matched.includes("process_change")) {
+      const settingPattern = /\d+(?:\.\d+)?\s*(?:→|->|=>|>>)\s*\d+(?:\.\d+)?/;
+      if (settingPattern.test(subText)) matched.push("process_change");
+    }
+    if (!matched.includes("quality")) {
+      const jxtPattern = /JXT\d{10,}/i;
+      if (jxtPattern.test(subText)) matched.push("quality");
+    }
+    const subEntry = { ...baseEntry, text: subText };
+    if (matched.length === 1) {
+      if (matched[0] === "quality") qualityMsgs.push(subEntry);
+      else if (matched[0] === "process_change") processChangeMsgs.push(subEntry);
+      else if (matched[0] === "test") testMsgs.push(subEntry);
+    } else if (matched.length >= 2) {
+      ambiguousMsgs.push({ ...subEntry, matched });
+    }
+  };
+
+  let absorbedSubCount = 0;  // 12-AC2 진단용
   let i = 0;
   while (i < msgs.length) {
     const m = msgs[i];
     if (m.text.includes("[BM Downtime Bot]")) {
       let full = m.text;
-      let j = i + 1;
-      while (j < msgs.length && !msgs[j].text.includes("[BM Downtime Bot]")) {
-        if (!msgs[j].text.includes("미디어 파일 제외됨")) full += "\n" + msgs[j].text;
-        j++;
-        if (j - i > 15) break;
+
+      // ★ 영역 12-AC1: 신 형식 BM Bot 감지 — Start Time / End Time이 모두 있으면 단일 메시지로 완결됨
+      // 옛 형식 (~2025): 한 메시지가 여러 줄로 분리됨 → multi-line 통합 필요
+      // 신 형식 (2026~): 한 메시지에 모든 필드 포함 → 통합 시 일반 메시지 흡수 부작용
+      const hasCompleteFields = m.text.includes("Start Time") && m.text.includes("End Time");
+
+      if (!hasCompleteFields) {
+        // 옛 형식 — multi-line 통합 (기존 로직 + 12-AC2 안전망)
+        let j = i + 1;
+        const absorbedTexts = [];  // 흡수된 sub-message 보관 (안전망)
+        while (j < msgs.length && !msgs[j].text.includes("[BM Downtime Bot]")) {
+          if (!msgs[j].text.includes("미디어 파일 제외됨")) {
+            full += "\n" + msgs[j].text;
+            absorbedTexts.push({ text: msgs[j].text, msg: msgs[j] });  // 흡수 시 보관
+          }
+          j++;
+          if (j - i > 15) break;
+        }
+        downtime.push({ time: m.time, text: full, date: m.date, hour: m.hour });
+
+        // ★ 12-AC2: 흡수된 sub-message 각각도 키워드 매칭 별도 실행 (PM/조건변경 누락 방지)
+        absorbedTexts.forEach(({ text, msg }) => {
+          classifySubMessage(text, {
+            time: msg.time, sender: msg.sender, date: msg.date, hour: msg.hour,
+          });
+          absorbedSubCount++;
+        });
+
+        i = j;
+      } else {
+        // ★ 12-AC1: 신 형식 — 단일 메시지로 처리, 다음 일반 메시지 흡수 안 함
+        downtime.push({ time: m.time, text: full, date: m.date, hour: m.hour });
+        i++;
       }
-      downtime.push({ time: m.time, text: full, date: m.date, hour: m.hour });
-      i = j;
     } else if (m.text.match(/cutter|limit|⚠️|🟡|cathode|anode/i)) {
       equipment.push({ time: m.time, sender: m.sender, text: m.text, date: m.date, hour: m.hour });
       i++;
@@ -658,8 +714,11 @@ function classifyMessages(msgs) {
       general.push(entry);
     }
   }
-  // ★ 영역 12-AB4: 분류 안 된 일반 메시지 진단 로그
+  // ★ 영역 12-AB4 + 12-AC2: 분류 안 된 일반 메시지 진단 로그
   if (typeof console !== "undefined") {
+    if (absorbedSubCount > 0) {
+      console.log(`[메시지 분류] 옛 형식 BM Bot이 흡수한 sub-message ${absorbedSubCount}건도 키워드 분류 별도 실행 (12-AC2)`);
+    }
     if (general.length > 0) {
       console.log(`[메시지 분류 진단] 분류 안 됨(general) ${general.length}건. 샘플 5건 (3,4번 누락 진단용):`);
       general.slice(0, 5).forEach((g, i) => {

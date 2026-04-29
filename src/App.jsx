@@ -697,7 +697,30 @@ function extractAllIssues(downtime) {
   return downtime.map(d => {
     const result = extractField(d.text, "Result");
     const durStr = extractField(d.text, "Duration");
-    const durMin = parseInt(durStr) || 0;
+    let durMin = parseInt(durStr) || 0;
+
+    // ★ 영역 12-AA: 신 형식 BM Bot 지원 — Duration 필드 없을 때 Start Time / End Time으로 계산
+    // 옛 형식 (~2025): *Duration*: 7 minutes
+    // 신 형식 (2026~): *Start Time*: 8/11/2025, 2:48:10 PM / *End Time*: 8/11/2025, 3:00:10 PM
+    if (durMin === 0) {
+      const startStr = extractField(d.text, "Start Time");
+      const endStr = extractField(d.text, "End Time");
+      if (startStr && endStr) {
+        try {
+          const startDate = new Date(startStr);
+          const endDate = new Date(endStr);
+          if (!isNaN(startDate.getTime()) && !isNaN(endDate.getTime())) {
+            const diffMin = Math.round((endDate.getTime() - startDate.getTime()) / 60000);
+            if (diffMin > 0 && diffMin < 24 * 60 * 7) {  // 0~1주일 사이만 유효 (방어)
+              durMin = diffMin;
+            }
+          }
+        } catch (e) {
+          // 파싱 실패 시 0 유지
+        }
+      }
+    }
+
     const stopStatus = extractField(d.text, "Stop Status");
     const eq = extractField(d.text, "Equipment");
     const part = extractField(d.text, "Part Replacement");
@@ -2524,6 +2547,18 @@ export default function App() {
     const allIssuesFlat = extractAllIssues(cl.downtime);  // 영역 11-A: priority 객체 대신 평면 배열
     setClassified(cl);
     setPriority(allIssuesFlat);  // priority state는 이제 평면 배열을 보유
+
+    // ★ 영역 12-AA: Duration 파싱 진단 로그
+    const dur30plus = allIssuesFlat.filter(i => (i.durMin || 0) >= 30).length;
+    const dur60plus = allIssuesFlat.filter(i => (i.durMin || 0) >= 60).length;
+    const dur0 = allIssuesFlat.filter(i => (i.durMin || 0) === 0).length;
+    console.log(`[Duration 파싱 진단] BM Bot 전체 ${allIssuesFlat.length}건 / 30분+ ${dur30plus}건 / 60분+ ${dur60plus}건 / durMin=0 ${dur0}건`);
+    if (allIssuesFlat.length > 0) {
+      console.log(`[Duration 샘플]`, allIssuesFlat.slice(0, 3).map(i => ({
+        eq: i.eq, durMin: i.durMin, prob: (i.prob || "").slice(0, 50)
+      })));
+    }
+    console.log(`[메시지 분류] downtime ${cl.downtime?.length || 0} / quality ${cl.qualityMsgs?.length || 0} / process_change ${cl.processChangeMsgs?.length || 0} / test ${cl.testMsgs?.length || 0} / ambiguous ${cl.ambiguousMsgs?.length || 0}`);
 
     // ★ 영역 6-B: STEP 3 진입 전에 PE 큐레이션을 미리 실행 (사용자가 자동 선정 결과를 바로 보고 추가 선택할 수 있도록)
     setCurating(true);

@@ -2742,6 +2742,27 @@ export default function App() {
         console.log(`[모호 분류] skip ${ambigResult.skip.length}건 (어디에도 분류 안 됨)`);
       }
 
+      // ★ 영역 12-AE0: 카테고리별 raw 메시지 샘플 출력 (LLM에 들어가는 데이터 확인용)
+      // 사용자 정답 레포트 (24일자) 5개 그룹 (STK-3-B2 Overhang, Cutter 2C, STK-4-B1, STK-4-B3, STK-2-A1)이
+      // 실제 데이터에 있는지 확인 — 풍부도 갭의 원인 진단 (데이터 부족 vs LLM 부족)
+      console.log(`[process_change 메시지 raw — ${categoryMsgs.process_change.length}건 중 최대 10건]`);
+      categoryMsgs.process_change.slice(0, 10).forEach((m, i) => {
+        const preview = (m.text || "").replace(/\n/g, " | ").slice(0, 250);
+        console.log(`  [PC-${i+1}] ${m.date || "?"} ${m.time || "?"} ${m.sender || "?"}: ${preview}${m.text.length > 250 ? "..." : ""}`);
+      });
+      console.log(`[test 메시지 raw — ${categoryMsgs.test.length}건 중 최대 10건]`);
+      categoryMsgs.test.slice(0, 10).forEach((m, i) => {
+        const preview = (m.text || "").replace(/\n/g, " | ").slice(0, 250);
+        console.log(`  [TST-${i+1}] ${m.date || "?"} ${m.time || "?"} ${m.sender || "?"}: ${preview}${m.text.length > 250 ? "..." : ""}`);
+      });
+      if (categoryMsgs.quality.length > 0) {
+        console.log(`[quality 메시지 raw — ${categoryMsgs.quality.length}건 중 최대 5건]`);
+        categoryMsgs.quality.slice(0, 5).forEach((m, i) => {
+          const preview = (m.text || "").replace(/\n/g, " | ").slice(0, 250);
+          console.log(`  [QL-${i+1}] ${m.date || "?"} ${m.time || "?"} ${m.sender || "?"}: ${preview}${m.text.length > 250 ? "..." : ""}`);
+        });
+      }
+
       // ★ 영역 12-Y5: 큐레이션에 KB 활용 (Cell_PE / Elec_PE 우선, 없으면 빈 문자열)
       let kbForCuration = "";
       try {

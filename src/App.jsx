@@ -22,7 +22,7 @@ const REPORT_FOCUS = {
 // ─── 키워드 화이트리스트 (즉시 DEEP 강제) ───────────────────────────────────────
 const DEEP_FORCE_KEYWORDS = {
   안전: ["부상", "사고", "화재", "감전", "추락", "응급", "구급", "injury", "fire"],
-  환경: ["누유", "누수", "유출", "분진", "악취", "leak", "spill"],
+  환경: ["누유", "누수", "유출", "분진", "악취", "spill"],  // 영역 12-X1: AZS 미사용 유해물질로 영문 leak 제외 (단순 공압 LEAK은 DEEP 제외)
   품질통제: ["SAR", "NCR", "HOLD", "Special Action Request", "Non-Conformance"],
   출하고객: ["고객 클레임", "반품", "출하 정지", "납품 지연", "claim"],
   라인정지: ["라인 정지", "가동 중단", "전 라인 멈춤", "올스톱", "full_stop"],
@@ -64,7 +64,7 @@ const SCORE_KEYWORD_MATRIX = {
     bonus: 10,
     keywords: ["emergency", "EMO", "safety", "환경", "부상", "사고", "화재",
                "감전", "추락", "응급", "구급", "injury", "fire",
-               "누유", "누수", "유출", "분진", "악취", "leak", "spill"],
+               "누유", "누수", "유출", "분진", "악취", "spill"],  // 영역 12-X1: 영문 leak 제외 (AZS 단순 공압 LEAK)
     fields: ["problem", "cause"],
   },
   quality_critical: {
@@ -841,9 +841,13 @@ function classifyIssues5Category(input, options = {}) {
 // ─── 9-C: 명세서 §5.2 매트릭스 기반 점수 (기존 scoreIssue 대체) ─────────────────
 // 기존 scoreIssue와 호환되는 시그니처. 명세서 키워드 매트릭스 5종 적용.
 function scoreIssueMatrix(issue) {
+  const dur = issue.durMin || 0;
   const breakdown = {
-    downtime: (issue.durMin || 0) / 30,
+    downtime: dur / 30,
     repeat: ((issue.repeatCount || 1) >= 2) ? (issue.repeatCount * 3) : 0,
+    // ★ 영역 12-X2 (6): 장기부동 별도 보너스 — 부동시간 누락 방지
+    long_downtime_bonus: dur >= 60 ? 8 : 0,
+    very_long_downtime_bonus: dur >= 120 ? 5 : 0,
   };
 
   // 매트릭스 5종 적용
@@ -892,18 +896,10 @@ function selectKeyIssuesFromTags(taggedIssues, maxIssues = MAX_ISSUES) {
 // ★ 새로운 논의 시스템 ★
 // ═════════════════════════════════════════════════════════════════════════════
 
-// ─── 0. PE 사전 큐레이션 (전체 이슈 1회 호출) ────────────────────────────────
+// ─── 0. PE 사전 큐레이션 — 영역 12-X3 (7): Sonnet 3분할 병렬 호출 ─────────────
+// 각 호출 max_tokens 2000 / Sonnet (MODEL_REASONING) / 504 시 Haiku fallback
+// Promise.all로 동시 실행 → 전체 시간 = 가장 느린 1건 (~8~10초)
 async function runPreCuration(allIssues, kbPE, reportType, categoryMsgs = {}) {
-  // ★ 영역 11-C: 사용자 업로드 레포트 (HTML) 1~5번 구조로 출력
-  // 1. 핵심 요약 (TL;DR)
-  // 2. 장기부동 (분할 보고 통합 적용 - LLM이 같은 호기 + 24h 내 + 동일 알람코드/root cause 묶음 판단)
-  // 3. 발생빈도 (카테고리별 + 동일 설비 다발)
-  // 4. 조건 변경 (Vision Offset / Setting / Cutter)
-  // 5. 테스트/PM (그룹별)
-  // 6. NG 품질 (트렌드)
-  //
-  // 6/7번 (가장 주목할 사항 / 액션 후속)은 페르소나 논의 후 별도 호출 (영역 11-E)
-
   const qualityList = categoryMsgs.quality || [];
   const processChangeList = categoryMsgs.process_change || [];
   const testList = categoryMsgs.test || [];
@@ -912,7 +908,7 @@ async function runPreCuration(allIssues, kbPE, reportType, categoryMsgs = {}) {
     return emptyBriefing();
   }
 
-  // 이슈 데이터를 JSON으로 변환 (긴 필드는 자르기 — 페이로드 크기 한도 고려)
+  // 이슈 데이터 변환
   const issuesData = allIssues.map((issue, idx) => ({
     no: idx + 1,
     date: issue.date || "",
@@ -945,158 +941,196 @@ async function runPreCuration(allIssues, kbPE, reportType, categoryMsgs = {}) {
   const isWeekly = reportType === "weekly";
   const longThreshold = isWeekly ? 60 : 30;
 
+  // ── 3분할 병렬 호출 ──
+  console.log("[PE 큐레이션] Sonnet 3분할 병렬 호출 시작...");
+  const startTime = Date.now();
+
+  const [part1, part2, part3] = await Promise.all([
+    curationPart1_LongDowntime(issuesData, allIssues.length, focus, kbText, longThreshold, categoryMsgs),
+    curationPart2_RecurringConditionChange(issuesData, processChangeData, allIssues.length, focus, kbText, categoryMsgs),
+    curationPart3_TestPmQuality(testData, qualityData, focus, kbText, categoryMsgs),
+  ]);
+
+  const elapsed = ((Date.now() - startTime) / 1000).toFixed(1);
+  console.log(`[PE 큐레이션] 3분할 병렬 완료 (${elapsed}초)`);
+
+  // 결과 병합
+  return normalizeBriefing({
+    summary_text: part1.summary_text || "",
+    criticalSummary: part1.criticalSummary || [],
+    longDowntime: part1.longDowntime || [],
+    recurringByCategory: part2.recurringByCategory || [],
+    recurringSameEquipment: part2.recurringSameEquipment || [],
+    conditionChanges: part2.conditionChanges || { visionOffset: [], settingChange: [], cutter: [], other: [] },
+    testPm: part3.testPm || { linePM: [], fmvs: [], cutter: [], stackingSepa: [] },
+    qualityNg: part3.qualityNg || { table: [], trend: "데이터 없음" },
+  });
+}
+
+// ─── 분할 헬퍼: 공통 호출 (Sonnet 1차 → 504 시 Haiku fallback) ─────────────────
+async function callCurationPart(sys, userMsg, partLabel, allIssuesForFallback = [], categoryMsgsForFallback = {}) {
+  try {
+    await new Promise(r => setTimeout(r, 200));
+    const raw = await callClaudeRaw(sys, userMsg, {
+      model: MODEL_REASONING,  // ★ Sonnet (품질 우선)
+      max_tokens: 2000,
+    });
+    return safeJSON(raw);
+  } catch (e) {
+    console.error(`[PE 큐레이션 ${partLabel} 1차 실패]`, e?.message);
+
+    // 504 timeout 시 Haiku로 fallback
+    if (e?.message?.includes("504") || e?.message?.includes("Timeout") || e?.message?.includes("timeout")) {
+      try {
+        console.log(`[PE 큐레이션 ${partLabel}] Haiku로 fallback 재시도...`);
+        await new Promise(r => setTimeout(r, 800));
+        const raw2 = await callClaudeRaw(sys, userMsg, {
+          model: MODEL_FAST,  // Haiku fallback
+          max_tokens: 1500,
+        });
+        return safeJSON(raw2);
+      } catch (e2) {
+        console.error(`[PE 큐레이션 ${partLabel} fallback도 실패]`, e2?.message);
+      }
+    }
+    // 최종 실패 — 빈 객체 반환 (병합 시 기본값 사용)
+    return {};
+  }
+}
+
+// ─── Part 1: 1번 장기부동 (가장 중요) ─────────────────────────────────────────
+async function curationPart1_LongDowntime(issuesData, totalCount, focus, kbText, longThreshold, categoryMsgs) {
   const sys = `${FACTORY_PHILOSOPHY}
 
 당신은 AZS 배터리 공장의 ${PERSONAS.Cell_PE.role.replace(" - Cell 공정", "")}입니다.
-이 작업은 일일 이슈 브리핑 생성 — 사용자 레포트 양식 1~5번 형태로 정리합니다.${kbText}
+이 작업은 일일 이슈 브리핑의 1번 섹션 (장기부동) 정리입니다.${kbText}
 
 ${focus}
 
 [중요: 분할 보고 통합 룰]
 같은 호기에서 시간 인접 (24시간 내) + 동일 알람 코드 또는 동일 root cause 키워드를 보이는 BM Bot 보고가 여러 건이면,
-하나의 누적 이슈로 묶어 longDowntime에 표시. 분할 시간을 명시 (예: "21:20~21:55 (35분, full stop) → 22:00~04:56 (416분, no_prod) → 누적 451분").
-불확실하면 묶지 말고 분리 표시 (보수적 적용).
+하나의 누적 이슈로 묶어 longDowntime에 표시. 분할 시간을 명시. 불확실하면 묶지 말고 분리 표시.
 
 [필수 출력 - JSON만, 다른 텍스트 금지]
 {
-  "summary_text": "전체 이슈 흐름의 핵심 트렌드 요약 — 1~3문장 (예: '가장 주목할 점은 STK-1-A4의 9.65시간 부동, Z2 servo coupling 파손이 root cause')",
-
+  "summary_text": "전체 이슈 흐름의 핵심 트렌드 요약 — 1~3문장",
   "criticalSummary": [
     "최장 부동: [설비명] [부동시간] — 근본 원인: [원인]",
-    "기타 주요 이벤트: [설비1] [내용], [설비2] [내용]",
-    "품질 추세: [핵심 메시지]",
-    "주목 패턴: [패턴 설명]"
+    "기타 주요 이벤트",
+    "품질 추세",
+    "주목 패턴"
   ],
-
   "longDowntime": [
     {
       "isTop": true,
       "equipment": "호기명",
       "title": "[설비명] [문제 요약] — N분 (M시간) Full Stop",
-      "occurrence": "발생 시간 (분할 시 통합 표기, 예: '04/28 21:20 ~ 04/29 07:19, two splits')",
+      "occurrence": "발생 시간",
       "alarm": "알람 메시지",
-      "splitNote": "두 차례 분할 보고 — 21:20~21:55 (35분) → 22:00~04:56 (416분) → 누적 451분 (분할 보고 시에만)",
+      "splitNote": "분할 보고 통합한 경우만 작성, 아니면 ''",
       "rootCause": "근본 원인 (mechanical/electrical/quality 명시)",
-      "partReplaced": "교체 부품명 + 코드",
+      "partReplaced": "교체 부품명",
       "pic": "PIC 또는 Tech 시퀀스",
       "result": "결과 (Solved/Unsolved/Monitoring)",
       "durationMin": 부동시간_분,
-      "actionSequence": [
-        "1. 첫 번째 조치",
-        "2. 두 번째 조치",
-        "..."
-      ]
+      "actionSequence": ["1. 첫 번째 조치", "2. 두 번째 조치"]
     }
-  ],
-
-  "recurringByCategory": [
-    {"category":"카테고리명 (예: Tab Width / NG, 2nd PnP / Ejector)","count":건수,"equipments":["STK-1-A4 (×2)","STK-2-D5 (×2)"]}
-  ],
-
-  "recurringSameEquipment": [
-    {"equipment":"호기","count":건수,"detail":"발생 내역 요약"}
-  ],
-
-  "conditionChanges": {
-    "visionOffset": [
-      {"date":"YY/M/D","time":"HH:MM","equipment":"호기","change":"변경 내용","reason":"사유"}
-    ],
-    "settingChange": [
-      {"equipment":"호기 (해당 시)","parameter":"파라미터명","before":"변경 전","after":"변경 후"}
-    ],
-    "cutter": [
-      {"date":"YY/M/D","time":"HH:MM","equipment":"호기","change":"변경/조정 내용"}
-    ],
-    "other": [
-      {"date":"YY/M/D","equipment":"호기","change":"기타 조건 변경","pic":"담당자"}
-    ]
-  },
-
-  "testPm": {
-    "linePM": [
-      {"date":"YY/M/D","line":"라인명 (예: Line 1A)","status":"상태 — 미수행/진행중/Stop No Production"}
-    ],
-    "fmvs": [
-      {"date":"YY/M/D","action":"FMVS 작업 (예: Reposition)","equipments":"대상 설비 목록"}
-    ],
-    "cutter": [
-      {"date":"YY/M/D","time":"HH:MM","item":"테스트 항목","resultIcon":"✅/❌/🔄","note":"결과 비고"}
-    ],
-    "stackingSepa": [
-      {"date":"YY/M/D","equipment":"호기","issue":"문제 내용","resultIcon":"❌"}
-    ]
-  },
-
-  "qualityNg": {
-    "table": [
-      {"date":"YY/M/D","sepaFold":숫자,"electrodeExpose":숫자,"nonResponse":숫자,"dimOverkill":숫자,"contactNg":숫자}
-    ],
-    "trend": "트렌드 박스 텍스트 (예: 'Sepa Fold 27 → 7 EA로 급감 (-74%). Electrode Expose 횡보 (11 → 12). Non Response 증가 (3 → 6).')"
-  }
+  ]
 }
 
 [규칙]
 - 장기부동 임계값: ${longThreshold}분 이상
-- longDowntime의 actionSequence는 PIC가 자유 텍스트로 보고한 조치 내용을 시간순/의미순으로 정리 (1~10단계, isTop=true인 경우 더 풍부)
-- isTop=true는 가장 큰 부동 1~2건만 (그 외 longDowntime은 isTop=false 또는 생략)
-- splitNote는 분할 보고 통합한 경우만 작성. 단일 보고면 빈 문자열 ""
-- recurringByCategory: 키워드 카테고리 (Tab Width/NG, 2nd PnP/Ejector/Suction, Hang Error, Servo Fault, Sensor cable, NG Dimension/Align 등)
-- recurringSameEquipment: 같은 호기에서 2건 이상 발생한 것
-- conditionChanges는 4개 하위 그룹으로 나눔 — 데이터 없으면 빈 배열 []
-- testPm도 4개 하위 그룹 — 데이터 없으면 빈 배열 []
-- qualityNg.trend는 데이터에 명시된 일별 NG 메시지 (*Tgl/*Daily NG 형식)에서만 추출. 없으면 "데이터 없음"
-- 모든 수치는 숫자만 (단위 제외)
-- 명백한 잡담/분류 오류는 제외`;
+- isTop=true는 가장 큰 부동 1~2건만
+- actionSequence: 시간순 1~10단계, isTop인 경우 더 풍부하게
+- 모든 수치는 숫자만`;
 
-  const userMsg = `[전체 부동 이슈 데이터 - ${allIssues.length}건]
+  const userMsg = `[전체 부동 이슈 데이터 - ${totalCount}건]
 ${JSON.stringify(issuesData, null, 1)}
 
-[품질 이슈 메시지 - ${qualityData.length}건]
-${qualityData.length > 0 ? JSON.stringify(qualityData, null, 1) : "(없음)"}
+위 데이터에서 1번 섹션 (핵심 요약 + 장기부동)만 정리하세요. 분할 보고 통합 룰을 보수적으로 적용하세요.`;
+
+  return await callCurationPart(sys, userMsg, "Part1-LongDowntime");
+}
+
+// ─── Part 2: 2번 반복 + 3번 조건변경 ──────────────────────────────────────────
+async function curationPart2_RecurringConditionChange(issuesData, processChangeData, totalCount, focus, kbText, categoryMsgs) {
+  const sys = `${FACTORY_PHILOSOPHY}
+
+당신은 AZS 배터리 공장의 ${PERSONAS.Cell_PE.role.replace(" - Cell 공정", "")}입니다.
+이 작업은 일일 이슈 브리핑의 2번 (발생빈도) + 3번 (조건변경) 섹션 정리입니다.${kbText}
+
+${focus}
+
+[필수 출력 - JSON만, 다른 텍스트 금지]
+{
+  "recurringByCategory": [
+    {"category":"카테고리명 (예: Tab Width/NG, 2nd PnP/Ejector, Hang Error, Servo Fault)","count":건수,"equipments":["STK-1-A4 (×2)","STK-2-D5 (×2)"]}
+  ],
+  "recurringSameEquipment": [
+    {"equipment":"호기","count":건수,"detail":"발생 내역 요약"}
+  ],
+  "conditionChanges": {
+    "visionOffset": [{"date":"YY/M/D","time":"HH:MM","equipment":"호기","change":"변경 내용","reason":"사유"}],
+    "settingChange": [{"equipment":"호기","parameter":"파라미터명","before":"변경 전","after":"변경 후"}],
+    "cutter": [{"date":"YY/M/D","time":"HH:MM","equipment":"호기","change":"변경 내용"}],
+    "other": [{"date":"YY/M/D","equipment":"호기","change":"기타 조건 변경","pic":"담당자"}]
+  }
+}
+
+[규칙]
+- recurringByCategory: 키워드 카테고리 (Tab Width/NG, Sensor cable, Servo Fault, Vision NG, Hang Error 등)
+- recurringSameEquipment: 같은 호기에서 2건 이상 발생
+- conditionChanges는 4개 하위 그룹으로 나눔 — 데이터 없으면 빈 배열 []
+- 모든 수치는 숫자만`;
+
+  const userMsg = `[전체 부동 이슈 데이터 - ${totalCount}건]
+${JSON.stringify(issuesData, null, 1)}
 
 [공정/설비 조건변경 메시지 - ${processChangeData.length}건]
 ${processChangeData.length > 0 ? JSON.stringify(processChangeData, null, 1) : "(없음)"}
 
-[테스트/양산외 생산 메시지 - ${testData.length}건]
+위 데이터를 2번 반복 + 3번 조건변경 형식으로 정리하세요.`;
+
+  return await callCurationPart(sys, userMsg, "Part2-Recurring/ConditionChange");
+}
+
+// ─── Part 3: 4번 테스트/PM + 5번 품질NG ───────────────────────────────────────
+async function curationPart3_TestPmQuality(testData, qualityData, focus, kbText, categoryMsgs) {
+  const sys = `${FACTORY_PHILOSOPHY}
+
+당신은 AZS 배터리 공장의 ${PERSONAS.Cell_PE.role.replace(" - Cell 공정", "")}입니다.
+이 작업은 일일 이슈 브리핑의 4번 (테스트/PM) + 5번 (품질 NG) 섹션 정리입니다.${kbText}
+
+${focus}
+
+[필수 출력 - JSON만, 다른 텍스트 금지]
+{
+  "testPm": {
+    "linePM": [{"date":"YY/M/D","line":"라인명","status":"상태"}],
+    "fmvs": [{"date":"YY/M/D","action":"FMVS 작업","equipments":"대상 설비"}],
+    "cutter": [{"date":"YY/M/D","time":"HH:MM","item":"테스트 항목","resultIcon":"✅/❌/🔄","note":"결과"}],
+    "stackingSepa": [{"date":"YY/M/D","equipment":"호기","issue":"문제 내용","resultIcon":"❌"}]
+  },
+  "qualityNg": {
+    "table": [{"date":"YY/M/D","sepaFold":숫자,"electrodeExpose":숫자,"nonResponse":숫자,"dimOverkill":숫자,"contactNg":숫자}],
+    "trend": "트렌드 박스 텍스트 (예: 'Sepa Fold 27 → 7 EA로 급감 (-74%). Non Response 증가 (3 → 6).')"
+  }
+}
+
+[규칙]
+- testPm 4개 하위 그룹 — 데이터 없으면 빈 배열 []
+- qualityNg.trend는 일별 NG 메시지 (*Tgl/*Daily NG 형식)에서만 추출. 없으면 "데이터 없음"
+- 모든 수치는 숫자만`;
+
+  const userMsg = `[테스트/양산외 생산 메시지 - ${testData.length}건]
 ${testData.length > 0 ? JSON.stringify(testData, null, 1) : "(없음)"}
 
-위 데이터를 사용자 레포트 양식 1~5번 구조로 정리해주세요. 분할 보고 통합 룰을 보수적으로 적용하세요.`;
+[품질 이슈 메시지 - ${qualityData.length}건]
+${qualityData.length > 0 ? JSON.stringify(qualityData, null, 1) : "(없음)"}
 
-  try {
-    await new Promise(r => setTimeout(r, 500));
-    const raw = await callClaudeRaw(sys, userMsg, {
-      model: MODEL_FAST,  // Haiku
-      max_tokens: 2500,  // 영역 11: 응답 시간 ↓ (Netlify 10초 안전선 — 4000도 timeout 발생)
-    });
-    const parsed = safeJSON(raw);
-    return normalizeBriefing(parsed);
-  } catch (e) {
-    console.error("[PE 큐레이션 1차 실패]", e?.message);
+위 데이터를 4번 테스트/PM + 5번 품질NG 형식으로 정리하세요.`;
 
-    // ★ 영역 11: 504 timeout 시 더 짧게 재시도
-    if (e?.message?.includes("504") || e?.message?.includes("Timeout")) {
-      try {
-        console.log("[PE 큐레이션 재시도] max_tokens 1500으로 축소...");
-        await new Promise(r => setTimeout(r, 1000));
-        const raw2 = await callClaudeRaw(sys, userMsg, {
-          model: MODEL_FAST,
-          max_tokens: 1500,  // 더 짧은 응답
-        });
-        const parsed2 = safeJSON(raw2);
-        return normalizeBriefing(parsed2);
-      } catch (e2) {
-        console.error("[PE 큐레이션 2차 실패]", e2?.message);
-      }
-    }
-
-    console.error("[PE 큐레이션 실패] 페이로드 크기:", {
-      sys_chars: sys.length,
-      userMsg_chars: userMsg.length,
-      total_kb: Math.round((sys.length + userMsg.length) / 1024),
-      issues_count: allIssues.length,
-    });
-    return buildFallbackCuration(allIssues, categoryMsgs);
-  }
+  return await callCurationPart(sys, userMsg, "Part3-TestPm/Quality");
 }
 
 // ─── 영역 11-C: 빈/정규화 헬퍼 ──────────────────────────────────────────────────
@@ -1865,15 +1899,26 @@ async function generateInsightsAndActions(curation, discussions, taggedResult, k
   const focus = REPORT_FOCUS[reportType] || REPORT_FOCUS.meeting;
   const kbText = kbPE ? `\n\n[학습 내용 일부]\n${kbPE.slice(0, 300)}` : "";
 
-  // 사회자 합의만 압축 (페이로드 c 옵션)
-  const moderatorSummary = (discussions || []).map((d, i) => ({
-    no: i + 1,
-    equipment: d.issue?.eq || "",
-    problem: (d.issue?.prob || "").slice(0, 80),
-    mode: d.modeInfo?.mode || "",
-    consensus: (d.moderator?.consensus || d.moderator?.summary || d.moderator?.supplement || "").slice(0, 250),
-    confidence: d.moderator?.confidence || "",
-  }));
+  // 사회자 합의 — 영역 12-X4 (2): 새 4축 분리 필드 활용 (옛 consensus도 호환)
+  const moderatorSummary = (discussions || []).map((d, i) => {
+    const m = d.moderator || {};
+    return {
+      no: i + 1,
+      equipment: d.issue?.eq || "",
+      problem: (d.issue?.prob || "").slice(0, 80),
+      mode: d.modeInfo?.mode || "",
+      issueStatus: d.issueStatus || "unknown",
+      // ★ 새 4축 (영역 12 Phase 1) — 우선
+      근본원인_합의: (m["근본원인_합의"] || "").slice(0, 200),
+      조치안_평가_합의: (m["조치안_평가_합의"] || "").slice(0, 200),
+      개선안_합의: (m["개선안_합의"] || "").slice(0, 200),
+      재발방지책_합의: (m["재발방지책_합의"] || "").slice(0, 200),
+      충돌점: (m["충돌점"] || "").slice(0, 150),
+      추가_논의_필요: (m["추가_논의_필요"] || "").slice(0, 150),
+      // 옛 호환 (소형 한 줄 종합)
+      consensus_summary: (m.consensus || m.summary || m.supplement || "").slice(0, 150),
+    };
+  });
 
   // 5-카테고리 통계
   const counts = (taggedResult && taggedResult.counts) || {};
@@ -1900,10 +1945,22 @@ async function generateInsightsAndActions(curation, discussions, taggedResult, k
 
 ${focus}
 
+[★ 영역 12 — 페르소나 4축 합의 활용 강조]
+페르소나 사회자 종합은 다음 4축으로 정리되어 있습니다 (방식 나):
+  1) 근본원인_합의 — root cause에 대한 합의
+  2) 조치안_평가_합의 — 기존 조치의 적절성 평가
+  3) 개선안_합의 — 향후 개선 방향
+  4) 재발방지책_합의 — 장기 재발 방지
+
+★ 인사이트(6번)와 액션(7번) 작성 시 위 4축을 다음과 같이 활용:
+  - 6번 인사이트의 근거(evidence)는 "[설비명] 근본원인_합의" 또는 "[설비명] 충돌점" 형태로 명시
+  - 7번 액션은 사회자 "개선안_합의"와 "재발방지책_합의"에서 직접 도출 (P0/P1/P2 분류)
+  - "충돌점"이 있는 이슈는 "가설-검증필요" confidence + "추가 논의 필요" 액션으로 기재
+
 [환각 방지 규칙 — 매우 중요]
 - 각 인사이트와 액션에 confidence 라벨 (확실/가설-검증필요)을 반드시 명시
 - 가설(검증 필요)인 경우, 어느 데이터에서 도출했는지 근거(evidence) 명시
-- 데이터로 확실히 뒷받침되지 않는 인과 추론(예: "X 파손이 다른 라인 Y의 원인일 가능성")은 반드시 "가설-검증필요"로 표기
+- 데이터로 확실히 뒷받침되지 않는 인과 추론은 반드시 "가설-검증필요"로 표기
 - 알려지지 않은 과거 사례를 추측해서 만들지 마세요 — 직접 데이터에 없으면 언급 금지
 
 [7번 P0/P1/P2 분류 기준]
@@ -1945,7 +2002,7 @@ ${focus}
   const userMsg = `[PE 큐레이션 요약]
 ${JSON.stringify(briefingSummary, null, 1)}
 
-[페르소나 논의 결과 — 사회자 합의]
+[페르소나 논의 결과 — 사회자 4축 합의 (영역 12 방식 나)]
 ${moderatorSummary.length > 0 ? JSON.stringify(moderatorSummary, null, 1) : "(논의된 이슈 없음 — 큐레이션만으로 인사이트 도출)"}
 
 [5-카테고리 통계]
@@ -2557,28 +2614,60 @@ export default function App() {
       report.discussions = allDiscussions;  // ★ Phase 2: 페르소나 매칭용
       setMinutes(report);
 
-      // 시트 저장
+      // 시트 저장 — 영역 12-X5 (3): 새 4축 필드 + 페르소나 say 통합 컬럼
       setProgress(p => [...p, "💾 구글 시트 저장 중..."]);
-      const deepSummary = (report.grouped?.DEEP || []).map(d => `${d.issue.eq}: ${d.moderator.consensus}`).join(" | ");
-      const stdSummary = (report.grouped?.STANDARD || []).map(d => `${d.issue.eq}: ${d.moderator.summary}`).join(" | ");
-      const liteSummary = (report.grouped?.LITE || []).map(d => `${d.issue.eq}: ${d.moderator.supplement}`).join(" | ");
+
+      // 사회자 4축 합의 + say 통합 (DEEP/STANDARD/LITE)
+      const buildSheetSummary = (group, mode) => {
+        return (group || []).map(d => {
+          const m = d.moderator || {};
+          const eq = d.issue?.eq || "?";
+          // 4축 합의 (있으면 우선)
+          const axes = [
+            m["근본원인_합의"] && `근본원인:${m["근본원인_합의"].slice(0, 60)}`,
+            m["조치안_평가_합의"] && `조치평가:${m["조치안_평가_합의"].slice(0, 60)}`,
+            m["개선안_합의"] && `개선:${m["개선안_합의"].slice(0, 60)}`,
+            m["재발방지책_합의"] && `재발방지:${m["재발방지책_합의"].slice(0, 60)}`,
+          ].filter(Boolean).join(" / ");
+          // 4축 없으면 옛 호환
+          const fallback = m.consensus || m.summary || m.supplement || "-";
+          return `[${eq}] ${axes || fallback}`;
+        }).join(" || ");
+      };
+
+      const deepSummary = buildSheetSummary(report.grouped?.DEEP, "DEEP");
+      const stdSummary = buildSheetSummary(report.grouped?.STANDARD, "STANDARD");
+      const liteSummary = buildSheetSummary(report.grouped?.LITE, "LITE");
+
+      // 페르소나 say 발언 통합 (모든 discussion에서 say 추출)
+      const personaSayCombined = (allDiscussions || []).map(d => {
+        const eq = d.issue?.eq || "?";
+        const says = (d.opinions || []).map(o => {
+          const p = PERSONAS[o.persona]?.label || o.persona;
+          const say = (o.opinion?.say || o.opinion?.근본원인 || "").slice(0, 100);
+          return say ? `${p}: ${say}` : null;
+        }).filter(Boolean).join(" | ");
+        return says ? `[${eq}] ${says}` : null;
+      }).filter(Boolean).join(" || ").slice(0, 1500);
 
       const saved = await saveToSheets({
         date: dateStr,
         agenda: `[${selectedProcess} 공정] ${report.agenda}`,
         issue_summary: `5-카테고리 LD${taggedResult.counts.LONG_DOWNTIME}/HF${taggedResult.counts.HIGH_FREQUENCY}/CC${taggedResult.counts.CONDITION_CHANGE}/TP${taggedResult.counts.TEST_PM}/QN${taggedResult.counts.QUALITY_NG} | 본문논의 ${keyIssues.length}건 (자동 ${autoCount} + 사용자 추가 ${manualCount}) | DEEP${report.grouped.DEEP.length} STANDARD${report.grouped.STANDARD.length} LITE${report.grouped.LITE.length}`,
-        pe_opinion: deepSummary.slice(0, 500),
-        me_opinion: stdSummary.slice(0, 500),
+        pe_opinion: deepSummary.slice(0, 800),  // 4축 통합 (이전 500 → 800 확대)
+        me_opinion: stdSummary.slice(0, 800),
         te_opinion: liteSummary.slice(0, 500),
-        discussion: (report.sections || []).map(s => `${s.heading}: ${(s.items||[]).join(", ")}`).join(" / ").slice(0, 2000),
-        action_items: report.sections?.[3]?.items?.join(" | ") || "",
+        discussion: personaSayCombined,  // ★ 페르소나 say 통합 (영역 12-X5)
+        action_items: (report.actions || []).map(a => `[${a.priority}] ${a.action}`).join(" | ").slice(0, 800),  // 7번 액션
         minutes_full: JSON.stringify({
           process: selectedProcess,
           agents: allowedAgents,
           analytics: report.analytics,
           modeStats: { DEEP: report.grouped.DEEP.length, STANDARD: report.grouped.STANDARD.length, LITE: report.grouped.LITE.length },
           tagged: taggedResult.counts,
-        }).slice(0, 1000),
+          insightsCount: (report.insights || []).length,
+          actionsCount: (report.actions || []).length,
+        }).slice(0, 1500),
       });
       setSheetSaved(saved);
       setStep(4);
@@ -2730,7 +2819,25 @@ export default function App() {
     `;
     }).join("");
 
-    // 2번 발생빈도
+    // ★ 영역 12-X6 (1): 2~5번 섹션 매칭 페르소나 논의 헬퍼 ─────────────────
+    // 카테고리별 / 설비별 매칭 — equipments 배열에서 설비명을 추출해 discussions와 매칭
+    const findDiscussionsByEquipments = (equipments) => {
+      const ds = minutes.discussions || [];
+      if (!ds.length || !equipments?.length) return [];
+      const eqSet = new Set(equipments.map(e => String(e || "").replace(/\s*\(×\d+\)/g, "").trim()).filter(Boolean));
+      return ds.filter(d => eqSet.has(d.issue?.eq || ""));
+    };
+    const findDiscussionsByEquipment = (equipment) => {
+      const ds = minutes.discussions || [];
+      if (!ds.length || !equipment) return [];
+      return ds.filter(d => d.issue?.eq === equipment);
+    };
+    const buildMultiplePersonaConvs = (matches) => {
+      if (!matches?.length) return "";
+      return matches.map(m => buildPersonaConvHtml(m)).join("");
+    };
+
+    // 2번 발생빈도 — 카테고리별 매칭 페르소나 논의 통합
     const recurringCatHtml = (cur.recurringByCategory || []).length > 0 ? `
       <h3>카테고리별</h3>
       <table>
@@ -2738,39 +2845,78 @@ export default function App() {
         <tbody>
           ${cur.recurringByCategory.map(c => `<tr><td><b>${esc(c.category)}</b></td><td class="num"><b>${c.count}</b></td><td>${esc((c.equipments || []).join(", "))}</td></tr>`).join("")}
         </tbody>
-      </table>` : "";
+      </table>
+      ${cur.recurringByCategory.map(c => {
+        const matches = findDiscussionsByEquipments(c.equipments || []);
+        if (!matches.length) return "";
+        return `<div style="margin-top:8px;padding-left:10px;border-left:3px solid #ddd;"><div style="font-size:0.88em;color:#666;margin-bottom:6px;"><b>📌 [${esc(c.category)}] 카테고리</b> 관련 페르소나 논의:</div>${buildMultiplePersonaConvs(matches)}</div>`;
+      }).join("")}` : "";
 
     const recurringEqHtml = (cur.recurringSameEquipment || []).length > 0 ? `
       <h3>동일 설비 다발</h3>
-      <ul>${cur.recurringSameEquipment.map(e => `<li><b>${esc(e.equipment)}</b>: ${e.count}건${e.detail ? ` — ${esc(e.detail)}` : ""}</li>`).join("")}</ul>` : "";
+      <ul>${cur.recurringSameEquipment.map(e => `<li><b>${esc(e.equipment)}</b>: ${e.count}건${e.detail ? ` — ${esc(e.detail)}` : ""}</li>`).join("")}</ul>
+      ${cur.recurringSameEquipment.map(e => {
+        const matches = findDiscussionsByEquipment(e.equipment);
+        if (!matches.length) return "";
+        return `<div style="margin-top:8px;padding-left:10px;border-left:3px solid #ddd;"><div style="font-size:0.88em;color:#666;margin-bottom:6px;"><b>📌 [${esc(e.equipment)}]</b> 관련 페르소나 논의:</div>${buildMultiplePersonaConvs(matches)}</div>`;
+      }).join("")}` : "";
 
-    // 3번 조건 변경
+    // 3번 조건 변경 — 설비별 매칭 페르소나 논의
     const cc = cur.conditionChanges || {};
     const buildTable = (rows, headers, makeRow) => rows.length === 0 ? "" : `
       <table>
         <thead><tr>${headers.map(h => `<th>${h}</th>`).join("")}</tr></thead>
         <tbody>${rows.map(makeRow).join("")}</tbody>
       </table>`;
+    // 3번 영역에서 등장하는 모든 equipment 추출 → 매칭 논의 모음
+    const buildConditionChangePersonas = () => {
+      const eqs = new Set();
+      [...(cc.visionOffset || []), ...(cc.settingChange || []), ...(cc.cutter || []), ...(cc.other || [])].forEach(r => {
+        if (r.equipment) eqs.add(r.equipment);
+      });
+      const matches = findDiscussionsByEquipments([...eqs]);
+      if (!matches.length) return "";
+      return `<div style="margin-top:10px;padding-left:10px;border-left:3px solid #ddd;"><div style="font-size:0.88em;color:#666;margin-bottom:6px;"><b>📌 조건 변경 영역</b> 관련 페르소나 논의:</div>${buildMultiplePersonaConvs(matches)}</div>`;
+    };
     const visionHtml = (cc.visionOffset || []).length > 0 ? `<h3>Vision Offset 적용</h3>${buildTable(cc.visionOffset, ["시간", "설비", "변경 내용", "사유"], r => `<tr><td>${esc(r.date)} ${esc(r.time)}</td><td><b>${esc(r.equipment)}</b></td><td>${esc(r.change)}</td><td>${esc(r.reason || "-")}</td></tr>`)}` : "";
     const settingHtml = (cc.settingChange || []).length > 0 ? `<h3>Setting 변경 (Before → After)</h3>${buildTable(cc.settingChange, ["설비", "파라미터", "Before → After"], r => `<tr><td>${esc(r.equipment || "-")}</td><td>${esc(r.parameter)}</td><td>${esc(r.before)} → <b>${esc(r.after)}</b></td></tr>`)}` : "";
     const cutterHtml = (cc.cutter || []).length > 0 ? `<h3>Cutter 조정</h3>${buildTable(cc.cutter, ["시간", "설비", "변경 내용"], r => `<tr><td>${esc(r.date)} ${esc(r.time)}</td><td><b>${esc(r.equipment)}</b></td><td>${esc(r.change)}</td></tr>`)}` : "";
     const otherHtml = (cc.other || []).length > 0 ? `<h3>기타</h3>${buildTable(cc.other, ["날짜", "설비", "변경 내용", "담당"], r => `<tr><td>${esc(r.date)}</td><td>${esc(r.equipment)}</td><td>${esc(r.change)}</td><td>${esc(r.pic || "-")}</td></tr>`)}` : "";
+    const conditionChangePersonasHtml = buildConditionChangePersonas();
 
-    // 4번 테스트/PM
+    // 4번 테스트/PM — 설비별 매칭 페르소나 논의
     const tp = cur.testPm || {};
+    const buildTestPmPersonas = () => {
+      const eqs = new Set();
+      [...(tp.fmvs || []), ...(tp.cutter || []), ...(tp.stackingSepa || [])].forEach(r => {
+        if (r.equipment) eqs.add(r.equipment);
+        if (r.equipments) String(r.equipments).split(/[,\s]+/).forEach(eq => eq && eqs.add(eq));
+      });
+      const matches = findDiscussionsByEquipments([...eqs]);
+      if (!matches.length) return "";
+      return `<div style="margin-top:10px;padding-left:10px;border-left:3px solid #ddd;"><div style="font-size:0.88em;color:#666;margin-bottom:6px;"><b>📌 테스트/PM 영역</b> 관련 페르소나 논의:</div>${buildMultiplePersonaConvs(matches)}</div>`;
+    };
     const linePmHtml = (tp.linePM || []).length > 0 ? `<h3>Line PM 계획</h3>${buildTable(tp.linePM, ["일자", "라인", "상태"], r => `<tr><td>${esc(r.date)}</td><td><b>${esc(r.line)}</b></td><td>${esc(r.status)}</td></tr>`)}` : "";
     const fmvsHtml = (tp.fmvs || []).length > 0 ? `<h3>FMVS (Vision Camera)</h3>${buildTable(tp.fmvs, ["일자", "작업", "대상 설비"], r => `<tr><td>${esc(r.date)}</td><td>${esc(r.action)}</td><td>${esc(r.equipments)}</td></tr>`)}` : "";
     const cutterTestHtml = (tp.cutter || []).length > 0 ? `<h3>Cutter 테스트</h3>${buildTable(tp.cutter, ["시간", "항목", "결과"], r => `<tr><td>${esc(r.date)} ${esc(r.time)}</td><td>${esc(r.item)}</td><td>${esc(r.resultIcon || "")} ${esc(r.note || "")}</td></tr>`)}` : "";
     const stackHtml = (tp.stackingSepa || []).length > 0 ? `<h3>Stacking Sepa Run</h3><ul>${tp.stackingSepa.map(s => `<li><b>${esc(s.date)} ${esc(s.equipment)}</b>: ${esc(s.issue)} ${esc(s.resultIcon || "")}</li>`).join("")}</ul>` : "";
+    const testPmPersonasHtml = buildTestPmPersonas();
 
-    // 5번 NG 품질
+    // 5번 NG 품질 — 품질 관련 페르소나 논의 (QUALITY_NG tag)
     const qng = cur.qualityNg || {};
+    const buildQualityPersonas = () => {
+      const ds = minutes.discussions || [];
+      const matches = ds.filter(d => (d.issue?.tags || []).includes("QUALITY_NG"));
+      if (!matches.length) return "";
+      return `<div style="margin-top:10px;padding-left:10px;border-left:3px solid #ddd;"><div style="font-size:0.88em;color:#666;margin-bottom:6px;"><b>📌 품질 NG 영역</b> 관련 페르소나 논의:</div>${buildMultiplePersonaConvs(matches)}</div>`;
+    };
     const qualityTableHtml = (qng.table || []).length > 0 ? `
       <table>
         <thead><tr><th>일자</th><th class="num">Sepa Fold</th><th class="num">Electrode Expose</th><th class="num">Non Response</th><th class="num">Dim Overkill</th><th class="num">Contact NG</th></tr></thead>
         <tbody>${qng.table.map(r => `<tr><td>${esc(r.date)}</td><td class="num">${r.sepaFold ?? "-"}</td><td class="num">${r.electrodeExpose ?? "-"}</td><td class="num">${r.nonResponse ?? "-"}</td><td class="num">${r.dimOverkill ?? "-"}</td><td class="num">${r.contactNg ?? "-"}</td></tr>`).join("")}</tbody>
       </table>
       ${qng.trend ? `<div class="info"><b>추세:</b> ${esc(qng.trend)}</div>` : ""}` : "<p>데이터 없음</p>";
+    const qualityPersonasHtml = buildQualityPersonas();
 
     // 6번 인사이트
     const insightsHtml = insights.length > 0 ? insights.map(ins => `
@@ -2930,15 +3076,18 @@ ${recurringEqHtml}
 <h2>⚙️ 3. 설비/공정 조건 변경</h2>
 ${visionHtml}${settingHtml}${cutterHtml}${otherHtml}
 ${!visionHtml && !settingHtml && !cutterHtml && !otherHtml ? "<p>조건 변경 없음</p>" : ""}
+${conditionChangePersonasHtml}
 
 <hr>
 <h2>🧪 4. 테스트 / PM 활동</h2>
 ${linePmHtml}${fmvsHtml}${cutterTestHtml}${stackHtml}
 ${!linePmHtml && !fmvsHtml && !cutterTestHtml && !stackHtml ? "<p>테스트/PM 활동 없음</p>" : ""}
+${testPmPersonasHtml}
 
 <hr>
 <h2>📊 5. 일일 NG 품질 실적</h2>
 ${qualityTableHtml}
+${qualityPersonasHtml}
 
 <hr>
 <h2>⚠️ 6. 가장 주목할 사항</h2>
@@ -4055,7 +4204,8 @@ ${userText}
                   <div style={{marginBottom:10}}>
                     <div style={{fontSize:11,fontWeight:800,color:"#22d3ee",marginBottom:4}}>② 점수 공식</div>
                     <div style={{paddingLeft:8,color:"#94a3b8",fontFamily:"monospace",background:"rgba(0,0,0,0.2)",padding:"6px 8px",borderRadius:4}}>
-                      score = 부동(분)/30 + 반복횟수×3 + 안전환경(+10) + 미해결(+5) + FullStop(+5)
+                      score = 부동(분)/30 + 반복횟수×3 + 안전환경(+10) + 미해결(+5) + FullStop(+5)<br/>
+                      &nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp; + 장기부동≥60분(+8) + 장기부동≥120분(+5)
                     </div>
                     <div style={{paddingLeft:8,color:"#64748b",marginTop:4,fontSize:10}}>
                       예: 부동 90분 + 반복 2회 + 안전키워드 → 3 + 6 + 10 = 19점

@@ -1400,9 +1400,18 @@ ${focus} 다음 이슈를 ${p.role.split(" ")[0]} 관점에서 분석하세요.
   2) 조치안 평가 — 기조치는 적절했는지, 미흡한 부분
   3) 개선안 / 재발방지책 — 향후 동일 이슈 방지 방법${conversationGuide}${statusGuide}
 
+★ 발언 방식 (영역 12 Phase 2): 자연스러운 대화체로 발언하세요.
+  - "say" 필드에 자유 텍스트로 발언 (이전 동료 의견을 직접 언급/인용/반박, 자기 관점 설명, 100~200자)
+  - "quote" 필드에 인용한 동료 발언의 짧은 핵심 1줄 (60자 이내, 첫 발언자는 빈 문자열)
+  - "reply_to" 필드에 답변 대상 페르소나 코드 (예: "Cell_TE", 첫 발언자는 빈 문자열)
+  - 4축 구조화 필드(근본원인/조치안_평가/개선안/재발방지책)는 사회자 합의용으로 함께 채우되, 본 발언은 say에 자유롭게 풀어쓰세요.
+
 [필수 출력 - JSON만]
 {
-  "previous_reference": "이전 동료 의견 인용 (첫 발언자는 빈 문자열, 60자이내)",
+  "say": "자유 대화체 발언 (이전 동료 인용/반박 포함, 100~200자)",
+  "quote": "인용한 동료 발언 핵심 1줄 (60자 이내, 첫 발언자는 빈 문자열)",
+  "reply_to": "답변 대상 페르소나 코드 (예: Cell_TE, 첫 발언자는 빈 문자열)",
+  "previous_reference": "이전 동료 의견 인용 요약 (60자, 첫 발언자는 빈 문자열) — 호환용",
   "stance": "동의/부분동의/반대/추가의견/초기분석 중 하나",
   "근본원인": "표면 증상이 아닌 진짜 root cause (100자이내, 가설이면 '가설:' 접두어)",
   "조치안_평가": "기조치 적절성 평가 (적절/미흡/부적절/진행중/해당없음 + 근거, 80자이내)",
@@ -1414,11 +1423,14 @@ ${focus} 다음 이슈를 ${p.role.split(" ")[0]} 관점에서 분석하세요.
     await new Promise(r => setTimeout(r, 600));
     const raw = await callClaudeRaw(sys, `[이슈]\n${issueCtx}${prevText}`, {
       model: MODEL_REASONING,
-      max_tokens: 900,  // 영역 12: 4개 의미 필드로 약간 증가
+      max_tokens: 1200,  // 영역 12 Phase 2: say 자유 텍스트 추가로 토큰 ↑
     });
     return safeJSON(raw);
   } catch {
     return {
+      say: "분석 중 오류 발생",
+      quote: "",
+      reply_to: "",
       previous_reference: "",
       stance: "분석 오류",
       "근본원인": "분석 중 오류",
@@ -2542,6 +2554,7 @@ export default function App() {
       report.insights = insightsAndActions.section6_insights;
       report.actions = insightsAndActions.section7_actions;
       report.curation = curation;  // 메인 페이지에서 1~5번 표시 위해
+      report.discussions = allDiscussions;  // ★ Phase 2: 페르소나 매칭용
       setMinutes(report);
 
       // 시트 저장
@@ -2589,8 +2602,113 @@ export default function App() {
     // 헬퍼: HTML 이스케이프
     const esc = (s) => String(s || "").replace(/&/g, "&amp;").replace(/</g, "&lt;").replace(/>/g, "&gt;").replace(/"/g, "&quot;");
 
-    // 1번 장기부동 박스
-    const longDowntimeHtml = (cur.longDowntime || []).map((d) => `
+    // ★ Phase 2: 페르소나 대화 HTML 생성 헬퍼 (좌우 번갈아 + 색상 + 인용구 + 사회자 종합)
+    const buildPersonaConvHtml = (matched) => {
+      if (!matched) return "";
+      const opinions = matched.opinions || [];
+      const m = matched.moderator || {};
+      const mode = matched.modeInfo?.mode || "?";
+
+      // 입장 색상
+      const stanceColors = {
+        "동의": "#27ae60", "부분동의": "#d68910", "반대": "#c0392b",
+        "추가의견": "#7c3aed", "초기분석": "#2980b9",
+      };
+      const stanceBg = {
+        "동의": "rgba(39,174,96,0.15)", "부분동의": "rgba(214,137,16,0.15)",
+        "반대": "rgba(192,57,43,0.15)", "추가의견": "rgba(124,58,237,0.15)",
+        "초기분석": "rgba(41,128,185,0.15)",
+      };
+
+      // 메시지 (좌우 번갈아)
+      const messages = opinions.map((o, idx) => {
+        const p = PERSONAS[o.persona] || {};
+        const op = o.opinion || {};
+        const isLeft = idx % 2 === 0;
+        const stance = op.stance || "초기분석";
+        const sayText = op.say || op.근본원인 || "(발언 데이터 없음)";
+        const quote = op.quote || op.previous_reference || "";
+        const replyTo = op.reply_to || "";
+        const stanceColor = stanceColors[stance] || "#7f8c8d";
+        const stanceBgColor = stanceBg[stance] || "rgba(127,140,141,0.15)";
+        const personaColor = p.color || "#7f8c8d";
+        const personaBgColor = p.bg || "rgba(127,140,141,0.15)";
+
+        const align = isLeft ? "flex-start" : "flex-end";
+        const flexDir = isLeft ? "row" : "row-reverse";
+        const radius = isLeft ? "4px 14px 14px 14px" : "14px 4px 14px 14px";
+
+        const nameLabels = `
+          <span style="font-weight:700;color:${personaColor};">${esc(p.label || o.persona)}</span>
+          <span style="font-size:0.85em;padding:1px 6px;border-radius:8px;background:${stanceBgColor};color:${stanceColor};font-weight:700;">${esc(stance)}</span>
+          ${replyTo ? `<span style="font-size:0.85em;padding:1px 6px;border-radius:8px;background:#ecf0f1;color:#7f8c8d;">↩ ${esc(replyTo)}</span>` : ""}
+        `;
+
+        const bubbleContent = `
+          ${quote ? `<div style="font-size:0.85em;font-style:italic;padding:4px 10px;margin-bottom:6px;border-left:3px solid rgba(0,0,0,0.3);background:rgba(0,0,0,0.18);border-radius:0 8px 8px 0;color:rgba(255,255,255,0.85);">"${esc(quote)}"</div>` : ""}
+          <div>${esc(sayText)}</div>
+        `;
+
+        return `
+        <div style="display:flex;flex-direction:${flexDir};margin-bottom:14px;gap:8px;justify-content:${align};">
+          <div style="flex-shrink:0;width:38px;height:38px;border-radius:50%;display:flex;align-items:center;justify-content:center;font-size:18px;font-weight:700;background:${personaBgColor};color:${personaColor};">
+            ${esc(p.icon || "?")}
+          </div>
+          <div style="max-width:70%;text-align:${isLeft ? "left" : "right"};">
+            <div style="font-size:0.8em;margin-bottom:4px;display:flex;gap:6px;align-items:center;justify-content:${isLeft ? "flex-start" : "flex-end"};flex-wrap:wrap;">
+              ${nameLabels}
+            </div>
+            <div style="padding:10px 14px;border-radius:${radius};font-size:0.92em;line-height:1.6;background:${personaColor};color:white;text-align:left;">
+              ${bubbleContent}
+            </div>
+          </div>
+        </div>`;
+      }).join("");
+
+      // 사회자 종합
+      const modParts = [];
+      if (m["근본원인_합의"]) modParts.push(`<div style="margin:5px 0;"><b style="color:#c0392b;display:inline-block;min-width:130px;">🎯 근본원인 합의:</b> ${esc(m["근본원인_합의"])}</div>`);
+      if (m["조치안_평가_합의"]) modParts.push(`<div style="margin:5px 0;"><b style="color:#e67e22;display:inline-block;min-width:130px;">⚖️ 조치안 평가:</b> ${esc(m["조치안_평가_합의"])}</div>`);
+      if (m["개선안_합의"]) modParts.push(`<div style="margin:5px 0;"><b style="color:#2980b9;display:inline-block;min-width:130px;">💡 개선안 합의:</b> ${esc(m["개선안_합의"])}</div>`);
+      if (m["재발방지책_합의"]) modParts.push(`<div style="margin:5px 0;"><b style="color:#27ae60;display:inline-block;min-width:130px;">🛡️ 재발방지책:</b> ${esc(m["재발방지책_합의"])}</div>`);
+      if (m["충돌점"] && m["충돌점"] !== "없음") modParts.push(`<div style="margin:5px 0;"><b style="color:#c0392b;display:inline-block;min-width:130px;">⚠️ 충돌점:</b> ${esc(m["충돌점"])}</div>`);
+      if (m["추가_논의_필요"] && m["추가_논의_필요"] !== "없음") modParts.push(`<div style="margin:5px 0;"><b style="color:#e67e22;display:inline-block;min-width:130px;">🔍 추가 논의:</b> ${esc(m["추가_논의_필요"])}</div>`);
+      if (Array.isArray(m.actions) && m.actions.length > 0) {
+        const actsHtml = m.actions.map(a => `<li><b>[${esc(a.priority || "-")}]</b> ${esc(a.action || "")} <span style="color:#666;">(${esc(a.owner || "-")} / ${esc(a.duration || "-")})</span></li>`).join("");
+        modParts.push(`<div style="margin-top:8px;"><b style="color:#2980b9;">📋 액션 플랜:</b><ul style="margin:4px 0;padding-left:20px;">${actsHtml}</ul></div>`);
+      }
+      if (m.consensus) modParts.push(`<div style="margin-top:10px;padding-top:8px;border-top:1px solid rgba(124,58,237,0.2);font-style:italic;color:#7c3aed;">💬 ${esc(m.consensus.slice(0, 200))}</div>`);
+
+      return `
+        <details style="margin-top:12px;padding-top:12px;border-top:1px dashed #bbb;">
+          <summary style="cursor:pointer;padding:6px 10px;background:rgba(124,58,237,0.08);border:1px solid rgba(124,58,237,0.25);border-radius:6px;font-weight:700;color:#7c3aed;">
+            💬 페르소나 논의 (${opinions.length}명 발언) · ${esc(mode)} 모드 · 사회자 종합 포함
+          </summary>
+          <div style="padding:14px 4px;">
+            ${messages}
+          </div>
+          <div style="margin-top:12px;padding:14px 18px;background:rgba(124,58,237,0.08);border:1px solid rgba(124,58,237,0.3);border-left:5px solid #7c3aed;border-radius:8px;">
+            <div style="color:#7c3aed;font-weight:700;margin-bottom:8px;">📋 사회자 종합 (${esc(mode)})</div>
+            ${modParts.join("")}
+          </div>
+        </details>
+      `;
+    };
+
+    // discussions 매칭 헬퍼 (downloadHtml 안에서 사용)
+    const findMatchingDiscForCuration = (item) => {
+      const ds = minutes.discussions || [];
+      if (!item || !item.equipment) return null;
+      let m = ds.find(d => d.issue?.eq === item.equipment && item.durationMin && Math.abs((d.issue?.durMin || 0) - item.durationMin) < 5);
+      if (m) return m;
+      return ds.filter(d => d.issue?.eq === item.equipment).sort((a, b) => (b.issue?.durMin || 0) - (a.issue?.durMin || 0))[0] || null;
+    };
+
+    // 1번 장기부동 박스 — Phase 2: 페르소나 대화 통합
+    const longDowntimeHtml = (cur.longDowntime || []).map((d) => {
+      const matchedDisc = findMatchingDiscForCuration(d);
+      const personaConvHtml = buildPersonaConvHtml(matchedDisc);
+      return `
       <div class="${d.isTop ? "critical" : "warning"}">
         <h3 style="margin-top:0;">${d.isTop ? "🔴 [TOP] " : "🔴 "}${esc(d.title || `${d.equipment} ${d.durationMin}분`)}</h3>
         <table>
@@ -2607,8 +2725,10 @@ export default function App() {
         ${(d.actionSequence || []).length > 0 ? `
         <h4>적용 조치 (${d.actionSequence.length}단계)</h4>
         <ol>${d.actionSequence.map(s => `<li>${esc(s)}</li>`).join("")}</ol>` : ""}
+        ${personaConvHtml}
       </div>
-    `).join("");
+    `;
+    }).join("");
 
     // 2번 발생빈도
     const recurringCatHtml = (cur.recurringByCategory || []).length > 0 ? `
@@ -2833,8 +2953,8 @@ ${actionsHtml}
 AZS Status Reports WhatsApp 데이터 기반 · ${new Date().toLocaleString("ko-KR")}</p>
 
 <div class="appendix-page">
-<h1>📎 Appendix — 페르소나 논의 상세</h1>
-<p class="meta">메인 보고서의 인사이트(6번)와 액션(7번)은 아래 페르소나 논의 결과를 기반으로 도출되었습니다.</p>
+<h1>📎 전체 페르소나 논의 모아보기</h1>
+<p class="meta">각 이슈별 페르소나 논의는 메인 페이지의 1~5번 섹션에 직접 매칭되어 표시되며, 아래는 통합 조회용입니다.</p>
 ${appendixHtml || "<p>페르소나 논의 없음</p>"}
 </div>
 
@@ -3973,10 +4093,11 @@ ${userText}
                 border:"1px solid rgba(167,139,250,0.25)", borderRadius:8,
                 marginBottom:14,
               }}>
-                📎 Appendix — 페르소나 논의 상세 내역
+                📎 전체 페르소나 논의 모아보기
               </div>
               <div style={{fontSize:10,color:"#94a3b8",marginBottom:12,fontStyle:"italic"}}>
-                메인 보고서의 인사이트(6번)와 액션(7번)은 아래 페르소나 논의 결과를 기반으로 도출되었습니다.
+                각 이슈별 페르소나 논의는 메인 페이지의 1~5번 섹션에 직접 매칭되어 표시됩니다.<br/>
+                아래는 전체 페르소나 논의를 한 곳에서 통합 조회하는 영역입니다.
               </div>
             </div>
 
@@ -4596,7 +4717,7 @@ function DateRangePicker({ availableDates, selRange, onChange }) {
 //   autoSelectedIds: 자동 선정 ID (⭐ 표시용)
 //   onToggle: (issueId) => void
 //   onToggleMany: (issueIds[], shouldCheck) => void  (그룹 일괄)
-function BriefingDisplay({ curation, allIssues = [], selectedIds = [], autoSelectedIds = [], onToggle, onToggleMany }) {
+function BriefingDisplay({ curation, allIssues = [], selectedIds = [], autoSelectedIds = [], onToggle, onToggleMany, discussions = [] }) {
   if (!curation) return null;
 
   const sectionStyle = {
@@ -4653,6 +4774,34 @@ function BriefingDisplay({ curation, allIssues = [], selectedIds = [], autoSelec
     if (checked === 0) return "none";
     if (checked === issueIds.length) return "all";
     return "partial";
+  };
+
+  // ─── Phase 2: 페르소나 논의 매칭 헬퍼 ───
+  // 큐레이션 이슈 → 매칭되는 페르소나 논의 (discussions)
+  const findMatchingDiscussion = (curationItem) => {
+    if (!discussions || discussions.length === 0) return null;
+    if (!curationItem || !curationItem.equipment) return null;
+    // 1순위: equipment + durMin 일치
+    let match = discussions.find(d =>
+      d.issue?.eq === curationItem.equipment &&
+      curationItem.durationMin &&
+      Math.abs((d.issue?.durMin || 0) - curationItem.durationMin) < 5
+    );
+    if (match) return match;
+    // 2순위: equipment 일치 (가장 부동시간 긴 것)
+    match = discussions
+      .filter(d => d.issue?.eq === curationItem.equipment)
+      .sort((a, b) => (b.issue?.durMin || 0) - (a.issue?.durMin || 0))[0];
+    return match || null;
+  };
+  // 매칭된 모든 discussion id 모음 (Appendix에서 매칭 안 된 것 식별용)
+  const matchedDiscussionKeys = new Set();
+  const markMatched = (d) => { if (d && d.issue) matchedDiscussionKeys.add(getIssueId(d.issue)); };
+
+  // 일반 이슈 → 매칭되는 discussion (allIssues에서 사용)
+  const findMatchingDiscussionByIssue = (issue) => {
+    if (!discussions || !issue) return null;
+    return discussions.find(d => getIssueId(d.issue) === getIssueId(issue)) || null;
   };
   // 인라인 체크박스 렌더 (이슈 1건)
   const IssueCheckbox = ({ issue, label = null, compact = false }) => {
@@ -4780,6 +4929,13 @@ function BriefingDisplay({ curation, allIssues = [], selectedIds = [], autoSelec
                       </ol>
                     </div>
                   )}
+                  {/* ★ Phase 2: 매칭되는 페르소나 논의 표시 */}
+                  {(() => {
+                    const matched = findMatchingDiscussion(d);
+                    if (!matched) return null;
+                    markMatched(matched);
+                    return <PersonaConversation discussion={matched}/>;
+                  })()}
                 </div>
               );
             })}
@@ -4797,30 +4953,36 @@ function BriefingDisplay({ curation, allIssues = [], selectedIds = [], autoSelec
               {showShortDowntime ? "▼" : "▶"} 기타 짧은 부동 이슈 ({shortDowntimeIssues.length}건) — 추가 논의 후보
             </button>
             {showShortDowntime && (
-              <div style={{marginTop:8, maxHeight:240, overflowY:"auto"}}>
+              <div style={{marginTop:8, maxHeight:600, overflowY:"auto"}}>
                 {shortDowntimeIssues.map((i) => {
                   const id = getIssueId(i);
                   const checked = selectedIds.includes(id);
+                  const matched = findMatchingDiscussionByIssue(i);
+                  if (matched) markMatched(matched);
                   return (
-                    <label key={id} style={{
-                      display:"flex", alignItems:"flex-start", gap:8,
-                      padding:"6px 8px", marginBottom:3, borderRadius:5,
-                      background: checked ? "rgba(34,211,238,0.05)" : "rgba(15,23,42,0.3)",
-                      border:`1px solid ${checked ? "rgba(34,211,238,0.25)" : "rgba(51,65,85,0.25)"}`,
-                      cursor:"pointer", fontSize:10,
-                    }}>
-                      <input type="checkbox" checked={checked}
-                        onChange={() => onToggle(id)}
-                        style={{marginTop:2, cursor:"pointer", accentColor:"#22d3ee"}}/>
-                      <div style={{flex:1, lineHeight:1.5}}>
-                        <span style={{color:"#94a3b8"}}>{i.date} {i.time}</span>
-                        {" · "}
-                        <span style={{color:"#cbd5e1",fontWeight:700,fontFamily:"monospace"}}>{i.eq || "-"}</span>
-                        {" · "}
-                        <span style={{color:"#94a3b8"}}>{i.durMin}분</span>
-                        {i.prob && <div style={{color:"#cbd5e1",fontSize:9.5}}>{i.prob.slice(0, 80)}</div>}
-                      </div>
-                    </label>
+                    <div key={id} style={{marginBottom: 6}}>
+                      <label style={{
+                        display:"flex", alignItems:"flex-start", gap:8,
+                        padding:"6px 8px", borderRadius:5,
+                        background: checked ? "rgba(34,211,238,0.05)" : "rgba(15,23,42,0.3)",
+                        border:`1px solid ${checked ? "rgba(34,211,238,0.25)" : "rgba(51,65,85,0.25)"}`,
+                        cursor:"pointer", fontSize:10,
+                      }}>
+                        <input type="checkbox" checked={checked}
+                          onChange={() => onToggle(id)}
+                          style={{marginTop:2, cursor:"pointer", accentColor:"#22d3ee"}}/>
+                        <div style={{flex:1, lineHeight:1.5}}>
+                          <span style={{color:"#94a3b8"}}>{i.date} {i.time}</span>
+                          {" · "}
+                          <span style={{color:"#cbd5e1",fontWeight:700,fontFamily:"monospace"}}>{i.eq || "-"}</span>
+                          {" · "}
+                          <span style={{color:"#94a3b8"}}>{i.durMin}분</span>
+                          {i.prob && <div style={{color:"#cbd5e1",fontSize:9.5}}>{i.prob.slice(0, 80)}</div>}
+                        </div>
+                      </label>
+                      {/* ★ Phase 2: 매칭되는 페르소나 논의 (체크박스 카드 아래) */}
+                      {matched && <PersonaConversation discussion={matched}/>}
+                    </div>
                   );
                 })}
               </div>
@@ -4878,24 +5040,30 @@ function BriefingDisplay({ curation, allIssues = [], selectedIds = [], autoSelec
                           const id = getIssueId(iss);
                           const checked = selectedIds.includes(id);
                           const isAuto = autoSelectedIds.includes(id);
+                          const matched = findMatchingDiscussionByIssue(iss);
+                          if (matched) markMatched(matched);
                           return (
-                            <label key={id} style={{
-                              display:"flex", alignItems:"flex-start", gap:6,
-                              padding:"3px 4px", marginBottom:2, fontSize:9.5,
-                              color:checked ? "#cbd5e1" : "#94a3b8",
-                              cursor:"pointer",
-                            }}>
-                              <input type="checkbox" checked={checked}
-                                onChange={() => onToggle(id)}
-                                style={{cursor:"pointer", accentColor:"#22d3ee", margin:"2px 0"}}/>
-                              {isAuto && <span style={{color:"#fbbf24",fontWeight:700}}>⭐</span>}
-                              <span style={{flex:1}}>
-                                <span style={{fontFamily:"monospace",fontWeight:700}}>{iss.eq || "-"}</span>
-                                {" · "}{iss.date} {iss.time}
-                                {" · "}{iss.durMin}분
-                                {iss.prob && <span style={{color:"#64748b"}}> — {iss.prob.slice(0, 50)}</span>}
-                              </span>
-                            </label>
+                            <div key={id} style={{marginBottom: 4}}>
+                              <label style={{
+                                display:"flex", alignItems:"flex-start", gap:6,
+                                padding:"3px 4px", fontSize:9.5,
+                                color:checked ? "#cbd5e1" : "#94a3b8",
+                                cursor:"pointer",
+                              }}>
+                                <input type="checkbox" checked={checked}
+                                  onChange={() => onToggle(id)}
+                                  style={{cursor:"pointer", accentColor:"#22d3ee", margin:"2px 0"}}/>
+                                {isAuto && <span style={{color:"#fbbf24",fontWeight:700}}>⭐</span>}
+                                <span style={{flex:1}}>
+                                  <span style={{fontFamily:"monospace",fontWeight:700}}>{iss.eq || "-"}</span>
+                                  {" · "}{iss.date} {iss.time}
+                                  {" · "}{iss.durMin}분
+                                  {iss.prob && <span style={{color:"#64748b"}}> — {iss.prob.slice(0, 50)}</span>}
+                                </span>
+                              </label>
+                              {/* ★ Phase 2: 매칭 논의 */}
+                              {matched && <PersonaConversation discussion={matched}/>}
+                            </div>
                           );
                         })}
                       </div>
@@ -4941,21 +5109,26 @@ function BriefingDisplay({ curation, allIssues = [], selectedIds = [], autoSelec
                           const id = getIssueId(iss);
                           const checked = selectedIds.includes(id);
                           const isAuto = autoSelectedIds.includes(id);
+                          const matched = findMatchingDiscussionByIssue(iss);
+                          if (matched) markMatched(matched);
                           return (
-                            <label key={id} style={{
-                              display:"flex", alignItems:"flex-start", gap:6,
-                              padding:"3px 4px", marginBottom:2, fontSize:9.5,
-                              color:checked ? "#cbd5e1" : "#94a3b8", cursor:"pointer",
-                            }}>
-                              <input type="checkbox" checked={checked}
-                                onChange={() => onToggle(id)}
-                                style={{cursor:"pointer", accentColor:"#22d3ee", margin:"2px 0"}}/>
-                              {isAuto && <span style={{color:"#fbbf24",fontWeight:700}}>⭐</span>}
-                              <span style={{flex:1}}>
-                                {iss.date} {iss.time} · {iss.durMin}분
-                                {iss.prob && <span style={{color:"#64748b"}}> — {iss.prob.slice(0, 60)}</span>}
-                              </span>
-                            </label>
+                            <div key={id} style={{marginBottom: 4}}>
+                              <label style={{
+                                display:"flex", alignItems:"flex-start", gap:6,
+                                padding:"3px 4px", fontSize:9.5,
+                                color:checked ? "#cbd5e1" : "#94a3b8", cursor:"pointer",
+                              }}>
+                                <input type="checkbox" checked={checked}
+                                  onChange={() => onToggle(id)}
+                                  style={{cursor:"pointer", accentColor:"#22d3ee", margin:"2px 0"}}/>
+                                {isAuto && <span style={{color:"#fbbf24",fontWeight:700}}>⭐</span>}
+                                <span style={{flex:1}}>
+                                  {iss.date} {iss.time} · {iss.durMin}분
+                                  {iss.prob && <span style={{color:"#64748b"}}> — {iss.prob.slice(0, 60)}</span>}
+                                </span>
+                              </label>
+                              {matched && <PersonaConversation discussion={matched}/>}
+                            </div>
                           );
                         })}
                       </div>
@@ -5249,7 +5422,11 @@ function MainReportPage({ minutes }) {
       </div>
 
       {/* 1~5번: BriefingDisplay (정보 표시 전용 — 체크박스 props 미전달) */}
-      <BriefingDisplay curation={minutes.curation}/>
+      <BriefingDisplay
+        curation={minutes.curation}
+        allIssues={minutes.tagged?.issues || []}
+        discussions={minutes.discussions || []}
+      />
 
       {/* 6번: 가장 주목할 사항 */}
       <div style={sectionStyle}>
@@ -5356,6 +5533,237 @@ function MainReportPage({ minutes }) {
         — 메인 레포트 종료 —<br/>
         AZS Status Reports WhatsApp 데이터 기반
       </div>
+    </div>
+  );
+}
+
+// ─── ★ 영역 12 Phase 2: 페르소나 대화형 표시 컴포넌트 ──────────────────────────
+// 좌우 번갈아 정렬 + 말풍선 (페르소나 색상 배경) + 사회자 종합
+// props:
+//   discussion: { issue, modeInfo, opinions, moderator } — runIssueDiscussion 결과
+//   defaultExpanded: boolean (기본 false = 접힘)
+function PersonaConversation({ discussion, defaultExpanded = false }) {
+  const [expanded, setExpanded] = useState(defaultExpanded);
+  if (!discussion) return null;
+  const { opinions = [], moderator = {}, modeInfo } = discussion;
+
+  // 입장 → 색상
+  const stanceStyle = {
+    "동의": { bg: "rgba(52,211,153,0.2)", color: "#34d399" },
+    "부분동의": { bg: "rgba(251,191,36,0.2)", color: "#fbbf24" },
+    "반대": { bg: "rgba(239,68,68,0.2)", color: "#ef4444" },
+    "추가의견": { bg: "rgba(167,139,250,0.2)", color: "#a78bfa" },
+    "초기분석": { bg: "rgba(96,165,250,0.2)", color: "#60a5fa" },
+  };
+  const sStyle = (s) => stanceStyle[s] || { bg: "rgba(100,116,139,0.2)", color: "#94a3b8" };
+
+  return (
+    <div style={{
+      marginTop: 12, paddingTop: 12,
+      borderTop: "1px dashed rgba(100,116,139,0.5)",
+    }}>
+      {/* 헤더 (토글) */}
+      <div onClick={() => setExpanded(!expanded)} style={{
+        display: "flex", justifyContent: "space-between", alignItems: "center",
+        cursor: "pointer", padding: "6px 10px",
+        background: "rgba(167,139,250,0.1)",
+        border: "1px solid rgba(167,139,250,0.3)",
+        borderRadius: 6, fontSize: 11, fontWeight: 700, color: "#a78bfa",
+      }}>
+        <span>💬 페르소나 논의 ({opinions.length}명 발언) · {modeInfo?.mode || "?"} 모드 · 사회자 종합 포함</span>
+        <span>{expanded ? "▼ 접기" : "▶ 펼치기"}</span>
+      </div>
+
+      {expanded && (
+        <>
+          {/* 메시지 리스트 (좌우 번갈아) */}
+          <div style={{ padding: "14px 4px" }}>
+            {opinions.map((o, idx) => {
+              const p = PERSONAS[o.persona] || {};
+              const op = o.opinion || {};
+              const isLeft = idx % 2 === 0;
+              const stance = op.stance || "초기분석";
+              const sty = sStyle(stance);
+              const sayText = op.say || op.근본원인 || "(발언 데이터 없음)";
+              const quote = op.quote || op.previous_reference || "";
+              const replyTo = op.reply_to || "";
+
+              return (
+                <div key={idx} style={{
+                  display: "flex",
+                  flexDirection: isLeft ? "row" : "row-reverse",
+                  marginBottom: 14, gap: 8,
+                  animation: "fadeUp 0.3s",
+                }}>
+                  {/* 아바타 */}
+                  <div style={{
+                    flexShrink: 0, width: 38, height: 38,
+                    borderRadius: "50%", display: "flex",
+                    alignItems: "center", justifyContent: "center",
+                    fontSize: 18, fontWeight: 700,
+                    background: p.bg || "rgba(100,116,139,0.25)",
+                    color: p.color || "#94a3b8",
+                  }}>
+                    {p.icon || "?"}
+                  </div>
+
+                  {/* 메시지 영역 */}
+                  <div style={{ maxWidth: "70%", textAlign: isLeft ? "left" : "right" }}>
+                    {/* 이름 + 입장 + 답변 대상 */}
+                    <div style={{
+                      fontSize: 9.5, fontWeight: 700, marginBottom: 4,
+                      display: "flex", gap: 6, alignItems: "center",
+                      justifyContent: isLeft ? "flex-start" : "flex-end",
+                      color: p.color || "#94a3b8",
+                    }}>
+                      {!isLeft && replyTo && (
+                        <span style={{
+                          fontSize: 9, padding: "1px 6px", borderRadius: 8,
+                          background: "rgba(100,116,139,0.2)", color: "#94a3b8", fontWeight: 600,
+                        }}>↩ {replyTo}</span>
+                      )}
+                      {!isLeft && (
+                        <span style={{
+                          fontSize: 9, padding: "1px 6px", borderRadius: 8,
+                          background: sty.bg, color: sty.color, fontWeight: 700,
+                        }}>{stance}</span>
+                      )}
+                      <span>{p.label || o.persona}</span>
+                      {isLeft && (
+                        <span style={{
+                          fontSize: 9, padding: "1px 6px", borderRadius: 8,
+                          background: sty.bg, color: sty.color, fontWeight: 700,
+                        }}>{stance}</span>
+                      )}
+                      {isLeft && replyTo && (
+                        <span style={{
+                          fontSize: 9, padding: "1px 6px", borderRadius: 8,
+                          background: "rgba(100,116,139,0.2)", color: "#94a3b8", fontWeight: 600,
+                        }}>↩ {replyTo}</span>
+                      )}
+                    </div>
+
+                    {/* 말풍선 (페르소나 색상 배경) */}
+                    <div style={{
+                      padding: "10px 14px",
+                      borderRadius: 14,
+                      borderTopLeftRadius: isLeft ? 4 : 14,
+                      borderTopRightRadius: isLeft ? 14 : 4,
+                      fontSize: 11, lineHeight: 1.6, wordWrap: "break-word",
+                      background: p.color || "#475569",
+                      color: "#fff",
+                      textAlign: "left",
+                    }}>
+                      {/* 인용구 */}
+                      {quote && (
+                        <div style={{
+                          fontSize: 10, fontStyle: "italic",
+                          padding: "4px 10px", marginBottom: 6,
+                          borderLeft: "3px solid rgba(0,0,0,0.3)",
+                          background: "rgba(0,0,0,0.18)",
+                          borderRadius: "0 8px 8px 0",
+                          color: "rgba(255,255,255,0.85)",
+                        }}>
+                          "{quote}"
+                        </div>
+                      )}
+                      {/* 발언 본문 */}
+                      <div>{sayText}</div>
+                    </div>
+                  </div>
+                </div>
+              );
+            })}
+          </div>
+
+          {/* 사회자 종합 (대화 끝, 옵션 ¬) */}
+          <div style={{
+            marginTop: 12, padding: "12px 16px",
+            background: "rgba(167,139,250,0.08)",
+            border: "1px solid rgba(167,139,250,0.3)",
+            borderLeft: "5px solid #a78bfa",
+            borderRadius: 8, fontSize: 11, color: "#e2e8f0", lineHeight: 1.6,
+          }}>
+            <div style={{ color: "#c4b5fd", fontWeight: 700, marginBottom: 8 }}>
+              📋 사회자 종합 ({modeInfo?.mode || "?"})
+            </div>
+
+            {moderator["근본원인_합의"] && (
+              <div style={{ margin: "5px 0" }}>
+                <b style={{ color: "#fca5a5", display: "inline-block", minWidth: 130 }}>🎯 근본원인 합의:</b>
+                {moderator["근본원인_합의"]}
+              </div>
+            )}
+            {moderator["조치안_평가_합의"] && (
+              <div style={{ margin: "5px 0" }}>
+                <b style={{ color: "#fdba74", display: "inline-block", minWidth: 130 }}>⚖️ 조치안 평가:</b>
+                {moderator["조치안_평가_합의"]}
+              </div>
+            )}
+            {moderator["개선안_합의"] && (
+              <div style={{ margin: "5px 0" }}>
+                <b style={{ color: "#93c5fd", display: "inline-block", minWidth: 130 }}>💡 개선안 합의:</b>
+                {moderator["개선안_합의"]}
+              </div>
+            )}
+            {moderator["재발방지책_합의"] && (
+              <div style={{ margin: "5px 0" }}>
+                <b style={{ color: "#86efac", display: "inline-block", minWidth: 130 }}>🛡️ 재발방지책:</b>
+                {moderator["재발방지책_합의"]}
+              </div>
+            )}
+            {moderator["충돌점"] && moderator["충돌점"] !== "없음" && (
+              <div style={{ margin: "5px 0" }}>
+                <b style={{ color: "#ef4444", display: "inline-block", minWidth: 130 }}>⚠️ 충돌점:</b>
+                {moderator["충돌점"]}
+              </div>
+            )}
+            {moderator["추가_논의_필요"] && moderator["추가_논의_필요"] !== "없음" && (
+              <div style={{ margin: "5px 0" }}>
+                <b style={{ color: "#fbbf24", display: "inline-block", minWidth: 130 }}>🔍 추가 논의:</b>
+                {moderator["추가_논의_필요"]}
+              </div>
+            )}
+
+            {/* STANDARD 모드 actions */}
+            {Array.isArray(moderator.actions) && moderator.actions.length > 0 && (
+              <div style={{ marginTop: 8 }}>
+                <b style={{ color: "#93c5fd" }}>📋 액션 플랜:</b>
+                <ul style={{ margin: "4px 0", paddingLeft: 20 }}>
+                  {moderator.actions.map((a, ai) => (
+                    <li key={ai} style={{ marginBottom: 2 }}>
+                      <b>[{a.priority}]</b> {a.action}
+                      <span style={{ color: "#94a3b8", fontSize: 10 }}> (담당:{a.owner}, {a.duration}{a.type ? `, ${a.type}` : ""})</span>
+                    </li>
+                  ))}
+                </ul>
+              </div>
+            )}
+
+            {/* LITE 모드 */}
+            {moderator.supplement && (
+              <div style={{ margin: "5px 0" }}>✅ 보완: {moderator.supplement}</div>
+            )}
+            {moderator.recurRisk && (
+              <div style={{ margin: "5px 0" }}>🔁 재발우려: {moderator.recurRisk}</div>
+            )}
+            {moderator.prevention && (
+              <div style={{ margin: "5px 0" }}>🛡️ 방지책: {moderator.prevention}</div>
+            )}
+
+            {/* 한 줄 요약 */}
+            {moderator.consensus && (
+              <div style={{
+                marginTop: 10, paddingTop: 8,
+                borderTop: "1px solid rgba(167,139,250,0.2)",
+                fontStyle: "italic", color: "#c4b5fd",
+              }}>
+                💬 {moderator.consensus.slice(0, 200)}
+              </div>
+            )}
+          </div>
+        </>
+      )}
     </div>
   );
 }

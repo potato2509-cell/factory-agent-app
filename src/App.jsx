@@ -1781,6 +1781,221 @@ function buildTimeFreqAnalysis(allIssues, processName = "Cell") {
 }
 
 // ═════════════════════════════════════════════════════════════════════════════
+// ★ 영역 11-E: 6번 "가장 주목할 사항" + 7번 "액션 후속 사항" 생성
+// LLM이 페르소나 논의 결과 + 큐레이션 + 5-카테고리 통계를 보고 인사이트/액션 생성
+// 환각 방지: confidence 라벨 + 근거 데이터 명시 (ii+iii)
+// 7번 P0/P1/P2 분류: LLM 판단 + 룰 검증 (Z)
+// ═════════════════════════════════════════════════════════════════════════════
+async function generateInsightsAndActions(curation, discussions, taggedResult, kbPE, reportType) {
+  const focus = REPORT_FOCUS[reportType] || REPORT_FOCUS.meeting;
+  const kbText = kbPE ? `\n\n[학습 내용 일부]\n${kbPE.slice(0, 300)}` : "";
+
+  // 사회자 합의만 압축 (페이로드 c 옵션)
+  const moderatorSummary = (discussions || []).map((d, i) => ({
+    no: i + 1,
+    equipment: d.issue?.eq || "",
+    problem: (d.issue?.prob || "").slice(0, 80),
+    mode: d.modeInfo?.mode || "",
+    consensus: (d.moderator?.consensus || d.moderator?.summary || d.moderator?.supplement || "").slice(0, 250),
+    confidence: d.moderator?.confidence || "",
+  }));
+
+  // 5-카테고리 통계
+  const counts = (taggedResult && taggedResult.counts) || {};
+
+  // 큐레이션 핵심만 추출 (핵심요약 + 장기부동 + 반복 카테고리)
+  const cur = curation || {};
+  const briefingSummary = {
+    summary_text: cur.summary_text || "",
+    criticalSummary: cur.criticalSummary || [],
+    longDowntime: (cur.longDowntime || []).slice(0, 5).map(d => ({
+      equipment: d.equipment, durationMin: d.durationMin,
+      rootCause: d.rootCause, splitNote: d.splitNote || "",
+    })),
+    recurringByCategory: (cur.recurringByCategory || []).slice(0, 5).map(r => ({
+      category: r.category, count: r.count, equipments: (r.equipments || []).slice(0, 3),
+    })),
+    qualityTrend: cur.qualityNg?.trend || "",
+  };
+
+  const sys = `${FACTORY_PHILOSOPHY}
+
+당신은 AZS 배터리 공장의 시니어 엔지니어로서, 페르소나 논의 결과 + PE 큐레이션 + 통계를 바탕으로
+보고서의 6번 "가장 주목할 사항"과 7번 "액션 후속 사항"을 작성합니다.${kbText}
+
+${focus}
+
+[환각 방지 규칙 — 매우 중요]
+- 각 인사이트와 액션에 confidence 라벨 (확실/가설-검증필요)을 반드시 명시
+- 가설(검증 필요)인 경우, 어느 데이터에서 도출했는지 근거(evidence) 명시
+- 데이터로 확실히 뒷받침되지 않는 인과 추론(예: "X 파손이 다른 라인 Y의 원인일 가능성")은 반드시 "가설-검증필요"로 표기
+- 알려지지 않은 과거 사례를 추측해서 만들지 마세요 — 직접 데이터에 없으면 언급 금지
+
+[7번 P0/P1/P2 분류 기준]
+- P0: 안전·환경 키워드, 9시간+ 부동, 공장 전체 영향, horizontal deployment 즉시 권장
+- P1: 미해결 이슈, spare 발주 필요, root cause 미파악, 4시간+ 부동
+- P2: 모니터링, 일정 협의, 단일 설비 단발 이슈, 1시간 이하
+
+[필수 출력 - JSON만, 다른 텍스트 금지]
+{
+  "section6_insights": [
+    {
+      "title": "1) [핵심 키워드] — [설비/현상]",
+      "bulletPoints": [
+        "1~2문장 인사이트 (60자 이내)",
+        "추가 관찰 (60자 이내)"
+      ],
+      "confidence": "확실 또는 가설-검증필요",
+      "evidence": "어느 이슈/데이터에서 도출했는지 (예: 'STK-1-A4 longDowntime 데이터, recurringByCategory의 Tab Width 4건')"
+    }
+  ],
+  "section7_actions": [
+    {
+      "priority": "P0/P1/P2",
+      "action": "구체적 행동 (60자)",
+      "context": "왜 필요한지 (40자)",
+      "evidence": "어느 데이터에서 도출 (40자)",
+      "confidence": "확실 또는 가설-검증필요"
+    }
+  ]
+}
+
+[규칙]
+- section6_insights: 5~6개 (사용자 레포트와 동일 분량)
+- section7_actions: P0 1~3개 + P1 1~3개 + P2 1~3개 (총 5~8개)
+- 각 인사이트는 bulletPoints 1~3개
+- 데이터 근거 없는 추측은 절대 만들지 마세요
+- confidence는 데이터로 명확히 검증된 것만 "확실", 추론/가설은 "가설-검증필요"`;
+
+  const userMsg = `[PE 큐레이션 요약]
+${JSON.stringify(briefingSummary, null, 1)}
+
+[페르소나 논의 결과 — 사회자 합의]
+${moderatorSummary.length > 0 ? JSON.stringify(moderatorSummary, null, 1) : "(논의된 이슈 없음 — 큐레이션만으로 인사이트 도출)"}
+
+[5-카테고리 통계]
+장기부동: ${counts.LONG_DOWNTIME || 0} / 반복: ${counts.HIGH_FREQUENCY || 0} / 조건변경: ${counts.CONDITION_CHANGE || 0} / 테스트PM: ${counts.TEST_PM || 0} / 품질NG: ${counts.QUALITY_NG || 0}
+
+위 데이터를 바탕으로 6번 "가장 주목할 사항" 5~6건과 7번 "액션 후속 사항" P0/P1/P2 표를 작성하세요.
+환각 방지를 위해 confidence와 evidence를 반드시 명시하세요.`;
+
+  try {
+    await new Promise(r => setTimeout(r, 500));
+    const raw = await callClaudeRaw(sys, userMsg, {
+      model: MODEL_FAST,  // Haiku (빠른 응답, 6/7번 생성에 충분)
+      max_tokens: 3000,
+    });
+    const parsed = safeJSON(raw);
+
+    // 룰 검증 (Z 옵션) — LLM 분류 결과를 안전 룰로 보정
+    const insights = Array.isArray(parsed.section6_insights) ? parsed.section6_insights : [];
+    const actions = Array.isArray(parsed.section7_actions) ? parsed.section7_actions : [];
+
+    // P0/P1/P2 룰 검증
+    const validatedActions = actions.map(a => {
+      const text = `${a.action || ""} ${a.context || ""} ${a.evidence || ""}`.toLowerCase();
+      // 룰 1: safety/환경/9시간+ → P0 강제
+      if (/safety|emergency|환경|safety|9시간|horizontal/i.test(text) && a.priority !== "P0") {
+        return { ...a, priority: "P0", _ruleAdjusted: "safety 키워드로 P0 격상" };
+      }
+      // 룰 2: monitoring/모니터링/일정 → P2 강제
+      if (/monitoring|모니터링|일정|schedule/i.test(text) && a.priority === "P0") {
+        return { ...a, priority: "P2", _ruleAdjusted: "monitoring 키워드로 P2 강등" };
+      }
+      // priority가 없거나 잘못된 값
+      if (!["P0", "P1", "P2"].includes(a.priority)) {
+        return { ...a, priority: "P2", _ruleAdjusted: "priority 미지정 — P2 기본" };
+      }
+      return a;
+    });
+
+    return {
+      section6_insights: insights,
+      section7_actions: validatedActions,
+    };
+  } catch (e) {
+    console.error("[6/7번 생성 실패]", e);
+    return buildFallbackInsightsAndActions(curation, taggedResult);
+  }
+}
+
+// 6/7번 폴백 (LLM 호출 실패 시 룰 기반)
+function buildFallbackInsightsAndActions(curation, taggedResult) {
+  const cur = curation || {};
+  const counts = (taggedResult && taggedResult.counts) || {};
+  const insights = [];
+  const actions = [];
+
+  // 인사이트 — 룰 기반
+  if ((cur.longDowntime || []).length > 0) {
+    const top = cur.longDowntime[0];
+    insights.push({
+      title: `1) ${top.equipment || "?"} — ${top.durationMin || 0}분 부동, 기간 최장`,
+      bulletPoints: [
+        `근본 원인: ${(top.rootCause || "분석 중").slice(0, 60)}`,
+        top.splitNote ? "분할 보고 형태로 전체 누적 시간 추적 필요" : "단일 보고",
+      ].filter(Boolean),
+      confidence: "확실",
+      evidence: `longDowntime[0] - ${top.equipment}`,
+    });
+  }
+  if ((cur.recurringByCategory || []).length > 0) {
+    const top = cur.recurringByCategory[0];
+    insights.push({
+      title: `2) ${top.category} 카테고리 ${top.count}건 다발`,
+      bulletPoints: [
+        `해당 설비: ${(top.equipments || []).slice(0, 3).join(", ")}`,
+        "반복 발생 패턴 확인 필요",
+      ],
+      confidence: "확실",
+      evidence: `recurringByCategory[0]`,
+    });
+  }
+  if (cur.qualityNg?.trend && cur.qualityNg.trend !== "데이터 없음") {
+    insights.push({
+      title: `3) 품질 NG 트렌드`,
+      bulletPoints: [cur.qualityNg.trend.slice(0, 100)],
+      confidence: "확실",
+      evidence: "qualityNg.trend",
+    });
+  }
+
+  // 액션 — 룰 기반
+  if ((cur.longDowntime || []).filter(d => (d.durationMin || 0) >= 540).length > 0) {
+    actions.push({
+      priority: "P0",
+      action: "최장 부동 이슈 horizontal deployment 점검",
+      context: "9시간+ 부동, 학습 내용 다른 라인 적용",
+      evidence: "longDowntime durationMin >= 540",
+      confidence: "확실",
+    });
+  }
+  if ((cur.longDowntime || []).filter(d => /not solved|unsolved/i.test(d.result || "")).length > 0) {
+    actions.push({
+      priority: "P1",
+      action: "미해결 이슈 root cause 분석",
+      context: "Solved되지 않은 장기부동 존재",
+      evidence: "longDowntime result 미해결",
+      confidence: "확실",
+    });
+  }
+  if ((cur.testPm?.linePM || []).filter(p => /stop/i.test(p.status || "")).length > 0) {
+    actions.push({
+      priority: "P2",
+      action: "PM 일정 협의",
+      context: "Stop No Production 발생",
+      evidence: "testPm.linePM",
+      confidence: "확실",
+    });
+  }
+
+  return {
+    section6_insights: insights,
+    section7_actions: actions,
+  };
+}
+
+// ═════════════════════════════════════════════════════════════════════════════
 // 보고서 생성 (모드별 그룹핑 + 시간/빈도 분석 추가)
 // ═════════════════════════════════════════════════════════════════════════════
 async function generateReport(date, dates, discussions, priority, reportType, kb, allIssues, processName = "Cell", curation = null) {
@@ -2237,12 +2452,33 @@ export default function App() {
         important: keyIssues.filter(i => (i.tags || []).includes("HIGH_FREQUENCY") && !(i.tags || []).includes("LONG_DOWNTIME")),
         normal: [],
       };
+
+      // ★ 영역 11-E: 6번 "가장 주목할 사항" + 7번 "액션 후속 사항" 생성
+      setProgress(p => [...p, "💡 6번 인사이트 + 7번 액션 후속 사항 생성 중..."]);
+      let insightsAndActions = { section6_insights: [], section7_actions: [] };
+      try {
+        insightsAndActions = await generateInsightsAndActions(
+          curation, allDiscussions, taggedResult,
+          kbResult.kb["Cell_PE"] || kbResult.kb["Elec_PE"] || "",
+          reportType
+        );
+        setProgress(p => [...p, `✅ 인사이트 ${insightsAndActions.section6_insights.length}건 / 액션 ${insightsAndActions.section7_actions.length}건 생성 완료`]);
+      } catch (e) {
+        console.error("[6/7번 생성 실패]", e);
+        setProgress(p => [...p, `⚠️ 6/7번 LLM 생성 실패 — 룰 기반 폴백 사용`]);
+        insightsAndActions = buildFallbackInsightsAndActions(curation, taggedResult);
+      }
+
       const report = await generateReport(dateStr, selDates, allDiscussions, priorityCompat, reportType, kbResult.kb, allIssuesForAnalytics, selectedProcess, curation);
       // ★ 보고서에 공정/참여 에이전트 정보 추가
       report.process = selectedProcess;
       report.allowedAgents = allowedAgents;
       report.range = selRange;  // 영역 8: 보고서에 범위 정보 보존
       report.tagged = taggedResult;  // 영역 9: 5-카테고리 결과 보존
+      // ★ 영역 11-E: 6/7번 결과 보존
+      report.insights = insightsAndActions.section6_insights;
+      report.actions = insightsAndActions.section7_actions;
+      report.curation = curation;  // 메인 페이지에서 1~5번 표시 위해
       setMinutes(report);
 
       // 시트 저장
@@ -2274,6 +2510,222 @@ export default function App() {
 
     } catch(e) { setError(e.message); }
     finally { setRunning(false); }
+  };
+
+  // ─── ★ 영역 11-H: HTML 다운로드 (메인 1~7번 + 유첨 page-break) ────────────────
+  const downloadHtml = () => {
+    if (!minutes) return;
+    const title = minutes.title || "AZS Factory 일일 이슈 레포트";
+    const cur = minutes.curation || {};
+    const insights = minutes.insights || [];
+    const actions = minutes.actions || [];
+    const periodLabel = minutes.date || "";
+    const tagged = minutes.tagged || { issues: [], counts: {} };
+    const issuesCount = (tagged.issues || []).length;
+
+    // 헬퍼: HTML 이스케이프
+    const esc = (s) => String(s || "").replace(/&/g, "&amp;").replace(/</g, "&lt;").replace(/>/g, "&gt;").replace(/"/g, "&quot;");
+
+    // 1번 장기부동 박스
+    const longDowntimeHtml = (cur.longDowntime || []).map((d) => `
+      <div class="${d.isTop ? "critical" : "warning"}">
+        <h3 style="margin-top:0;">${d.isTop ? "🔴 [TOP] " : "🔴 "}${esc(d.title || `${d.equipment} ${d.durationMin}분`)}</h3>
+        <table>
+          <tbody>
+            ${d.occurrence ? `<tr><th style="width:25%;">발생</th><td>${esc(d.occurrence)}</td></tr>` : ""}
+            ${d.alarm ? `<tr><th>알람</th><td><code>${esc(d.alarm)}</code></td></tr>` : ""}
+            ${d.splitNote ? `<tr><th>보고 형태</th><td><b>${esc(d.splitNote)}</b></td></tr>` : ""}
+            ${d.rootCause ? `<tr><th>근본 원인</th><td><b>${esc(d.rootCause)}</b></td></tr>` : ""}
+            ${d.partReplaced ? `<tr><th>부품 교체</th><td><b>${esc(d.partReplaced)}</b></td></tr>` : ""}
+            ${d.pic ? `<tr><th>PIC</th><td>${esc(d.pic)}</td></tr>` : ""}
+            ${d.result ? `<tr><th>결과</th><td><span class="${(d.result || "").toLowerCase().includes("solved") ? "ok" : "progress"}">${esc(d.result)}</span></td></tr>` : ""}
+          </tbody>
+        </table>
+        ${(d.actionSequence || []).length > 0 ? `
+        <h4>적용 조치 (${d.actionSequence.length}단계)</h4>
+        <ol>${d.actionSequence.map(s => `<li>${esc(s)}</li>`).join("")}</ol>` : ""}
+      </div>
+    `).join("");
+
+    // 2번 발생빈도
+    const recurringCatHtml = (cur.recurringByCategory || []).length > 0 ? `
+      <h3>카테고리별</h3>
+      <table>
+        <thead><tr><th>카테고리</th><th class="num">건수</th><th>해당 설비</th></tr></thead>
+        <tbody>
+          ${cur.recurringByCategory.map(c => `<tr><td><b>${esc(c.category)}</b></td><td class="num"><b>${c.count}</b></td><td>${esc((c.equipments || []).join(", "))}</td></tr>`).join("")}
+        </tbody>
+      </table>` : "";
+
+    const recurringEqHtml = (cur.recurringSameEquipment || []).length > 0 ? `
+      <h3>동일 설비 다발</h3>
+      <ul>${cur.recurringSameEquipment.map(e => `<li><b>${esc(e.equipment)}</b>: ${e.count}건${e.detail ? ` — ${esc(e.detail)}` : ""}</li>`).join("")}</ul>` : "";
+
+    // 3번 조건 변경
+    const cc = cur.conditionChanges || {};
+    const buildTable = (rows, headers, makeRow) => rows.length === 0 ? "" : `
+      <table>
+        <thead><tr>${headers.map(h => `<th>${h}</th>`).join("")}</tr></thead>
+        <tbody>${rows.map(makeRow).join("")}</tbody>
+      </table>`;
+    const visionHtml = (cc.visionOffset || []).length > 0 ? `<h3>Vision Offset 적용</h3>${buildTable(cc.visionOffset, ["시간", "설비", "변경 내용", "사유"], r => `<tr><td>${esc(r.date)} ${esc(r.time)}</td><td><b>${esc(r.equipment)}</b></td><td>${esc(r.change)}</td><td>${esc(r.reason || "-")}</td></tr>`)}` : "";
+    const settingHtml = (cc.settingChange || []).length > 0 ? `<h3>Setting 변경 (Before → After)</h3>${buildTable(cc.settingChange, ["설비", "파라미터", "Before → After"], r => `<tr><td>${esc(r.equipment || "-")}</td><td>${esc(r.parameter)}</td><td>${esc(r.before)} → <b>${esc(r.after)}</b></td></tr>`)}` : "";
+    const cutterHtml = (cc.cutter || []).length > 0 ? `<h3>Cutter 조정</h3>${buildTable(cc.cutter, ["시간", "설비", "변경 내용"], r => `<tr><td>${esc(r.date)} ${esc(r.time)}</td><td><b>${esc(r.equipment)}</b></td><td>${esc(r.change)}</td></tr>`)}` : "";
+    const otherHtml = (cc.other || []).length > 0 ? `<h3>기타</h3>${buildTable(cc.other, ["날짜", "설비", "변경 내용", "담당"], r => `<tr><td>${esc(r.date)}</td><td>${esc(r.equipment)}</td><td>${esc(r.change)}</td><td>${esc(r.pic || "-")}</td></tr>`)}` : "";
+
+    // 4번 테스트/PM
+    const tp = cur.testPm || {};
+    const linePmHtml = (tp.linePM || []).length > 0 ? `<h3>Line PM 계획</h3>${buildTable(tp.linePM, ["일자", "라인", "상태"], r => `<tr><td>${esc(r.date)}</td><td><b>${esc(r.line)}</b></td><td>${esc(r.status)}</td></tr>`)}` : "";
+    const fmvsHtml = (tp.fmvs || []).length > 0 ? `<h3>FMVS (Vision Camera)</h3>${buildTable(tp.fmvs, ["일자", "작업", "대상 설비"], r => `<tr><td>${esc(r.date)}</td><td>${esc(r.action)}</td><td>${esc(r.equipments)}</td></tr>`)}` : "";
+    const cutterTestHtml = (tp.cutter || []).length > 0 ? `<h3>Cutter 테스트</h3>${buildTable(tp.cutter, ["시간", "항목", "결과"], r => `<tr><td>${esc(r.date)} ${esc(r.time)}</td><td>${esc(r.item)}</td><td>${esc(r.resultIcon || "")} ${esc(r.note || "")}</td></tr>`)}` : "";
+    const stackHtml = (tp.stackingSepa || []).length > 0 ? `<h3>Stacking Sepa Run</h3><ul>${tp.stackingSepa.map(s => `<li><b>${esc(s.date)} ${esc(s.equipment)}</b>: ${esc(s.issue)} ${esc(s.resultIcon || "")}</li>`).join("")}</ul>` : "";
+
+    // 5번 NG 품질
+    const qng = cur.qualityNg || {};
+    const qualityTableHtml = (qng.table || []).length > 0 ? `
+      <table>
+        <thead><tr><th>일자</th><th class="num">Sepa Fold</th><th class="num">Electrode Expose</th><th class="num">Non Response</th><th class="num">Dim Overkill</th><th class="num">Contact NG</th></tr></thead>
+        <tbody>${qng.table.map(r => `<tr><td>${esc(r.date)}</td><td class="num">${r.sepaFold ?? "-"}</td><td class="num">${r.electrodeExpose ?? "-"}</td><td class="num">${r.nonResponse ?? "-"}</td><td class="num">${r.dimOverkill ?? "-"}</td><td class="num">${r.contactNg ?? "-"}</td></tr>`).join("")}</tbody>
+      </table>
+      ${qng.trend ? `<div class="info"><b>추세:</b> ${esc(qng.trend)}</div>` : ""}` : "<p>데이터 없음</p>";
+
+    // 6번 인사이트
+    const insightsHtml = insights.length > 0 ? insights.map(ins => `
+      <h3>${esc(ins.title)}</h3>
+      <ul>${(ins.bulletPoints || []).map(bp => `<li>${esc(bp)}</li>`).join("")}</ul>
+      <p style="font-size:0.9em;color:#666;">
+        <b>${ins.confidence?.includes("가설") ? "🔬 가설 — 검증필요" : "✅ 확실"}</b>
+        ${ins.evidence ? ` · 📎 근거: ${esc(ins.evidence)}` : ""}
+      </p>`).join("") : "<p>인사이트 없음</p>";
+
+    // 7번 액션
+    const actionsHtml = actions.length > 0 ? `
+      <table>
+        <thead><tr><th class="center" style="width:10%;">우선순위</th><th>항목</th><th>비고</th><th style="width:18%;">근거</th></tr></thead>
+        <tbody>${actions.map(a => {
+          const pCls = a.priority === "P0" ? "p0" : a.priority === "P1" ? "p1" : "p2";
+          const pIcon = a.priority === "P0" ? "🚨" : a.priority === "P1" ? "🔴" : "🟡";
+          return `<tr><td class="center"><span class="priority ${pCls}">${pIcon} ${esc(a.priority)}</span></td><td><b>${esc(a.action)}</b>${a._ruleAdjusted ? `<div style="font-size:0.8em;color:#888;">※ ${esc(a._ruleAdjusted)}</div>` : ""}</td><td>${esc(a.context)}${a.confidence?.includes("가설") ? ` <span style="font-size:0.85em;color:#e67e22;">🔬 검증필요</span>` : ""}</td><td style="font-size:0.88em;color:#666;">${esc(a.evidence)}</td></tr>`;
+        }).join("")}</tbody>
+      </table>` : "<p>액션 항목 없음</p>";
+
+    // 유첨 (페르소나 논의)
+    const appendixHtml = (discussions || []).map((d, i) => {
+      const mode = d.modeInfo?.mode || "";
+      const modeColor = mode === "DEEP" ? "#c0392b" : mode === "STANDARD" ? "#e67e22" : "#27ae60";
+      const consensus = d.moderator?.consensus || d.moderator?.summary || d.moderator?.supplement || "";
+      const opinions = (d.opinions || []).map(o => `
+        <div style="margin-top:8px;padding:6px 10px;background:#f5f5f5;border-left:3px solid ${PERSONAS[o.agent]?.color || "#999"};border-radius:3px;">
+          <b>${esc(PERSONAS[o.agent]?.icon || "")} ${esc(o.agent)}</b>: ${esc(JSON.stringify(o.body || o.content || ""))}
+        </div>`).join("");
+      return `
+        <div style="margin-bottom:18px;padding:12px 16px;background:#fafafa;border:1px solid #ddd;border-left:4px solid ${modeColor};border-radius:5px;">
+          <h4 style="margin-top:0;color:${modeColor};">[${esc(mode)}] ${i + 1}. ${esc(d.issue?.eq || "?")} — ${esc((d.issue?.prob || "").slice(0, 60))}</h4>
+          <p><b>📌 사회자 합의:</b> ${esc(consensus.slice(0, 500))}</p>
+          ${opinions ? `<details><summary style="cursor:pointer;color:#666;">에이전트 의견 펼치기</summary>${opinions}</details>` : ""}
+        </div>`;
+    }).join("");
+
+    const html = `<!DOCTYPE html>
+<html lang="ko">
+<head>
+<meta charset="UTF-8">
+<title>${esc(title)}</title>
+<style>
+  body { font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", "Noto Sans KR", "Malgun Gothic", sans-serif;
+    max-width: 1100px; margin: 2em auto; padding: 0 1.5em; line-height: 1.65; color: #222; background: #fafafa; }
+  h1 { font-size: 1.9em; border-bottom: 3px solid #1a3a5c; padding-bottom: 0.3em; color: #1a3a5c; }
+  h2 { font-size: 1.45em; border-bottom: 1px solid #ccc; padding-bottom: 0.25em; margin-top: 2em; color: #1a3a5c; }
+  h3 { font-size: 1.18em; margin-top: 1.5em; color: #333; }
+  h4 { font-size: 1.02em; margin-top: 1.2em; color: #555; }
+  table { border-collapse: collapse; margin: 1em 0; width: 100%; font-size: 0.92em; background: #fff; }
+  th, td { border: 1px solid #bbb; padding: 7px 11px; text-align: left; vertical-align: top; }
+  th { background: #e8eef5; font-weight: 600; color: #1a3a5c; }
+  td.num, th.num { text-align: right; font-variant-numeric: tabular-nums; }
+  .center { text-align: center; }
+  code { background: #f0f0f0; padding: 1px 5px; border-radius: 3px; font-family: "SF Mono", Consolas, monospace; font-size: 0.88em; }
+  .meta { color: #666; font-size: 0.92em; }
+  .critical { background: #fff5f5; border-left: 5px solid #c0392b; padding: 1em 1.3em; margin: 1.2em 0; border-radius: 3px; }
+  .warning { background: #fffaf0; border-left: 5px solid #e67e22; padding: 1em 1.3em; margin: 1em 0; border-radius: 3px; }
+  .info { background: #f0f8ff; border-left: 5px solid #2980b9; padding: 0.9em 1.2em; margin: 1em 0; border-radius: 3px; }
+  .summary-box { background: #fff; border: 2px solid #1a3a5c; padding: 1em 1.3em; margin: 1.5em 0; border-radius: 5px; }
+  .ok { color: #27ae60; font-weight: 600; }
+  .progress { color: #d68910; font-weight: 600; }
+  .priority { font-weight: 700; }
+  .p0 { color: #c0392b; }
+  .p1 { color: #e67e22; }
+  .p2 { color: #d4ac0d; }
+  .appendix-page { page-break-before: always; padding-top: 2em; border-top: 3px double #888; margin-top: 3em; }
+  @media print { .appendix-page { page-break-before: always; } }
+</style>
+</head>
+<body>
+
+<h1>${esc(title)}</h1>
+<p class="meta"><b>분석 기간:</b> ${esc(periodLabel)}<br>
+<b>출처:</b> AZS Status Reports WhatsApp 그룹<br>
+<b>레코드:</b> 부동 이슈 ${issuesCount}건</p>
+
+${cur.summary_text || (cur.criticalSummary || []).length > 0 ? `
+<div class="summary-box">
+<h3 style="margin-top:0;">📋 핵심 요약</h3>
+${cur.summary_text ? `<p><i>${esc(cur.summary_text)}</i></p>` : ""}
+${(cur.criticalSummary || []).length > 0 ? `<ul>${cur.criticalSummary.map(c => `<li>${esc(c)}</li>`).join("")}</ul>` : ""}
+</div>` : ""}
+
+<hr>
+<h2>🚨 1. 장기부동 건 — 상세</h2>
+${longDowntimeHtml || "<p>장기부동 이슈 없음</p>"}
+
+<hr>
+<h2>🔁 2. 발생빈도 높은 이슈</h2>
+${recurringCatHtml}
+${recurringEqHtml}
+
+<hr>
+<h2>⚙️ 3. 설비/공정 조건 변경</h2>
+${visionHtml}${settingHtml}${cutterHtml}${otherHtml}
+${!visionHtml && !settingHtml && !cutterHtml && !otherHtml ? "<p>조건 변경 없음</p>" : ""}
+
+<hr>
+<h2>🧪 4. 테스트 / PM 활동</h2>
+${linePmHtml}${fmvsHtml}${cutterTestHtml}${stackHtml}
+${!linePmHtml && !fmvsHtml && !cutterTestHtml && !stackHtml ? "<p>테스트/PM 활동 없음</p>" : ""}
+
+<hr>
+<h2>📊 5. 일일 NG 품질 실적</h2>
+${qualityTableHtml}
+
+<hr>
+<h2>⚠️ 6. 가장 주목할 사항</h2>
+${insightsHtml}
+
+<hr>
+<h2>📌 7. 액션 후속 사항</h2>
+${actionsHtml}
+
+<hr>
+<p class="meta" style="text-align:center;">— 메인 레포트 종료 —<br>
+AZS Status Reports WhatsApp 데이터 기반 · ${new Date().toLocaleString("ko-KR")}</p>
+
+<div class="appendix-page">
+<h1>📎 Appendix — 페르소나 논의 상세</h1>
+<p class="meta">메인 보고서의 인사이트(6번)와 액션(7번)은 아래 페르소나 논의 결과를 기반으로 도출되었습니다.</p>
+${appendixHtml || "<p>페르소나 논의 없음</p>"}
+</div>
+
+</body>
+</html>`;
+
+    const blob = new Blob([html], { type: "text/html;charset=utf-8" });
+    const url = URL.createObjectURL(blob);
+    const a = document.createElement("a");
+    a.href = url;
+    a.download = `${minutes.title || "AZS_레포트"}.html`;
+    document.body.appendChild(a);
+    a.click();
+    document.body.removeChild(a);
+    URL.revokeObjectURL(url);
   };
 
   const downloadTxt = () => {
@@ -3383,181 +3835,26 @@ ${userText}
             {/* ★ 영역 9-E: 간단 모드 — SimpleReport 컴포넌트 (페르소나 논의/큐레이션 박스/기존 보고서 모두 대체) */}
             {/* 영역 11: 단일 흐름 — SimpleReport 비활성 */}
 
-            {/* ★ PE 사전 큐레이션 (보고서 1부 - 전체 정리) — 상세 모드만 표시 */}
-            {minutes.curation && (
+            {/* ★ 영역 11-F: STEP 4 메인 페이지 (사용자 레포트 1~7번 형태) */}
+            <MainReportPage minutes={minutes}/>
+
+            {/* ★ 영역 11-G: 유첨 (Appendix) — 페르소나 논의 카드 (page-break-before: always) */}
+            <div className="appendix-page-break" style={{
+              marginTop:30, paddingTop:20,
+              borderTop:"3px double rgba(100,116,139,0.5)",
+            }}>
               <div style={{
-                background:"rgba(15,23,42,0.7)",
-                border:"1px solid rgba(59,130,246,0.3)",
-                borderRadius:10, padding:"14px 16px", marginBottom:14,
+                fontSize:14, fontWeight:900, color:"#a78bfa",
+                padding:"10px 14px", background:"rgba(167,139,250,0.08)",
+                border:"1px solid rgba(167,139,250,0.25)", borderRadius:8,
+                marginBottom:14,
               }}>
-                <div style={{fontSize:12,fontWeight:800,color:"#3b82f6",marginBottom:10}}>
-                  📝 PE 사전 큐레이션 — 전체 이슈 정리
-                </div>
-
-                {/* 요약 텍스트 */}
-                <div style={{fontSize:11,color:"#cbd5e1",lineHeight:1.7,marginBottom:12,padding:"8px 10px",background:"rgba(59,130,246,0.06)",borderRadius:6}}>
-                  {minutes.curation.summary_text}
-                </div>
-
-                {/* 일자별 표 */}
-                {minutes.curation.daily_table?.length > 0 && (
-                  <div style={{marginBottom:12}}>
-                    <div style={{fontSize:10,color:"#94a3b8",fontWeight:700,marginBottom:6}}>
-                      📅 일자별 주요 이슈
-                    </div>
-                    <div style={{overflowX:"auto"}}>
-                      <table style={{width:"100%",fontSize:10,borderCollapse:"collapse"}}>
-                        <thead>
-                          <tr style={{background:"rgba(59,130,246,0.15)"}}>
-                            <th style={{padding:"5px 8px",textAlign:"left",color:"#60a5fa",border:"1px solid rgba(51,65,85,0.4)"}}>일자</th>
-                            <th style={{padding:"5px 8px",textAlign:"left",color:"#60a5fa",border:"1px solid rgba(51,65,85,0.4)"}}>호기</th>
-                            <th style={{padding:"5px 8px",textAlign:"left",color:"#60a5fa",border:"1px solid rgba(51,65,85,0.4)"}}>주요 내용</th>
-                            <th style={{padding:"5px 8px",textAlign:"left",color:"#60a5fa",border:"1px solid rgba(51,65,85,0.4)"}}>조치</th>
-                            <th style={{padding:"5px 8px",textAlign:"right",color:"#60a5fa",border:"1px solid rgba(51,65,85,0.4)"}}>분</th>
-                          </tr>
-                        </thead>
-                        <tbody>
-                          {minutes.curation.daily_table.map((row, i) => (
-                            <tr key={i}>
-                              <td style={{padding:"5px 8px",color:"#e2e8f0",border:"1px solid rgba(51,65,85,0.4)",whiteSpace:"nowrap"}}>{row.date}</td>
-                              <td style={{padding:"5px 8px",color:"#e2e8f0",border:"1px solid rgba(51,65,85,0.4)",whiteSpace:"nowrap"}}>{row.equipment}</td>
-                              <td style={{padding:"5px 8px",color:"#cbd5e1",border:"1px solid rgba(51,65,85,0.4)"}}>{row.issue}</td>
-                              <td style={{padding:"5px 8px",color:"#cbd5e1",border:"1px solid rgba(51,65,85,0.4)"}}>{row.action}</td>
-                              <td style={{padding:"5px 8px",color:row.downtime >= 60 ? "#ef4444" : "#94a3b8",textAlign:"right",fontWeight:row.downtime >= 60 ? 700 : 400,border:"1px solid rgba(51,65,85,0.4)"}}>{row.downtime}</td>
-                            </tr>
-                          ))}
-                        </tbody>
-                      </table>
-                    </div>
-                  </div>
-                )}
-
-                {/* 장기 부동 */}
-                {minutes.curation.long_downtime?.length > 0 && (
-                  <div style={{marginBottom:12}}>
-                    <div style={{fontSize:10,color:"#ef4444",fontWeight:700,marginBottom:6}}>
-                      ⏰ 장기 부동 ({minutes.curation.long_downtime.length}건)
-                    </div>
-                    {minutes.curation.long_downtime.map((d, i) => (
-                      <div key={i} style={{fontSize:10,padding:"6px 10px",background:"rgba(239,68,68,0.08)",borderRadius:5,marginBottom:4}}>
-                        <span style={{color:"#fca5a5",fontWeight:700}}>{d.equipment}</span>
-                        <span style={{color:"#94a3b8"}}> | {d.reason}</span>
-                        <span style={{color:"#fbbf24",marginLeft:6}}>({d.duration_note})</span>
-                        {d.status && <span style={{color:"#ef4444",fontSize:9,marginLeft:6}}>{d.status}</span>}
-                      </div>
-                    ))}
-                  </div>
-                )}
-
-                {/* 반복 항목 */}
-                {minutes.curation.recurring?.length > 0 && (
-                  <div>
-                    <div style={{fontSize:10,color:"#f59e0b",fontWeight:700,marginBottom:6}}>
-                      🔁 반복 발생 항목 ({minutes.curation.recurring.length}건)
-                    </div>
-                    {minutes.curation.recurring.map((r, i) => (
-                      <div key={i} style={{fontSize:10,padding:"6px 10px",background:"rgba(245,158,11,0.08)",borderRadius:5,marginBottom:4}}>
-                        <span style={{color:"#fcd34d",fontWeight:700}}>{r.item}</span>
-                        <span style={{color:"#94a3b8"}}> ({r.count}회) </span>
-                        <span style={{color:"#cbd5e1"}}>{r.lines?.join(", ")}</span>
-                        {r.cause && <div style={{color:"#94a3b8",marginTop:2}}>원인: {r.cause}</div>}
-                      </div>
-                    ))}
-                  </div>
-                )}
-
-                {/* ★ 영역 5-H: 품질 이슈 이력 */}
-                {minutes.curation.quality_issues?.length > 0 && (
-                  <div style={{marginTop:12}}>
-                    <div style={{fontSize:10,color:"#a78bfa",fontWeight:700,marginBottom:6}}>
-                      🧪 품질 이슈 이력 ({minutes.curation.quality_issues.length}건)
-                    </div>
-                    {minutes.curation.quality_issues.map((q, i) => (
-                      <div key={i} style={{fontSize:10,padding:"6px 10px",background:"rgba(167,139,250,0.08)",borderRadius:5,marginBottom:4}}>
-                        <span style={{color:"#94a3b8"}}>{q.date} {q.time}</span>{" "}
-                        <span style={{color:"#cbd5e1"}}>{q.item}</span>
-                        {q.note && q.note !== "-" && <span style={{color:"#94a3b8"}}> · {q.note}</span>}
-                      </div>
-                    ))}
-                  </div>
-                )}
-
-                {/* ★ 영역 5-H: 공정/설비 조건변경 이력 */}
-                {minutes.curation.process_changes?.length > 0 && (
-                  <div style={{marginTop:12}}>
-                    <div style={{fontSize:10,color:"#34d399",fontWeight:700,marginBottom:6}}>
-                      ⚙️ 공정/설비 조건변경 이력 ({minutes.curation.process_changes.length}건)
-                    </div>
-                    {minutes.curation.process_changes.map((c, i) => (
-                      <div key={i} style={{fontSize:10,padding:"6px 10px",background:"rgba(52,211,153,0.08)",borderRadius:5,marginBottom:4}}>
-                        <span style={{color:"#94a3b8"}}>{c.date} {c.time}</span>{" "}
-                        <span style={{color:"#cbd5e1"}}>{c.item}</span>
-                        {c.who && c.who !== "-" && <span style={{color:"#94a3b8"}}> · {c.who}</span>}
-                      </div>
-                    ))}
-                  </div>
-                )}
-
-                {/* ★ 영역 5-H: 테스트/양산외 생산 이력 */}
-                {minutes.curation.tests_inspections?.length > 0 && (
-                  <div style={{marginTop:12}}>
-                    <div style={{fontSize:10,color:"#22d3ee",fontWeight:700,marginBottom:6}}>
-                      🔬 테스트/양산외 생산 이력 ({minutes.curation.tests_inspections.length}건)
-                    </div>
-                    {minutes.curation.tests_inspections.map((t, i) => (
-                      <div key={i} style={{fontSize:10,padding:"6px 10px",background:"rgba(34,211,238,0.08)",borderRadius:5,marginBottom:4}}>
-                        <span style={{color:"#94a3b8"}}>{t.date} {t.time}</span>{" "}
-                        <span style={{color:"#cbd5e1"}}>{t.item}</span>
-                        {t.purpose && t.purpose !== "-" && <span style={{color:"#94a3b8"}}> · {t.purpose}</span>}
-                      </div>
-                    ))}
-                  </div>
-                )}
+                📎 Appendix — 페르소나 논의 상세 내역
               </div>
-            )}
-
-            {/* 시간/빈도 분석 */}
-            {minutes.analytics && (
-              <div style={{
-                background:"rgba(15,23,42,0.7)",
-                border:"1px solid rgba(34,211,238,0.25)",
-                borderRadius:10, padding:"14px 16px", marginBottom:14,
-              }}>
-                <div style={{fontSize:12,fontWeight:800,color:"#22d3ee",marginBottom:10}}>
-                  📊 이슈 분석 요약 (총 {minutes.analytics.total}건)
-                </div>
-                <div style={{display:"grid",gridTemplateColumns:"1fr 1fr",gap:14}}>
-                  <div>
-                    <div style={{fontSize:10,color:"#94a3b8",fontWeight:700,marginBottom:6}}>⏰ 시간대 TOP 5</div>
-                    {minutes.analytics.timeOfDay.length === 0 ? (
-                      <div style={{fontSize:10,color:"#475569"}}>데이터 없음</div>
-                    ) : minutes.analytics.timeOfDay.map((b, i) => {
-                      const max = minutes.analytics.timeOfDay[0].count;
-                      return (
-                        <div key={b.hour} style={{fontSize:10,marginBottom:4,display:"flex",alignItems:"center",gap:6}}>
-                          <span style={{color:"#cbd5e1",width:90}}>{i+1}. {b.label}</span>
-                          <span style={{flex:1,height:6,background:"rgba(51,65,85,0.4)",borderRadius:3,overflow:"hidden"}}>
-                            <span style={{display:"block",height:"100%",width:`${(b.count/max)*100}%`,background:"#22d3ee"}}/>
-                          </span>
-                          <span style={{color:"#22d3ee",width:30,textAlign:"right"}}>{b.count}</span>
-                        </div>
-                      );
-                    })}
-                  </div>
-                  <div>
-                    <div style={{fontSize:10,color:"#94a3b8",fontWeight:700,marginBottom:6}}>🔁 빈도 TOP 5 (설비)</div>
-                    {minutes.analytics.categoryFreq.length === 0 ? (
-                      <div style={{fontSize:10,color:"#475569"}}>데이터 없음</div>
-                    ) : minutes.analytics.categoryFreq.map((c, i) => (
-                      <div key={c.key} style={{fontSize:10,marginBottom:4,display:"flex",justifyContent:"space-between"}}>
-                        <span style={{color:"#cbd5e1"}}>{i+1}. {c.eq}</span>
-                        <span style={{color:"#22d3ee"}}>{c.count}건</span>
-                      </div>
-                    ))}
-                  </div>
-                </div>
+              <div style={{fontSize:10,color:"#94a3b8",marginBottom:12,fontStyle:"italic"}}>
+                메인 보고서의 인사이트(6번)와 액션(7번)은 아래 페르소나 논의 결과를 기반으로 도출되었습니다.
               </div>
-            )}
+            </div>
 
             {/* 모드별 분석 결과 — 상세 모드만 표시 */}
             {discussions.length > 0 && (
@@ -3595,65 +3892,13 @@ ${userText}
               </div>
             )}
 
-            {/* 보고서 — 상세 모드만 표시 */}
-            {(
-            <div style={{
-              background:"rgba(248,250,252,0.97)", borderRadius:12,
-              color:"#1e293b", padding:"28px 32px", marginBottom:14,
-              boxShadow:"0 20px 60px rgba(0,0,0,0.5)",
-              fontFamily:"'Noto Sans KR','Malgun Gothic',sans-serif",
-            }}>
-              <div style={{borderBottom:"3px solid #1d4ed8",paddingBottom:14,marginBottom:18}}>
-                <div style={{fontSize:9,letterSpacing:3,color:"#3b82f6",fontWeight:800,marginBottom:5}}>
-                  {REPORT_TYPES.find(r=>r.id===reportType)?.label.toUpperCase()}
-                </div>
-                <div style={{fontSize:18,fontWeight:900,color:"#0f172a",marginBottom:8}}>
-                  {minutes.title}
-                </div>
-                <div style={{display:"flex",gap:16,fontSize:11,color:"#64748b",flexWrap:"wrap"}}>
-                  <span>📅 {minutes.date}</span>
-                  <span>👥 {minutes.attendees}</span>
-                </div>
-                <div style={{marginTop:6,fontSize:11,color:"#475569"}}>
-                  <span style={{fontWeight:700}}>안건: </span>{minutes.agenda}
-                </div>
-              </div>
-              {(minutes.sections||[]).map((sec,i) => (
-                <div key={i} style={{marginBottom:16}}>
-                  <div style={{
-                    fontSize:11,fontWeight:800,color:"#1d4ed8",
-                    background:"#dbeafe",padding:"4px 10px",
-                    borderRadius:5,marginBottom:8,display:"inline-block",
-                  }}>{sec.heading}</div>
-                  <ul style={{margin:0,padding:0,listStyle:"none"}}>
-                    {(sec.items||[]).map((item,j) => (
-                      <li key={j} style={{
-                        fontSize:12,color:"#334155",lineHeight:1.8,
-                        paddingLeft:14,position:"relative",
-                      }}>
-                        <span style={{position:"absolute",left:0,color:"#3b82f6"}}>·</span>{item}
-                      </li>
-                    ))}
-                  </ul>
-                </div>
-              ))}
-              <div style={{
-                borderTop:"1px solid #e2e8f0",paddingTop:10,marginTop:4,
-                fontSize:10,color:"#94a3b8",textAlign:"right",
-              }}>
-                AI 생성 보고서 · {new Date().toLocaleString("ko-KR")}
-              </div>
-            </div>
-            )}
-            {/* /보고서 블록 종료 (간단모드 시 숨김 분기 닫기) */}
-
             <div style={{display:"flex",gap:10,marginBottom:10}}>
-              <button onClick={downloadTxt} style={{
+              <button onClick={downloadHtml} style={{
                 flex:1, padding:"11px",
                 background:"linear-gradient(135deg,#3b82f6,#22d3ee)",
                 border:"none", borderRadius:8, color:"#fff",
                 fontSize:13, fontWeight:800, cursor:"pointer",
-              }}>📥 TXT 다운로드</button>
+              }}>📥 HTML 다운로드 (메인 + 유첨)</button>
               <button onClick={()=>{setStep(3);setMinutes(null);setDiscussions([]);setProgress([]);}} style={{
                 flex:1, padding:"11px", background:"transparent",
                 border:"1.5px solid rgba(167,139,250,0.35)", borderRadius:8,
@@ -4811,6 +5056,181 @@ function BriefingDisplay({ curation, allIssues = [], selectedIds = [], autoSelec
             )}
           </>
         )}
+      </div>
+    </div>
+  );
+}
+
+// ─── ★ 영역 11-F: STEP 4 메인 페이지 (사용자 레포트 1~7번 형태) ──────────────
+// 1~5번: BriefingDisplay 재사용 (체크박스 props 미전달 = 정보 표시 전용)
+// 6번: 가장 주목할 사항 (LLM 생성 인사이트)
+// 7번: 액션 후속 사항 (P0/P1/P2 표)
+function MainReportPage({ minutes }) {
+  if (!minutes) return null;
+  const sectionStyle = {
+    background:"rgba(15,23,42,0.6)", border:"1px solid rgba(100,116,139,0.25)",
+    borderRadius:10, padding:"14px 16px", marginBottom:14,
+  };
+  const headingStyle = {
+    fontSize:13, fontWeight:800, marginBottom:10,
+    paddingBottom:6, borderBottom:"1px solid rgba(51,65,85,0.4)",
+  };
+  const tableStyle = { width:"100%", fontSize:10.5, color:"#cbd5e1", borderCollapse:"collapse" };
+  const thStyle = {
+    padding:"5px 8px", background:"rgba(51,65,85,0.4)",
+    color:"#94a3b8", fontWeight:700, textAlign:"left",
+    border:"1px solid rgba(51,65,85,0.4)",
+  };
+  const tdStyle = { padding:"5px 8px", border:"1px solid rgba(51,65,85,0.3)", verticalAlign:"top" };
+
+  // 분석 기간 라벨
+  const periodLabel = (() => {
+    if (minutes.range && minutes.range.start && minutes.range.end) {
+      // selRange 활용 — buildRangeLabel 결과는 minutes.date에 이미 들어있을 가능성
+      return minutes.date;
+    }
+    return minutes.date || "";
+  })();
+
+  // 6번 confidence 라벨 색상
+  const confColor = (conf) => conf?.includes("가설") ? "#f59e0b" : "#34d399";
+  const confLabel = (conf) => conf?.includes("가설") ? "🔬 가설 — 검증필요" : "✅ 확실";
+
+  // 7번 P0/P1/P2 색상
+  const pColor = (p) => p === "P0" ? "#c0392b" : p === "P1" ? "#e67e22" : "#d4ac0d";
+  const pIcon = (p) => p === "P0" ? "🚨" : p === "P1" ? "🔴" : "🟡";
+
+  return (
+    <div>
+      {/* 헤더 */}
+      <div style={{
+        background:"rgba(29,78,216,0.08)", borderTop:"4px solid #1d4ed8",
+        borderRadius:"0 0 10px 10px",
+        padding:"18px 20px", marginBottom:16,
+      }}>
+        <div style={{fontSize:18,fontWeight:900,color:"#dbeafe",marginBottom:6}}>
+          AZS Factory 일일 이슈 레포트
+        </div>
+        <div style={{fontSize:11,color:"#cbd5e1",lineHeight:1.7}}>
+          <strong>분석 기간:</strong> {periodLabel}<br/>
+          <strong>출처:</strong> AZS Status Reports WhatsApp 그룹<br/>
+          <strong>레코드:</strong> 부동 이슈 {(minutes.tagged?.issues || []).length}건
+          {minutes.curation?.summary_text && (
+            <>
+              <br/>
+              <strong>요약:</strong> {minutes.curation.summary_text}
+            </>
+          )}
+        </div>
+      </div>
+
+      {/* 1~5번: BriefingDisplay (정보 표시 전용 — 체크박스 props 미전달) */}
+      <BriefingDisplay curation={minutes.curation}/>
+
+      {/* 6번: 가장 주목할 사항 */}
+      <div style={sectionStyle}>
+        <div style={{...headingStyle,color:"#e67e22"}}>⚠️ 6. 가장 주목할 사항</div>
+        {(!minutes.insights || minutes.insights.length === 0) ? (
+          <div style={{fontSize:10,color:"#64748b",padding:"8px 0"}}>인사이트 없음</div>
+        ) : (
+          <div>
+            {minutes.insights.map((ins, idx) => (
+              <div key={idx} style={{
+                padding:"10px 14px", marginBottom:8,
+                background:"rgba(15,23,42,0.4)", border:"1px solid rgba(51,65,85,0.3)",
+                borderLeft:`4px solid ${confColor(ins.confidence)}`,
+                borderRadius:6,
+              }}>
+                <div style={{
+                  display:"flex", alignItems:"center", gap:10,
+                  marginBottom:6,
+                }}>
+                  <span style={{fontSize:11,fontWeight:800,color:"#fcd34d",flex:1}}>
+                    {ins.title}
+                  </span>
+                  <span style={{
+                    fontSize:9, padding:"2px 8px", borderRadius:10,
+                    background:`${confColor(ins.confidence)}22`,
+                    color:confColor(ins.confidence),
+                    fontWeight:700,
+                  }}>{confLabel(ins.confidence)}</span>
+                </div>
+                {ins.bulletPoints?.length > 0 && (
+                  <ul style={{margin:0,paddingLeft:18,fontSize:10.5,color:"#cbd5e1",lineHeight:1.6}}>
+                    {ins.bulletPoints.map((bp, bi) => (
+                      <li key={bi} style={{marginBottom:2}}>{bp}</li>
+                    ))}
+                  </ul>
+                )}
+                {ins.evidence && (
+                  <div style={{
+                    fontSize:9, color:"#64748b", marginTop:6, paddingTop:4,
+                    borderTop:"1px dashed rgba(100,116,139,0.3)",
+                  }}>
+                    📎 근거: <span style={{color:"#94a3b8"}}>{ins.evidence}</span>
+                  </div>
+                )}
+              </div>
+            ))}
+          </div>
+        )}
+      </div>
+
+      {/* 7번: 액션 후속 사항 */}
+      <div style={sectionStyle}>
+        <div style={{...headingStyle,color:"#a78bfa"}}>📌 7. 액션 후속 사항</div>
+        {(!minutes.actions || minutes.actions.length === 0) ? (
+          <div style={{fontSize:10,color:"#64748b",padding:"8px 0"}}>액션 항목 없음</div>
+        ) : (
+          <table style={tableStyle}>
+            <thead>
+              <tr>
+                <th style={{...thStyle,width:"10%",textAlign:"center"}}>우선순위</th>
+                <th style={thStyle}>항목</th>
+                <th style={thStyle}>비고</th>
+                <th style={{...thStyle,width:"18%"}}>근거</th>
+              </tr>
+            </thead>
+            <tbody>
+              {minutes.actions.map((a, idx) => (
+                <tr key={idx}>
+                  <td style={{...tdStyle,textAlign:"center"}}>
+                    <span style={{
+                      fontSize:10, fontWeight:800, color:pColor(a.priority),
+                    }}>{pIcon(a.priority)} {a.priority}</span>
+                  </td>
+                  <td style={tdStyle}>
+                    <strong>{a.action}</strong>
+                    {a._ruleAdjusted && (
+                      <div style={{fontSize:8,color:"#94a3b8",marginTop:2}}>
+                        ※ {a._ruleAdjusted}
+                      </div>
+                    )}
+                  </td>
+                  <td style={{...tdStyle,fontSize:10}}>
+                    {a.context}
+                    {a.confidence?.includes("가설") && (
+                      <span style={{
+                        marginLeft:6, fontSize:8, padding:"1px 5px", borderRadius:3,
+                        background:"rgba(245,158,11,0.15)", color:"#fbbf24", fontWeight:700,
+                      }}>🔬 검증필요</span>
+                    )}
+                  </td>
+                  <td style={{...tdStyle,fontSize:9,color:"#94a3b8"}}>{a.evidence}</td>
+                </tr>
+              ))}
+            </tbody>
+          </table>
+        )}
+      </div>
+
+      {/* 푸터 */}
+      <div style={{
+        textAlign:"center", fontSize:9, color:"#64748b", marginTop:20,
+        paddingTop:12, borderTop:"1px solid rgba(51,65,85,0.3)",
+      }}>
+        — 메인 레포트 종료 —<br/>
+        AZS Status Reports WhatsApp 데이터 기반
       </div>
     </div>
   );

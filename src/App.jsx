@@ -1093,18 +1093,37 @@ async function runPreCuration(allIssues, kbPE, reportType, categoryMsgs = {}) {
   const isWeekly = reportType === "weekly";
   const longThreshold = isWeekly ? 60 : 30;
 
-  // ── 3분할 병렬 호출 ──
-  console.log("[PE 큐레이션] Sonnet 3분할 병렬 호출 시작...");
+  // ★ 영역 12-AE2: quality 메시지도 Part 2b 입력에 추가 (STK-4-B3 같은 NG+setting 메시지 누락 방지)
+  const qualityWithSetting = (categoryMsgs.quality || []).slice(0, 8).map((m, i) => ({
+    no: i + 1,
+    date: m.date || "",
+    time: m.time || "",
+    sender: m.sender || "",
+    text: (m.text || "").slice(0, 350).replace(/\n/g, " | "),
+  }));
+
+  // ── ★ 영역 12-AF3: 4분할 병렬 호출 (Part 2를 2a/2b로 분할) ──
+  // Part 2b가 conditionChangeGroups 전용 — Sonnet이 짧고 정확하게 처리
+  console.log("[PE 큐레이션] Sonnet 4분할 병렬 호출 시작 (Part 2 → 2a + 2b)...");
   const startTime = Date.now();
 
-  const [part1, part2, part3] = await Promise.all([
+  const [part1, part2a, part2b, part3] = await Promise.all([
     curationPart1_LongDowntime(issuesData, allIssues.length, focus, kbText, longThreshold, categoryMsgs),
-    curationPart2_RecurringConditionChange(issuesData, processChangeData, allIssues.length, focus, kbText, categoryMsgs),
+    curationPart2a_RecurringSimple(issuesData, processChangeData, allIssues.length, focus, kbText, categoryMsgs),
+    curationPart2b_ConditionChangeGroups(processChangeData, qualityWithSetting, focus, kbText),
     curationPart3_TestPmQuality(testData, qualityData, focus, kbText, categoryMsgs),
   ]);
 
+  // Part 2a + 2b 결과 병합 — conditionChangeGroups는 2b에서, 나머지는 2a에서
+  const part2 = {
+    recurringByCategory: part2a.recurringByCategory || [],
+    recurringSameEquipment: part2a.recurringSameEquipment || [],
+    conditionChanges: part2a.conditionChanges || { visionOffset: [], settingChange: [], cutter: [], other: [] },
+    conditionChangeGroups: part2b.conditionChangeGroups || [],
+  };
+
   const elapsed = ((Date.now() - startTime) / 1000).toFixed(1);
-  console.log(`[PE 큐레이션] 3분할 병렬 완료 (${elapsed}초)`);
+  console.log(`[PE 큐레이션] 4분할 병렬 완료 (${elapsed}초) — 2a: ${part2.recurringByCategory.length} 카테고리 / 2b: ${part2.conditionChangeGroups.length} 그룹`);
 
   // ★ 영역 12-Z3 + 12-AB5: 룰 백업 — LLM 응답 누락 시 자동 보강
   // 12-AB5: Haiku fallback이 max_tokens로 잘려서 일부만 응답한 경우(예: 4건 중 1건),
@@ -1307,43 +1326,34 @@ ${JSON.stringify(issuesData, null, 1)}
 위 데이터에서 duration_min >= ${longThreshold} 인 모든 부동 이슈를 longDowntime에 빠짐없이 정리하세요.
 옵셔널 필드(splitDetail, historyPattern 등)는 명백한 단서 있을 때만 채우고, 없으면 빈 값으로 응답해 응답 속도를 우선하세요.`;
 
-  return await callCurationPart(sys, userMsg, "Part1-LongDowntime");
+  // ★ 영역 12-AF4: Part 1 max_tokens 1500 (이전 1800 → 30.5초 timeout 직전, 안전 마진 확보)
+  return await callCurationPart(sys, userMsg, "Part1-LongDowntime", [], {}, 1500);
 }
 
-// ─── Part 2: 2번 반복 + 3번 조건변경 ──────────────────────────────────────────
-async function curationPart2_RecurringConditionChange(issuesData, processChangeData, totalCount, focus, kbText, categoryMsgs) {
-  // ★ 영역 12-AE2: quality 메시지도 입력에 추가 — STK-4-B3 같은 NG+setting 이중 메시지 누락 방지
-  // quality로 분류된 메시지 중 setting/parameter 정보가 있는 것 (Stack NG ... setting z cut 등)
-  const qualityWithSetting = (categoryMsgs.quality || []).slice(0, 8).map((m, i) => ({
-    no: i + 1,
-    date: m.date || "",
-    time: m.time || "",
-    sender: m.sender || "",
-    text: (m.text || "").slice(0, 350).replace(/\n/g, " | "),
-  }));
+// ─── ★ 영역 12-AF: Part 2 분할 (2a: recurring + simple changes, 2b: conditionChangeGroups 전용) ──
+// 이유: 기존 Part 2가 max_tokens 2200으로도 timeout (36.6초). 분할해서 각 부분 짧고 정확하게 처리.
 
+// ─── Part 2a: 2번 반복 + 3번 조건변경 (그룹 외 — 단순 변경 항목) ─────────────
+async function curationPart2a_RecurringSimple(issuesData, processChangeData, totalCount, focus, kbText, categoryMsgs) {
   const sys = `${FACTORY_PHILOSOPHY}
 
 당신은 AZS 배터리 공장의 ${PERSONAS.Cell_PE.role.replace(" - Cell 공정", "")}입니다.
-이 작업은 일일 이슈 브리핑의 2번 (발생빈도) + 3번 (조건변경) 섹션 정리입니다.${kbText}
+이 작업은 일일 이슈 브리핑의 2번 (발생빈도) + 3번 (조건변경 단순 항목) 정리입니다.${kbText}
 
 ${focus}
 
-[★ 최우선 지시 — 절대 누락 금지]
-1) 입력의 부동 이슈 데이터에서 카테고리별/호기별 반복을 빠짐없이 집계
-2) 조건변경 메시지가 있으면 conditionChanges 4개 그룹에 모두 분류
-3) **★ 핵심: 같은 호기에 여러 파라미터를 변경한 그룹은 conditionChangeGroups에 풀로 정리하세요**
-   - 메시지에 "Countermeasures:" "- Check ..." "- Setting Gap..." 같은 다중 파라미터 리스트가 있으면 모두 추출
-   - 메시지에 "Stack NG / Caused / Countermeasures" 형식의 보고는 conditionChangeGroups에 그룹으로 추출
-   - quality 메시지에 setting/parameter 변경이 있으면 (예: "setting z cut stack table") conditionChangeGroups에도 포함
+[★ 최우선 지시]
+1) 부동 이슈 데이터에서 카테고리별/호기별 반복을 빠짐없이 집계
+2) 조건변경 메시지 중 단순 항목을 conditionChanges 4개 그룹에 분류
+   (※ 호기별 다중 파라미터 그룹은 별도 작업에서 처리하므로 여기선 제외)
 
-[필수 출력 — JSON만, 다른 텍스트 금지]
+[필수 출력 — JSON만]
 {
   "recurringByCategory": [
-    {"category":"카테고리명 (예: Servo Fault, Ejector Timeout)","count":건수,"equipments":["STK-1-A4 (×2)","STK-2-D5"]}
+    {"category":"Servo Fault","count":4,"equipments":["STK-4-B1 (×2)","STK-3-D5"]}
   ],
   "recurringSameEquipment": [
-    {"equipment":"호기","count":건수,"detail":"발생 내역 요약",
+    {"equipment":"호기","count":건수,"detail":"발생 내역",
      "gapAnalysis":"(옵셔널)","totalDuration":"(옵셔널)","partsReplaced":"(옵셔널)"}
   ],
   "conditionChanges": {
@@ -1351,37 +1361,13 @@ ${focus}
     "settingChange": [{"equipment":"호기","parameter":"파라미터명","before":"변경 전","after":"변경 후"}],
     "cutter": [{"date":"YY/M/D","time":"HH:MM","equipment":"호기","change":"변경 내용"}],
     "other": [{"date":"YY/M/D","equipment":"호기","change":"기타 조건 변경","pic":"담당자"}]
-  },
-  "conditionChangeGroups": [
-    {
-      "title":"호기별 그룹 제목 (예: 'STK-3-B2 Overhang 대응')",
-      "equipment":"STK-3-B2",
-      "timeRange":"발생 시각 (예: '08:10, Shift 1')",
-      "shift":"Shift 정보",
-      "picReason":"PIC + 사유 (예: 'PIC: Group C · 사유: Anode X value spec 초과')",
-      "parameters":[
-        {"parameter":"파라미터명 (예: 'Gap 2nd PnP (+) Down Loading')","before":"변경 전 값","after":"변경 후 값"},
-        {"parameter":"...","before":"...","after":"..."}
-      ],
-      "verification":"검증 결과 (예: '3 sample CT scan 결과 OK, monitoring 진행')"
-    }
-  ]
+  }
 }
 
-[★ conditionChangeGroups — 핵심 출력 규칙]
-- ★ 입력 메시지에 같은 호기에 대한 복수 파라미터 변경/점검 항목이 있으면 반드시 그룹으로 추출
-- ★ 메시지의 "Countermeasures:" 또는 "- Check ..." 형식 다중 항목을 parameters 배열에 모두 채우세요 (10개도 가능)
-- ★ "Setting Gap 2nd PnP", "Setting align table", "Idle mandrel pressure" 같이 명시된 파라미터를 빠짐없이 추출
-- ★ 값 (Before → After)이 명시 안 됐을 때는 "→ Check/조정", "→ setting 조정" 같은 표현으로 명시
-- ★ Stack NG / Caused / Countermeasures 형식 보고도 그룹으로 추출 (problem 호기 중심)
-- ★ Cutter Splicing / Auto Splicing / VB Overload 같은 cutter 조정도 그룹으로 추출
-- ★ 그룹이 명백히 없으면 빈 배열 []
-
 [규칙]
-- recurringByCategory: 키워드 카테고리 — 모든 카테고리 빠짐없이 집계
+- recurringByCategory: 모든 카테고리 빠짐없이 집계
 - recurringSameEquipment: 같은 호기 2건 이상 발생만
-- conditionChanges 4개 하위 그룹 — 데이터 있는 만큼 모두 분류
-- 옵셔널 필드 (gapAnalysis 등) — 명백한 단서 있을 때만
+- conditionChanges 4개 하위 그룹 — 단발 변경/단순 항목만 (다중 파라미터 그룹은 제외)
 - 모든 수치는 숫자만`;
 
   const userMsg = `[부동 이슈 데이터 - ${totalCount}건]
@@ -1390,15 +1376,94 @@ ${JSON.stringify(issuesData, null, 1)}
 [공정/설비 조건변경 메시지 - ${processChangeData.length}건]
 ${processChangeData.length > 0 ? JSON.stringify(processChangeData, null, 1) : "(없음)"}
 
-[참고: quality 메시지 중 setting/parameter 정보 있을 수 있는 것 - ${qualityWithSetting.length}건]
+위 데이터를 2번 반복 + 3번 조건변경 단순 항목으로 정리하세요. (다중 파라미터 그룹은 별도 처리)`;
+
+  return await callCurationPart(sys, userMsg, "Part2a-Recurring/Simple", [], {}, 1500);
+}
+
+// ─── Part 2b: 3번 조건변경 (conditionChangeGroups 전용) ──────────────────────
+// 호기별 다중 파라미터 변경 그룹만 집중 추출
+async function curationPart2b_ConditionChangeGroups(processChangeData, qualityWithSetting, focus, kbText) {
+  const sys = `${FACTORY_PHILOSOPHY}
+
+당신은 AZS 배터리 공장의 ${PERSONAS.Cell_PE.role.replace(" - Cell 공정", "")}입니다.
+이 작업은 호기별 조건변경 그룹 (다중 파라미터 변경) 정밀 추출 전용입니다.${kbText}
+
+${focus}
+
+[★ 핵심 작업 — 이 작업의 전부]
+입력 메시지에서 같은 호기에 대해 여러 파라미터를 변경한 그룹을 풀로 추출하세요.
+각 그룹의 모든 파라미터를 빠짐없이 parameters 배열에 포함하세요.
+
+[★ 인식 패턴]
+1) "Machine: Stack 3B2 / Problem: Issue Overhang / Caused: ... / Countermeasures: - Setting Gap ... - Setting Gap ..." 형식
+   → 하나의 conditionChangeGroup으로 묶고, Countermeasures의 모든 항목을 parameters 배열에 포함
+2) Countermeasures 안의 "- Setting Gap 2nd PnP (+) Down Loading 39.6 => 40.0" 같은 항목은
+   parameter="Gap 2nd PnP (+) Down Loading", before="39.6", after="40.0"으로 추출
+3) "- check vision f/i" "- check gap" 같이 값 없이 점검 항목인 경우
+   parameter="Vision f/i 점검", before="", after="Check"
+4) Stack NG / Stack Wrinkle 보고도 그룹으로 추출 (문제 호기 + Countermeasures)
+
+[★ Few-shot 예시]
+입력 메시지: "Machine: Stack 3B2 / Problem: Issue Overhang / Caused: anode X value exceeds the limit / Countermeasures: - Check Gap 2nd PnP (+) Down Loading - Setting Gap 2nd PnP (+) Down Loading 39.6 => 40.0 - Setting Gap 2nd PnP (+) Down Unloading 32.9 => 33.0 - Setting Gap 2nd PnP (-) Down Loading 40.0 => 40.1 / Time: 08:10 / PIC: Group C / Result: 3 sample CT scan OK"
+
+출력:
+{
+  "title": "STK-3-B2 Overhang 대응",
+  "equipment": "STK-3-B2",
+  "timeRange": "08:10",
+  "shift": "Shift 1",
+  "picReason": "PIC: Group C · 사유: anode X value exceeds the limit",
+  "parameters": [
+    {"parameter": "Gap 2nd PnP (+) Down Loading 점검", "before": "", "after": "Check"},
+    {"parameter": "Gap 2nd PnP (+) Down Loading", "before": "39.6", "after": "40.0"},
+    {"parameter": "Gap 2nd PnP (+) Down Unloading", "before": "32.9", "after": "33.0"},
+    {"parameter": "Gap 2nd PnP (-) Down Loading", "before": "40.0", "after": "40.1"}
+  ],
+  "verification": "3 sample CT scan OK"
+}
+
+[필수 출력 — JSON만, 다른 텍스트 금지]
+{
+  "conditionChangeGroups": [
+    {
+      "title": "호기별 그룹 제목",
+      "equipment": "호기명 (정규화: Stack 3B2 → STK-3-B2)",
+      "timeRange": "발생 시각 (예: '08:10')",
+      "shift": "Shift 정보",
+      "picReason": "PIC + 사유",
+      "parameters": [
+        {"parameter": "파라미터명", "before": "값 또는 빈 문자열", "after": "값 또는 'Check'"}
+      ],
+      "verification": "검증 결과 또는 빈 문자열"
+    }
+  ]
+}
+
+[★ 호기명 정규화]
+- "Stack 3B2" → "STK-3-B2"
+- "Stack 4-B1" → "STK-4-B1"
+- "Stack 4B(-)" → "STK-4-B(-)"
+- "1B5" → "STK-1-B5"
+
+[규칙]
+- 그룹이 없으면 빈 배열 [] 반환
+- parameters는 메시지에 명시된 모든 항목 추출 — 풀로 (10개 이상도 가능)
+- 단발 변경 (Vision Offset 1건)은 그룹 아님 — 제외
+- 모든 수치는 숫자/문자열로 정확히 표기`;
+
+  const userMsg = `[조건변경 메시지 - ${processChangeData.length}건]
+${processChangeData.length > 0 ? JSON.stringify(processChangeData, null, 1) : "(없음)"}
+
+[참고: quality 메시지 중 setting 정보 있을 수 있는 것 - ${qualityWithSetting.length}건]
 ${qualityWithSetting.length > 0 ? JSON.stringify(qualityWithSetting, null, 1) : "(없음)"}
-※ 위 quality 메시지에 "setting z cut", "parameter 변경" 등이 있으면 conditionChangeGroups에 포함
+※ "setting z cut", "Stack NG ... Countermeasures" 같은 메시지에 호기별 다중 파라미터 변경 정보가 있을 수 있음
 
-위 데이터를 2번 반복 + 3번 조건변경 형식으로 정리하세요.
-★ conditionChangeGroups를 풀로 채우세요 — 같은 호기 다중 파라미터 그룹은 빠짐없이 추출.
-★ 메시지의 "Countermeasures:" 다중 항목은 parameters 배열에 모두 포함.`;
+위 메시지에서 같은 호기에 대한 다중 파라미터 변경 그룹을 풀로 추출하세요.
+★ 각 메시지의 Countermeasures 모든 항목을 parameters 배열에 포함.
+★ 호기명은 정규화 (Stack 3B2 → STK-3-B2).`;
 
-  return await callCurationPart(sys, userMsg, "Part2-Recurring/ConditionChange", [], {}, 2200);
+  return await callCurationPart(sys, userMsg, "Part2b-ConditionChangeGroups", [], {}, 1800);
 }
 
 // ─── Part 3: 4번 테스트/PM + 5번 품질NG ───────────────────────────────────────

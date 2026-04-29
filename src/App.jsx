@@ -1065,15 +1065,30 @@ ${testData.length > 0 ? JSON.stringify(testData, null, 1) : "(없음)"}
   try {
     await new Promise(r => setTimeout(r, 500));
     const raw = await callClaudeRaw(sys, userMsg, {
-      model: MODEL_FAST,  // ★ 영역 11: Haiku 사용 — Sonnet은 5500 토큰 응답에 25초+ → Netlify 10초 한도 초과 (확인됨)
-      max_tokens: 4000,  // 영역 11: Haiku는 빠르므로 약간 여유 — 풍부 응답 가능
+      model: MODEL_FAST,  // Haiku
+      max_tokens: 2500,  // 영역 11: 응답 시간 ↓ (Netlify 10초 안전선 — 4000도 timeout 발생)
     });
     const parsed = safeJSON(raw);
     return normalizeBriefing(parsed);
   } catch (e) {
-    // 영역 11: 상세 에러 정보 출력 (사용자 진단 용이)
-    console.error("[PE 큐레이션 실패]", e);
-    console.error("[PE 큐레이션 실패] 메시지:", e?.message);
+    console.error("[PE 큐레이션 1차 실패]", e?.message);
+
+    // ★ 영역 11: 504 timeout 시 더 짧게 재시도
+    if (e?.message?.includes("504") || e?.message?.includes("Timeout")) {
+      try {
+        console.log("[PE 큐레이션 재시도] max_tokens 1500으로 축소...");
+        await new Promise(r => setTimeout(r, 1000));
+        const raw2 = await callClaudeRaw(sys, userMsg, {
+          model: MODEL_FAST,
+          max_tokens: 1500,  // 더 짧은 응답
+        });
+        const parsed2 = safeJSON(raw2);
+        return normalizeBriefing(parsed2);
+      } catch (e2) {
+        console.error("[PE 큐레이션 2차 실패]", e2?.message);
+      }
+    }
+
     console.error("[PE 큐레이션 실패] 페이로드 크기:", {
       sys_chars: sys.length,
       userMsg_chars: userMsg.length,

@@ -954,15 +954,20 @@ async function runPreCuration(allIssues, kbPE, reportType, categoryMsgs = {}) {
   const elapsed = ((Date.now() - startTime) / 1000).toFixed(1);
   console.log(`[PE 큐레이션] 3분할 병렬 완료 (${elapsed}초)`);
 
-  // 결과 병합
+  // 결과 병합 — 영역 12-Y: 새 필드 (recordBreakdown, chronicIssues, conditionChangeGroups, chronic1AB, line3DCutterCpc) 보존
   return normalizeBriefing({
     summary_text: part1.summary_text || "",
+    recordBreakdown: part1.recordBreakdown || { bmDowntime: 0, ubm: 0, pdDowntime: 0, other: 0 },
     criticalSummary: part1.criticalSummary || [],
     longDowntime: part1.longDowntime || [],
+    chronicIssues: part1.chronicIssues || [],  // ★ 12-Y4 만성 이슈 별도 섹션
     recurringByCategory: part2.recurringByCategory || [],
     recurringSameEquipment: part2.recurringSameEquipment || [],
+    conditionChangeGroups: part2.conditionChangeGroups || [],  // ★ 12-Y2 호기별 그룹
     conditionChanges: part2.conditionChanges || { visionOffset: [], settingChange: [], cutter: [], other: [] },
     testPm: part3.testPm || { linePM: [], fmvs: [], cutter: [], stackingSepa: [] },
+    chronic1AB: part3.chronic1AB || null,  // ★ 12-Y3 1AB 만성 라인
+    line3DCutterCpc: part3.line3DCutterCpc || null,  // ★ 12-Y3 Line 3D CPC
     qualityNg: part3.qualityNg || { table: [], trend: "데이터 없음" },
   });
 }
@@ -973,7 +978,7 @@ async function callCurationPart(sys, userMsg, partLabel, allIssuesForFallback = 
     await new Promise(r => setTimeout(r, 200));
     const raw = await callClaudeRaw(sys, userMsg, {
       model: MODEL_REASONING,  // ★ Sonnet (품질 우선)
-      max_tokens: 2000,
+      max_tokens: 2500,  // 영역 12-Y6: 2000→2500 — 풍부 응답 (timeout 위험 약간 ↑)
     });
     return safeJSON(raw);
   } catch (e) {
@@ -986,7 +991,7 @@ async function callCurationPart(sys, userMsg, partLabel, allIssuesForFallback = 
         await new Promise(r => setTimeout(r, 800));
         const raw2 = await callClaudeRaw(sys, userMsg, {
           model: MODEL_FAST,  // Haiku fallback
-          max_tokens: 1500,
+          max_tokens: 1800,  // 12-Y6: 1500→1800
         });
         return safeJSON(raw2);
       } catch (e2) {
@@ -1003,51 +1008,101 @@ async function curationPart1_LongDowntime(issuesData, totalCount, focus, kbText,
   const sys = `${FACTORY_PHILOSOPHY}
 
 당신은 AZS 배터리 공장의 ${PERSONAS.Cell_PE.role.replace(" - Cell 공정", "")}입니다.
-이 작업은 일일 이슈 브리핑의 1번 섹션 (장기부동) 정리입니다.${kbText}
+이 작업은 일일 이슈 브리핑의 1번 섹션 (장기부동 + 만성 이슈 추적) 정리입니다.${kbText}
 
 ${focus}
 
-[중요: 분할 보고 통합 룰]
-같은 호기에서 시간 인접 (24시간 내) + 동일 알람 코드 또는 동일 root cause 키워드를 보이는 BM Bot 보고가 여러 건이면,
-하나의 누적 이슈로 묶어 longDowntime에 표시. 분할 시간을 명시. 불확실하면 묶지 말고 분리 표시.
+[★ 영역 12-Y1: 사용자 레포트 수준 출력 — 매우 중요]
+다음 정보들을 가능한 한 풍부하게 추출/분석하세요:
+
+1) **레코드 분류 (recordBreakdown)**: 이슈 데이터를 BM Downtime Bot / UBM (Unscheduled BM) / PD Downtime / Other로 분류해 카운트
+
+2) **분할 보고 정밀 분석**: 같은 호기 24h 내 동일 알람/root cause 보고가 여러 건이면 하나로 묶되:
+   - splitDetail에 "1차 — N분 (시각) / 2차 — M분 (시각, K분 만에 재발)" 형태로 분리 명시
+   - recurrenceGap (재발 간격, 분 단위)
+   - "1차 조치(homing/tunning)로는 근본 해결 안 됨" 같은 분석 명시 (어느 조치가 미흡했는지)
+
+3) **부수 피해 (collateralDamage)**: 다른 부품 파손 (Mandrel 파손, 충돌 피해 등) 명시
+
+4) **이력 패턴 (historyPattern)**: 동일 fault code (예: "31137 single turn"), 동일 부품 (예: "Servo R"), 동일 카테고리 (예: "Belt 1st PnP R 파손")가 다른 호기/날짜에서 발생한 이력 — KB나 입력 데이터에서 단서 찾으면 명시. 단서 없으면 빈 문자열
+
+5) **만성 이슈 (chronicIssues)**: 24시간 이상 open 상태이거나 여러 일자에 걸쳐 반복되는 이슈 별도 추적
+   - 예: "STK-1-D3 NG Tab Width — 04/22 04:30 시작 → 17시간+ open"
+   - 입력 데이터의 issuesData에서 미해결/Monitoring/not solved 결과를 가진 이슈 + KB의 이전 일자 동일 호기 이슈를 종합
+
+6) **criticalSummary 강화**: 5개 bullet 모두 풍부하게:
+   - "최장 부동: [설비명] [부동시간] — [근본 원인 + 조치 요약]"
+   - "동일 호기 다발 위험: [설비] [N분 간격 N회 발생, 부수 피해]"
+   - "주목 패턴: [패턴 설명, 예: 'STK-3-C4 Heat Press 영역 8분 간격 2회 발생, mechanical interference 가능성']"
+   - "품질 추세: [핵심 메시지]"
+   - "특이사항/경영진 개입: [매니저 직접 지시 등 — 데이터에 명시된 경우만, 없으면 '특이사항 없음']"
 
 [필수 출력 - JSON만, 다른 텍스트 금지]
 {
   "summary_text": "전체 이슈 흐름의 핵심 트렌드 요약 — 1~3문장",
+  "recordBreakdown": {
+    "bmDowntime": 숫자,
+    "ubm": 숫자,
+    "pdDowntime": 숫자,
+    "other": 숫자
+  },
   "criticalSummary": [
-    "최장 부동: [설비명] [부동시간] — 근본 원인: [원인]",
-    "기타 주요 이벤트",
-    "품질 추세",
-    "주목 패턴"
+    "최장 부동: ...",
+    "동일 호기 다발 위험: ...",
+    "주목 패턴: ...",
+    "품질 추세: ...",
+    "특이사항: ..."
   ],
   "longDowntime": [
     {
       "isTop": true,
       "equipment": "호기명",
       "title": "[설비명] [문제 요약] — N분 (M시간) Full Stop",
-      "occurrence": "발생 시간",
+      "occurrence": "발생 시간 (분할 시 통합 표기)",
       "alarm": "알람 메시지",
-      "splitNote": "분할 보고 통합한 경우만 작성, 아니면 ''",
+      "splitNote": "분할 보고 시: '두 차례 분할 — 21:20~21:55 (35분) → 22:00~04:56 (416분) → 누적 451분'",
+      "splitDetail": [
+        {"order": 1, "duration": 38, "time": "14:17~14:55", "description": "Forward Over Run, Mandrel Y2 파손"},
+        {"order": 2, "duration": 28, "time": "15:42~16:10", "gapMin": 47, "description": "Total Fault, Servo 자체 교체"}
+      ],
+      "recurrenceGap": "1차 후 47분만에 재발 (있을 때만)",
       "rootCause": "근본 원인 (mechanical/electrical/quality 명시)",
-      "partReplaced": "교체 부품명",
+      "partReplaced": "교체 부품명 + 코드 (예: 'BESMT0359 Servo Motor SIEMENS 1FK2204-6AF01-0MA0')",
+      "collateralDamage": "부수 피해 (Mandrel Y2 anode 파손 등, 없으면 빈 문자열)",
+      "historyPattern": "이력 패턴 (예: '31137 single turn은 04/22 STK-4-B1, 04/24 STK-4-B1에서도 동일 발생'), 단서 없으면 빈 문자열",
       "pic": "PIC 또는 Tech 시퀀스",
       "result": "결과 (Solved/Unsolved/Monitoring)",
       "durationMin": 부동시간_분,
-      "actionSequence": ["1. 첫 번째 조치", "2. 두 번째 조치"]
+      "actionSequence": ["1. 첫 번째 조치", "2. 두 번째 조치", "..."],
+      "actionAnalysis": "1차 조치로 해결됐는지/미흡했는지 분석 (예: '1차 조치(homing/tunning)로 미해결 → Servo 자체 결함이 1차부터 있었을 가능성'). 단발이면 빈 문자열"
+    }
+  ],
+  "chronicIssues": [
+    {
+      "equipment": "호기명",
+      "title": "[설비명] [문제] — [총 영향 시간 또는 'N시간+ open']",
+      "startedAt": "시작 시각 (예: '04/22 04:30')",
+      "currentStatus": "현재 상태 (예: '17시간+ open', 'Monitoring')",
+      "history": ["04/22: 발생", "04/23: 17시간 후 재발", "..."],
+      "managerInvolved": "관련 매니저/지시 사항 (있으면, 없으면 빈 문자열)"
     }
   ]
 }
 
 [규칙]
 - 장기부동 임계값: ${longThreshold}분 이상
-- isTop=true는 가장 큰 부동 1~2건만
+- isTop=true는 가장 큰 부동 1~2건만 (그 외 longDowntime은 isTop=false)
 - actionSequence: 시간순 1~10단계, isTop인 경우 더 풍부하게
+- splitDetail은 분할 보고만 작성, 단일 보고면 빈 배열 []
+- chronicIssues: 24h+ open이거나 cross-day 반복 이슈만 (없으면 빈 배열 [])
+- KB 데이터를 적극 활용해 historyPattern과 chronicIssues 식별
 - 모든 수치는 숫자만`;
 
   const userMsg = `[전체 부동 이슈 데이터 - ${totalCount}건]
 ${JSON.stringify(issuesData, null, 1)}
 
-위 데이터에서 1번 섹션 (핵심 요약 + 장기부동)만 정리하세요. 분할 보고 통합 룰을 보수적으로 적용하세요.`;
+위 데이터에서 1번 섹션 (핵심 요약 + 장기부동 + 만성 이슈 추적)을 풍부하게 정리하세요.
+KB가 제공된 경우 cross-day 패턴/만성 이슈/이력 패턴을 적극 활용하세요. 분할 보고는 splitDetail에 1차/2차 분리 명시하세요.`;
 
   return await callCurationPart(sys, userMsg, "Part1-LongDowntime");
 }
@@ -1061,13 +1116,47 @@ async function curationPart2_RecurringConditionChange(issuesData, processChangeD
 
 ${focus}
 
+[★ 영역 12-Y2: 사용자 레포트 수준 출력]
+
+1) **재발 간격 분석 (recurringSameEquipment.gapAnalysis)**: 동일 호기 다발 시 시간차 명시
+   - 예: "2회 (38min + 28min, 같은 servo R, 47분 간격 재발) → 누적 66분, Mandrel Y2 + Servo R 모두 교체"
+   - "1차 조치 후 N분 만에 재발" 형태로 분석
+
+2) **조건변경 PIC + 사유 (picReason)**: 어떤 PIC이 어떤 사유로 변경했는지
+   - 예: "PIC: Rijal, Heriyanto, Prada PD, Azis SL · 사유: Anode X value spec 초과"
+
+3) **조건변경 verification**: 변경 후 결과/검증 (CT scan OK, monitoring 진행 등)
+
+4) **조건변경 그룹 헤더 — 호기별 그룹화**: 같은 호기에 여러 파라미터 동시 변경된 경우 하나의 그룹으로
+   - 예: "STK-3-B2 Overhang 대응 (06:00~06:40, Shift 1)" — 10개 파라미터 한 그룹
+
 [필수 출력 - JSON만, 다른 텍스트 금지]
 {
   "recurringByCategory": [
-    {"category":"카테고리명 (예: Tab Width/NG, 2nd PnP/Ejector, Hang Error, Servo Fault)","count":건수,"equipments":["STK-1-A4 (×2)","STK-2-D5 (×2)"]}
+    {"category":"카테고리명","count":건수,"equipments":["STK-1-A4 (×2)","STK-2-D5 (×2)"]}
   ],
   "recurringSameEquipment": [
-    {"equipment":"호기","count":건수,"detail":"발생 내역 요약"}
+    {
+      "equipment":"호기",
+      "count":건수,
+      "detail":"발생 내역 요약 (시간 + 부동분 + 핵심 원인)",
+      "gapAnalysis":"재발 간격 + 분석 (예: '47분 간격 재발, 1차 조치(homing) 미해결로 servo 자체 교체 필요')",
+      "totalDuration":"누적 N분",
+      "partsReplaced":"교체된 부품 모음 (있으면)"
+    }
+  ],
+  "conditionChangeGroups": [
+    {
+      "title":"그룹 제목 (예: 'STK-3-B2 Overhang 대응 (06:00~06:40, Shift 1)')",
+      "equipment":"대상 호기",
+      "timeRange":"시간 범위",
+      "shift":"Shift 정보 (있으면)",
+      "picReason":"PIC + 사유 (예: 'PIC: Rijal, Heriyanto · 사유: Anode X value spec 초과')",
+      "parameters":[
+        {"parameter":"파라미터명","before":"변경 전","after":"변경 후"}
+      ],
+      "verification":"변경 후 결과 (예: '3 sample CT scan 결과 OK, monitoring 진행')"
+    }
   ],
   "conditionChanges": {
     "visionOffset": [{"date":"YY/M/D","time":"HH:MM","equipment":"호기","change":"변경 내용","reason":"사유"}],
@@ -1079,8 +1168,9 @@ ${focus}
 
 [규칙]
 - recurringByCategory: 키워드 카테고리 (Tab Width/NG, Sensor cable, Servo Fault, Vision NG, Hang Error 등)
-- recurringSameEquipment: 같은 호기에서 2건 이상 발생
-- conditionChanges는 4개 하위 그룹으로 나눔 — 데이터 없으면 빈 배열 []
+- recurringSameEquipment: 같은 호기에서 2건 이상 발생, gapAnalysis 필수
+- conditionChangeGroups: 같은 호기에 여러 파라미터 동시 변경된 경우 하나의 그룹으로 묶기 (사용자 레포트 양식)
+- conditionChanges: 4개 하위 그룹별 표 형식 — conditionChangeGroups와 보완 관계 (둘 다 채움)
 - 모든 수치는 숫자만`;
 
   const userMsg = `[전체 부동 이슈 데이터 - ${totalCount}건]
@@ -1089,7 +1179,7 @@ ${JSON.stringify(issuesData, null, 1)}
 [공정/설비 조건변경 메시지 - ${processChangeData.length}건]
 ${processChangeData.length > 0 ? JSON.stringify(processChangeData, null, 1) : "(없음)"}
 
-위 데이터를 2번 반복 + 3번 조건변경 형식으로 정리하세요.`;
+위 데이터를 2번 반복 + 3번 조건변경 형식으로 정리하세요. 동일 호기 다발 시 재발 간격을 분석하고, 조건변경은 호기별 그룹으로 묶으세요 (PIC + 사유 + 검증 결과 포함).`;
 
   return await callCurationPart(sys, userMsg, "Part2-Recurring/ConditionChange");
 }
@@ -1103,23 +1193,69 @@ async function curationPart3_TestPmQuality(testData, qualityData, focus, kbText,
 
 ${focus}
 
+[★ 영역 12-Y3: 사용자 레포트 수준 출력]
+
+1) **Line PM 시작/완료 시각**: 단순 상태가 아니라 "04/24 07:58 시작 → 04/24 16:08 완료" 형태
+
+2) **PM 결과 명시**: 호기별 PM/Cleaning/Check DE 완료 여부
+
+3) **만성 NG 라인 별도 추적 (chronic1AB)**: 사용자 레포트에서 "Stacking 1-AB Sepa Run Issues (지속 모니터링)" 같은 만성 라인 별도 섹션
+   - 데이터에 1AB 라인 NG 누적 보고가 있으면 호기별 NG 패턴 정리
+   - 예: "1-A2: NG ETC YCS 5x Sepa wrinkle First stack" / "1-A3: 2 lot 연속" 등
+
+4) **3일치 품질 비교 (qualityNg.table 3일치)**: 어제, 오늘, 내일 데이터 모두 추출 (데이터에 있으면). KB에서 어제 데이터 활용 가능
+
+5) **품질 추세 분석 (trend)**: 단순 수치가 아니라 "Sepa Fold 17→18 (소폭 증가), Electrode Expose 6→10 (+67%), Dimension Overkill 0→1 발생 (주목)" 같은 비교 분석
+
+6) **Cutter UBM 정밀 정보**: UBM Limit, 교체 부품, 결과 (Solved/Monitoring) 명시
+
 [필수 출력 - JSON만, 다른 텍스트 금지]
 {
   "testPm": {
-    "linePM": [{"date":"YY/M/D","line":"라인명","status":"상태"}],
+    "linePM": [
+      {
+        "date":"YY/M/D",
+        "line":"라인명 (예: Line 4-2 PM)",
+        "status":"상태 — 미수행/진행중/Stop No Production/완료",
+        "startTime":"시작 시각 (HH:MM, 있으면)",
+        "endTime":"완료 시각 (HH:MM, 있으면)",
+        "details":[{"equipment":"호기","work":"작업 내용 (예: PM, Cleaning, Check DE)","result":"✅/🔄/❌"}]
+      }
+    ],
     "fmvs": [{"date":"YY/M/D","action":"FMVS 작업","equipments":"대상 설비"}],
-    "cutter": [{"date":"YY/M/D","time":"HH:MM","item":"테스트 항목","resultIcon":"✅/❌/🔄","note":"결과"}],
+    "cutter": [
+      {"date":"YY/M/D","time":"HH:MM","equipment":"설비","item":"테스트 항목 (예: UBM Limit)","action":"조치 (예: Top Cutter Sear angle 1.8 교체 + Bottom flip)","resultIcon":"✅/❌/🔄","note":"결과 비고"}
+    ],
     "stackingSepa": [{"date":"YY/M/D","equipment":"호기","issue":"문제 내용","resultIcon":"❌"}]
   },
+  "chronic1AB": {
+    "title":"Stacking 1-AB Sepa Run Issues (지속 모니터링) (있으면, 없으면 빈 객체)",
+    "patternSummary":"전반적 패턴 (예: 'Separator wrinkle / YCS / Sepa Fold 3 종류 NG 다발')",
+    "byEquipment":[
+      {"equipment":"1-A2","ngList":"NG ETC YCS 5x Sepa wrinkle First stack"},
+      {"equipment":"1-B2","ngList":"NG YCS First stack 7X (이번 기간 최다)"}
+    ]
+  },
+  "line3DCutterCpc": {
+    "status":"04/25 03:39 monitoring 결과 CPC 이상 재발견 (있으면 작성, 없으면 빈 객체)",
+    "details":["보고 시각 + 내용 1", "보고 시각 + 내용 2"]
+  },
   "qualityNg": {
-    "table": [{"date":"YY/M/D","sepaFold":숫자,"electrodeExpose":숫자,"nonResponse":숫자,"dimOverkill":숫자,"contactNg":숫자}],
-    "trend": "트렌드 박스 텍스트 (예: 'Sepa Fold 27 → 7 EA로 급감 (-74%). Non Response 증가 (3 → 6).')"
+    "table": [
+      {"date":"YY/M/D (전전일)","sepaFold":숫자,"electrodeExpose":숫자,"nonResponse":숫자,"dimOverkill":숫자,"contactNg":숫자},
+      {"date":"YY/M/D (전일)","sepaFold":숫자,"electrodeExpose":숫자,"nonResponse":숫자,"dimOverkill":숫자,"contactNg":숫자},
+      {"date":"YY/M/D (당일, 진행중)","sepaFold":숫자,"electrodeExpose":숫자,"nonResponse":숫자,"dimOverkill":숫자,"contactNg":숫자}
+    ],
+    "trend": "비교 분석 (예: 'Sepa Fold 17→18 (소폭 증가), Electrode Expose 6→10 (+67%), Dimension Overkill 0→1 발생 (주목), Non Response 5→7 증가')"
   }
 }
 
 [규칙]
 - testPm 4개 하위 그룹 — 데이터 없으면 빈 배열 []
-- qualityNg.trend는 일별 NG 메시지 (*Tgl/*Daily NG 형식)에서만 추출. 없으면 "데이터 없음"
+- chronic1AB는 1AB 라인의 만성 NG가 데이터에 있을 때만 작성
+- line3DCutterCpc는 데이터에 있을 때만 작성
+- qualityNg.table은 가능한 한 3일치 (데이터 + KB 종합)
+- qualityNg.trend는 비교 분석 형식 (단순 나열 X). 없으면 "데이터 없음"
 - 모든 수치는 숫자만`;
 
   const userMsg = `[테스트/양산외 생산 메시지 - ${testData.length}건]
@@ -1128,7 +1264,7 @@ ${testData.length > 0 ? JSON.stringify(testData, null, 1) : "(없음)"}
 [품질 이슈 메시지 - ${qualityData.length}건]
 ${qualityData.length > 0 ? JSON.stringify(qualityData, null, 1) : "(없음)"}
 
-위 데이터를 4번 테스트/PM + 5번 품질NG 형식으로 정리하세요.`;
+위 데이터를 4번 테스트/PM + 5번 품질NG 형식으로 정리하세요. 만성 1AB 라인은 별도 섹션, 품질은 3일치 비교, 추세는 비교 분석 형식으로.`;
 
   return await callCurationPart(sys, userMsg, "Part3-TestPm/Quality");
 }
@@ -1156,10 +1292,16 @@ function normalizeBriefing(parsed) {
 
   const result = {
     summary_text: parsed.summary_text || "",
+    // ★ 영역 12-Y1: 레코드 분류
+    recordBreakdown: obj(parsed.recordBreakdown),
     criticalSummary: arr(parsed.criticalSummary),
     longDowntime: arr(parsed.longDowntime),
+    // ★ 영역 12-Y4: 만성 이슈 별도
+    chronicIssues: arr(parsed.chronicIssues),
     recurringByCategory: arr(parsed.recurringByCategory),
     recurringSameEquipment: arr(parsed.recurringSameEquipment),
+    // ★ 영역 12-Y2: 호기별 조건변경 그룹
+    conditionChangeGroups: arr(parsed.conditionChangeGroups),
     conditionChanges: {
       visionOffset: arr(obj(parsed.conditionChanges).visionOffset),
       settingChange: arr(obj(parsed.conditionChanges).settingChange),
@@ -1172,6 +1314,9 @@ function normalizeBriefing(parsed) {
       cutter: arr(obj(parsed.testPm).cutter),
       stackingSepa: arr(obj(parsed.testPm).stackingSepa),
     },
+    // ★ 영역 12-Y3: 1AB 만성 라인 / Line 3D CPC
+    chronic1AB: parsed.chronic1AB && typeof parsed.chronic1AB === "object" ? parsed.chronic1AB : null,
+    line3DCutterCpc: parsed.line3DCutterCpc && typeof parsed.line3DCutterCpc === "object" ? parsed.line3DCutterCpc : null,
     qualityNg: {
       table: arr(obj(parsed.qualityNg).table),
       trend: obj(parsed.qualityNg).trend || "데이터 없음",
@@ -2405,11 +2550,27 @@ export default function App() {
         test: [...(cl.testMsgs || []), ...ambigResult.test],
       };
 
-      // PE 큐레이션 실행 (KB 없이 진행 — STEP 3에선 빠르게)
+      // ★ 영역 12-Y5: 큐레이션에 KB 활용 (Cell_PE / Elec_PE 우선, 없으면 빈 문자열)
+      let kbForCuration = "";
+      try {
+        setProgress(p => [...p, `📚 PE KB 로딩 중... (cross-day 패턴 분석용)`]);
+        const peKbResult = await loadSelectedKnowledge(["Cell_PE", "Elec_PE"]);
+        kbForCuration = peKbResult.kb["Cell_PE"] || peKbResult.kb["Elec_PE"] || "";
+        if (kbForCuration) {
+          setProgress(p => [...p, `✅ KB 로딩 완료 (${kbForCuration.length} 자)`]);
+        } else {
+          setProgress(p => [...p, `ℹ️ KB 비어있음 — 단일 일자 분석으로 진행`]);
+        }
+      } catch (e) {
+        setProgress(p => [...p, `⚠️ KB 로딩 실패 — KB 없이 진행`]);
+        kbForCuration = "";
+      }
+
+      // PE 큐레이션 실행 (12-Y5: KB 활용)
       const allIssuesForCuration = allIssuesFlat;
       let curation;
       try {
-        curation = await runPreCuration(allIssuesForCuration, "", reportType, categoryMsgs);
+        curation = await runPreCuration(allIssuesForCuration, kbForCuration, reportType, categoryMsgs);
         setProgress(p => [...p, `✅ PE 큐레이션 완료 (장기부동 ${curation.long_downtime.length}건, 반복 ${curation.recurring.length}건)`]);
       } catch {
         setProgress(p => [...p, `⚠️ PE 큐레이션 실패 — 폴백 사용`]);
@@ -2793,10 +2954,46 @@ export default function App() {
       return ds.filter(d => d.issue?.eq === item.equipment).sort((a, b) => (b.issue?.durMin || 0) - (a.issue?.durMin || 0))[0] || null;
     };
 
-    // 1번 장기부동 박스 — Phase 2: 페르소나 대화 통합
+    // 1번 장기부동 박스 — 영역 12-Y1: 새 필드 (splitDetail, recurrenceGap, collateralDamage, historyPattern, actionAnalysis)
     const longDowntimeHtml = (cur.longDowntime || []).map((d) => {
       const matchedDisc = findMatchingDiscForCuration(d);
       const personaConvHtml = buildPersonaConvHtml(matchedDisc);
+
+      // 분할 보고 정밀 분석
+      const splitDetailHtml = (d.splitDetail || []).length > 0 ? `
+        <div style="margin-top:8px;padding:8px 12px;background:#fffbe6;border-left:3px solid #fbbf24;border-radius:4px;">
+          <div style="font-weight:700;color:#d97706;margin-bottom:4px;">📊 분할 보고 분석</div>
+          ${d.splitDetail.map(sd => `
+            <div style="font-size:0.92em;margin-bottom:3px;padding-left:8px;">
+              <b style="color:#e67e22;">${sd.order}차</b> — <b>${sd.duration}분</b> (${esc(sd.time)})
+              ${sd.gapMin ? `<span style="color:#c0392b;margin-left:6px;font-weight:700;">· 1차 후 ${sd.gapMin}분만에 재발</span>` : ""}
+              ${sd.description ? `<div style="margin-top:1px;color:#666;">→ ${esc(sd.description)}</div>` : ""}
+            </div>
+          `).join("")}
+        </div>
+      ` : "";
+
+      // 재발 간격 (단독)
+      const recurrenceGapHtml = (d.recurrenceGap && !(d.splitDetail || []).length) ? `
+        <div style="margin-top:6px;padding:6px 10px;background:#fffbe6;border-left:3px solid #fbbf24;border-radius:4px;color:#d97706;font-weight:700;">
+          ⏱️ ${esc(d.recurrenceGap)}
+        </div>
+      ` : "";
+
+      // 이력 패턴
+      const historyPatternHtml = d.historyPattern ? `
+        <div style="margin-top:6px;padding:6px 10px;background:#f0e6ff;border-left:3px solid #a78bfa;border-radius:4px;font-size:0.92em;">
+          <b style="color:#7c3aed;">🔍 이력 패턴:</b> ${esc(d.historyPattern)}
+        </div>
+      ` : "";
+
+      // 조치 분석
+      const actionAnalysisHtml = d.actionAnalysis ? `
+        <div style="margin-top:6px;padding:6px 10px;background:#fff5f5;border-left:3px solid #c0392b;border-radius:4px;font-size:0.92em;color:#c0392b;font-style:italic;">
+          ⚠️ ${esc(d.actionAnalysis)}
+        </div>
+      ` : "";
+
       return `
       <div class="${d.isTop ? "critical" : "warning"}">
         <h3 style="margin-top:0;">${d.isTop ? "🔴 [TOP] " : "🔴 "}${esc(d.title || `${d.equipment} ${d.durationMin}분`)}</h3>
@@ -2807,17 +3004,84 @@ export default function App() {
             ${d.splitNote ? `<tr><th>보고 형태</th><td><b>${esc(d.splitNote)}</b></td></tr>` : ""}
             ${d.rootCause ? `<tr><th>근본 원인</th><td><b>${esc(d.rootCause)}</b></td></tr>` : ""}
             ${d.partReplaced ? `<tr><th>부품 교체</th><td><b>${esc(d.partReplaced)}</b></td></tr>` : ""}
+            ${d.collateralDamage ? `<tr><th>부수 피해</th><td><b style="color:#d97706;">${esc(d.collateralDamage)}</b></td></tr>` : ""}
             ${d.pic ? `<tr><th>PIC</th><td>${esc(d.pic)}</td></tr>` : ""}
             ${d.result ? `<tr><th>결과</th><td><span class="${(d.result || "").toLowerCase().includes("solved") ? "ok" : "progress"}">${esc(d.result)}</span></td></tr>` : ""}
           </tbody>
         </table>
+        ${splitDetailHtml}
+        ${recurrenceGapHtml}
+        ${historyPatternHtml}
         ${(d.actionSequence || []).length > 0 ? `
         <h4>적용 조치 (${d.actionSequence.length}단계)</h4>
         <ol>${d.actionSequence.map(s => `<li>${esc(s)}</li>`).join("")}</ol>` : ""}
+        ${actionAnalysisHtml}
         ${personaConvHtml}
       </div>
     `;
     }).join("");
+
+    // ★ 영역 12-Y4: 만성 이슈 별도 섹션 HTML
+    const chronicIssuesHtml = (cur.chronicIssues || []).length > 0 ? `
+      <hr>
+      <h2>🔥 만성 이슈 추적 (별도)</h2>
+      <p class="meta">24시간 이상 open 상태이거나 여러 일자에 걸쳐 반복되는 만성 이슈입니다.</p>
+      ${(cur.chronicIssues).map(c => `
+        <div class="critical">
+          <h3 style="margin-top:0;">⚠️ ${esc(c.title || c.equipment || "")}</h3>
+          <table>
+            <tbody>
+              ${c.startedAt ? `<tr><th style="width:22%;">시작</th><td>${esc(c.startedAt)}</td></tr>` : ""}
+              ${c.currentStatus ? `<tr><th>현재 상태</th><td><b style="color:#d97706;">${esc(c.currentStatus)}</b></td></tr>` : ""}
+              ${c.managerInvolved ? `<tr><th>관련 관리</th><td><b style="color:#c0392b;">${esc(c.managerInvolved)}</b></td></tr>` : ""}
+            </tbody>
+          </table>
+          ${(c.history || []).length > 0 ? `<h4>이력</h4><ul>${c.history.map(h => `<li>${esc(h)}</li>`).join("")}</ul>` : ""}
+        </div>
+      `).join("")}
+    ` : "";
+
+    // ★ 영역 12-Y2: 조건변경 그룹 HTML
+    const conditionChangeGroupsHtml = (cur.conditionChangeGroups || []).length > 0 ? `
+      ${(cur.conditionChangeGroups).map(g => `
+        <h3>${esc(g.title || g.equipment || "")}${g.timeRange ? ` <span style="font-weight:400;color:#666;font-size:0.85em;">(${esc(g.timeRange)}${g.shift ? `, ${esc(g.shift)}` : ""})</span>` : ""}</h3>
+        ${g.picReason ? `<p class="meta">${esc(g.picReason)}</p>` : ""}
+        ${(g.parameters || []).length > 0 ? `
+          <table>
+            <thead><tr><th>파라미터</th><th>Before → After</th></tr></thead>
+            <tbody>
+              ${g.parameters.map(p => `<tr><td>${esc(p.parameter)}</td><td>${esc(p.before)} → <b>${esc(p.after)}</b></td></tr>`).join("")}
+            </tbody>
+          </table>
+        ` : ""}
+        ${g.verification ? `<p>→ <b class="ok">${esc(g.verification)}</b></p>` : ""}
+      `).join("")}
+    ` : "";
+
+    // ★ 영역 12-Y3: 1AB 만성 라인 HTML
+    const chronic1ABHtml = cur.chronic1AB && (cur.chronic1AB.title || (cur.chronic1AB.byEquipment || []).length) ? `
+      <div class="critical" style="margin-top:1em;">
+        <h3 style="margin-top:0;">🔥 ${esc(cur.chronic1AB.title || "Stacking 1-AB Sepa Run Issues (지속 모니터링)")}</h3>
+        ${cur.chronic1AB.patternSummary ? `<p>→ <i>${esc(cur.chronic1AB.patternSummary)}</i></p>` : ""}
+        ${(cur.chronic1AB.byEquipment || []).length > 0 ? `
+          <table>
+            <thead><tr><th>호기</th><th>다발 NG</th></tr></thead>
+            <tbody>
+              ${cur.chronic1AB.byEquipment.map(e => `<tr><td><b>${esc(e.equipment)}</b></td><td class="fail">${esc(e.ngList)}</td></tr>`).join("")}
+            </tbody>
+          </table>
+        ` : ""}
+      </div>
+    ` : "";
+
+    // ★ 영역 12-Y3: Line 3D Cutter CPC HTML
+    const line3DCutterCpcHtml = cur.line3DCutterCpc && cur.line3DCutterCpc.status ? `
+      <div class="info" style="margin-top:1em;">
+        <h4 style="margin-top:0;">📡 Line 3D Cutter CPC 이상 (모니터링)</h4>
+        <p>${esc(cur.line3DCutterCpc.status)}</p>
+        ${(cur.line3DCutterCpc.details || []).length > 0 ? `<ul>${cur.line3DCutterCpc.details.map(d => `<li>${esc(d)}</li>`).join("")}</ul>` : ""}
+      </div>
+    ` : "";
 
     // ★ 영역 12-X6 (1): 2~5번 섹션 매칭 페르소나 논의 헬퍼 ─────────────────
     // 카테고리별 / 설비별 매칭 — equipments 배열에서 설비명을 추출해 discussions와 매칭
@@ -3054,7 +3318,15 @@ export default function App() {
 <h1>${esc(title)}</h1>
 <p class="meta"><b>분석 기간:</b> ${esc(periodLabel)}<br>
 <b>출처:</b> AZS Status Reports WhatsApp 그룹<br>
-<b>레코드:</b> 부동 이슈 ${issuesCount}건</p>
+<b>레코드:</b> ${(() => {
+  const rb = cur.recordBreakdown || {};
+  const parts = [];
+  if (rb.bmDowntime > 0) parts.push(`BM Downtime Bot ${rb.bmDowntime}건`);
+  if (rb.ubm > 0) parts.push(`UBM ${rb.ubm}건`);
+  if (rb.pdDowntime > 0) parts.push(`PD Downtime ${rb.pdDowntime}건`);
+  if (rb.other > 0) parts.push(`기타 ${rb.other}건`);
+  return parts.length > 0 ? parts.join(" + ") : `부동 이슈 ${issuesCount}건`;
+})()}</p>
 
 ${cur.summary_text || (cur.criticalSummary || []).length > 0 ? `
 <div class="summary-box">
@@ -3067,6 +3339,8 @@ ${(cur.criticalSummary || []).length > 0 ? `<ul>${cur.criticalSummary.map(c => `
 <h2>🚨 1. 장기부동 건 — 상세</h2>
 ${longDowntimeHtml || "<p>장기부동 이슈 없음</p>"}
 
+${chronicIssuesHtml}
+
 <hr>
 <h2>🔁 2. 발생빈도 높은 이슈</h2>
 ${recurringCatHtml}
@@ -3074,14 +3348,17 @@ ${recurringEqHtml}
 
 <hr>
 <h2>⚙️ 3. 설비/공정 조건 변경</h2>
+${conditionChangeGroupsHtml}
 ${visionHtml}${settingHtml}${cutterHtml}${otherHtml}
-${!visionHtml && !settingHtml && !cutterHtml && !otherHtml ? "<p>조건 변경 없음</p>" : ""}
+${!conditionChangeGroupsHtml && !visionHtml && !settingHtml && !cutterHtml && !otherHtml ? "<p>조건 변경 없음</p>" : ""}
 ${conditionChangePersonasHtml}
 
 <hr>
 <h2>🧪 4. 테스트 / PM 활동</h2>
 ${linePmHtml}${fmvsHtml}${cutterTestHtml}${stackHtml}
 ${!linePmHtml && !fmvsHtml && !cutterTestHtml && !stackHtml ? "<p>테스트/PM 활동 없음</p>" : ""}
+${line3DCutterCpcHtml}
+${chronic1ABHtml}
 ${testPmPersonasHtml}
 
 <hr>
@@ -5011,6 +5288,19 @@ function BriefingDisplay({ curation, allIssues = [], selectedIds = [], autoSelec
           <div style={{fontSize:13,fontWeight:800,color:"#a78bfa",marginBottom:8}}>
             📋 핵심 요약
           </div>
+          {/* ★ 12-Y1: 레코드 분류 */}
+          {curation.recordBreakdown && (curation.recordBreakdown.bmDowntime || curation.recordBreakdown.ubm || curation.recordBreakdown.pdDowntime || curation.recordBreakdown.other) > 0 && (
+            <div style={{
+              fontSize:10, color:"#94a3b8", marginBottom:8,
+              padding:"5px 10px", background:"rgba(0,0,0,0.2)", borderRadius:5,
+            }}>
+              <span style={{fontWeight:700,color:"#cbd5e1"}}>레코드:</span>
+              {curation.recordBreakdown.bmDowntime > 0 && <span> BM Downtime Bot {curation.recordBreakdown.bmDowntime}건</span>}
+              {curation.recordBreakdown.ubm > 0 && <span> · UBM {curation.recordBreakdown.ubm}건</span>}
+              {curation.recordBreakdown.pdDowntime > 0 && <span> · PD Downtime {curation.recordBreakdown.pdDowntime}건</span>}
+              {curation.recordBreakdown.other > 0 && <span> · 기타 {curation.recordBreakdown.other}건</span>}
+            </div>
+          )}
           {curation.summary_text && (
             <div style={{fontSize:11,color:"#cbd5e1",marginBottom:8,fontStyle:"italic",lineHeight:1.6}}>
               {curation.summary_text}
@@ -5063,10 +5353,36 @@ function BriefingDisplay({ curation, allIssues = [], selectedIds = [], autoSelec
                       {d.splitNote && <tr><th style={thStyle}>보고 형태</th><td style={{...tdStyle,color:"#fcd34d"}}>{d.splitNote}</td></tr>}
                       {d.rootCause && <tr><th style={thStyle}>근본 원인</th><td style={{...tdStyle,fontWeight:700,color:"#fca5a5"}}>{d.rootCause}</td></tr>}
                       {d.partReplaced && <tr><th style={thStyle}>부품 교체</th><td style={{...tdStyle,fontWeight:700}}>{d.partReplaced}</td></tr>}
+                      {d.collateralDamage && <tr><th style={thStyle}>부수 피해</th><td style={{...tdStyle,fontWeight:700,color:"#fbbf24"}}>{d.collateralDamage}</td></tr>}
                       {d.pic && <tr><th style={thStyle}>PIC</th><td style={tdStyle}>{d.pic}</td></tr>}
                       {d.result && <tr><th style={thStyle}>결과</th><td style={{...tdStyle,color:d.result.toLowerCase().includes("solved")?"#34d399":"#fbbf24"}}>{d.result}</td></tr>}
                     </tbody>
                   </table>
+                  {/* ★ 12-Y1: 분할 보고 정밀 분석 */}
+                  {d.splitDetail?.length > 0 && (
+                    <div style={{marginTop:8, padding:"8px 10px", background:"rgba(252,211,77,0.06)", borderLeft:"3px solid #fcd34d", borderRadius:4}}>
+                      <div style={{fontSize:10.5,fontWeight:700,color:"#fcd34d",marginBottom:4}}>📊 분할 보고 분석</div>
+                      {d.splitDetail.map((sd, sdi) => (
+                        <div key={sdi} style={{fontSize:10,color:"#cbd5e1",marginBottom:3,paddingLeft:8}}>
+                          <span style={{fontWeight:700,color:"#fbbf24"}}>{sd.order}차</span> — <b>{sd.duration}분</b> ({sd.time})
+                          {sd.gapMin && <span style={{color:"#fca5a5",marginLeft:6,fontWeight:700}}>· 1차 후 {sd.gapMin}분만에 재발</span>}
+                          {sd.description && <div style={{marginTop:1,color:"#94a3b8"}}>→ {sd.description}</div>}
+                        </div>
+                      ))}
+                    </div>
+                  )}
+                  {/* ★ 12-Y1: 재발 간격 (splitDetail 없는 경우 단독 표시) */}
+                  {d.recurrenceGap && !d.splitDetail?.length && (
+                    <div style={{marginTop:6, padding:"6px 10px", background:"rgba(252,211,77,0.06)", borderLeft:"3px solid #fcd34d", borderRadius:4, fontSize:10, color:"#fcd34d", fontWeight:700}}>
+                      ⏱️ {d.recurrenceGap}
+                    </div>
+                  )}
+                  {/* ★ 12-Y1: 이력 패턴 */}
+                  {d.historyPattern && (
+                    <div style={{marginTop:6, padding:"6px 10px", background:"rgba(167,139,250,0.06)", borderLeft:"3px solid #a78bfa", borderRadius:4, fontSize:10, color:"#cbd5e1"}}>
+                      <span style={{fontWeight:700,color:"#c4b5fd"}}>🔍 이력 패턴:</span> {d.historyPattern}
+                    </div>
+                  )}
                   {d.actionSequence?.length > 0 && (
                     <div style={{marginTop:10}}>
                       <div style={{fontSize:11,fontWeight:700,color:"#94a3b8",marginBottom:4}}>
@@ -5077,6 +5393,12 @@ function BriefingDisplay({ curation, allIssues = [], selectedIds = [], autoSelec
                           <li key={si} style={{marginBottom:2}}>{step}</li>
                         ))}
                       </ol>
+                    </div>
+                  )}
+                  {/* ★ 12-Y1: 조치 분석 */}
+                  {d.actionAnalysis && (
+                    <div style={{marginTop:6, padding:"6px 10px", background:"rgba(239,68,68,0.06)", borderLeft:"3px solid #ef4444", borderRadius:4, fontSize:10, color:"#fca5a5", fontStyle:"italic"}}>
+                      ⚠️ {d.actionAnalysis}
                     </div>
                   )}
                   {/* ★ Phase 2: 매칭되는 페르소나 논의 표시 */}
@@ -5140,6 +5462,43 @@ function BriefingDisplay({ curation, allIssues = [], selectedIds = [], autoSelec
           </div>
         )}
       </div>
+
+      {/* ★ 영역 12-Y4: 만성 이슈 추적 (24h+ open 또는 cross-day 반복) */}
+      {curation.chronicIssues?.length > 0 && (
+        <div style={sectionStyle}>
+          <div style={{...headingStyle, color:"#dc2626"}}>🔥 만성 이슈 추적 (별도)</div>
+          <div style={{fontSize:10, color:"#94a3b8", marginBottom:10, fontStyle:"italic"}}>
+            24시간 이상 open 상태이거나 여러 일자에 걸쳐 반복되는 만성 이슈입니다.
+          </div>
+          {curation.chronicIssues.map((c, idx) => (
+            <div key={idx} style={{
+              background:"rgba(220,38,38,0.06)",
+              border:"1px solid rgba(220,38,38,0.3)",
+              borderLeft:"5px solid #dc2626",
+              borderRadius:6, padding:"10px 14px", marginBottom:10,
+            }}>
+              <div style={{fontSize:12, fontWeight:800, color:"#fca5a5", marginBottom:6}}>
+                ⚠️ {c.title || c.equipment}
+              </div>
+              <table style={{...tableStyle, fontSize:10.5}}>
+                <tbody>
+                  {c.startedAt && <tr><th style={{...thStyle,width:"22%"}}>시작</th><td style={tdStyle}>{c.startedAt}</td></tr>}
+                  {c.currentStatus && <tr><th style={thStyle}>현재 상태</th><td style={{...tdStyle,fontWeight:700,color:"#fbbf24"}}>{c.currentStatus}</td></tr>}
+                  {c.managerInvolved && <tr><th style={thStyle}>관련 관리</th><td style={{...tdStyle,color:"#fca5a5",fontWeight:700}}>{c.managerInvolved}</td></tr>}
+                </tbody>
+              </table>
+              {c.history?.length > 0 && (
+                <div style={{marginTop:8}}>
+                  <div style={{fontSize:10.5, fontWeight:700, color:"#94a3b8", marginBottom:4}}>이력</div>
+                  <ul style={{margin:0, paddingLeft:18, fontSize:10, color:"#cbd5e1", lineHeight:1.6}}>
+                    {c.history.map((h, hi) => <li key={hi} style={{marginBottom:2}}>{h}</li>)}
+                  </ul>
+                </div>
+              )}
+            </div>
+          ))}
+        </div>
+      )}
 
       {/* 2. 발생빈도 — 영역 11-K: 그룹 헤더 체크박스 + 펼침 시 개별 체크박스 */}
       <div style={sectionStyle}>
@@ -5253,6 +5612,14 @@ function BriefingDisplay({ curation, allIssues = [], selectedIds = [], autoSelec
                         {": "}{e.count}건{e.detail ? ` — ${e.detail}` : ""}
                       </span>
                     </div>
+                    {/* ★ 12-Y2: 재발 간격 분석 */}
+                    {(e.gapAnalysis || e.totalDuration || e.partsReplaced) && (
+                      <div style={{padding:"4px 12px 6px 32px", fontSize:9.5, color:"#fcd34d", lineHeight:1.6}}>
+                        {e.gapAnalysis && <div>⏱️ {e.gapAnalysis}</div>}
+                        {e.totalDuration && <div style={{color:"#fbbf24",fontWeight:700}}>📊 누적: {e.totalDuration}</div>}
+                        {e.partsReplaced && <div style={{color:"#94a3b8"}}>🔧 교체: {e.partsReplaced}</div>}
+                      </div>
+                    )}
                     {expanded && groupIssues.length > 0 && (
                       <div style={{padding:"4px 10px 8px 32px"}}>
                         {groupIssues.map(iss => {
@@ -5294,6 +5661,50 @@ function BriefingDisplay({ curation, allIssues = [], selectedIds = [], autoSelec
       {/* 3. 조건 변경 */}
       <div style={sectionStyle}>
         <div style={{...headingStyle,color:"#34d399"}}>⚙️ 3. 설비/공정 조건 변경</div>
+
+        {/* ★ 12-Y2: 호기별 통합 그룹 (사용자 레포트 양식) */}
+        {curation.conditionChangeGroups?.length > 0 && (
+          <div style={{marginBottom:14}}>
+            {curation.conditionChangeGroups.map((g, gi) => (
+              <div key={gi} style={{
+                background:"rgba(52,211,153,0.05)",
+                border:"1px solid rgba(52,211,153,0.25)",
+                borderLeft:"4px solid #34d399",
+                borderRadius:6, padding:"10px 14px", marginBottom:10,
+              }}>
+                <div style={{fontSize:11.5, fontWeight:800, color:"#86efac", marginBottom:4}}>
+                  {g.title || g.equipment}
+                  {g.timeRange && <span style={{color:"#94a3b8",fontWeight:400,marginLeft:6,fontSize:10}}>({g.timeRange}{g.shift ? `, ${g.shift}` : ""})</span>}
+                </div>
+                {g.picReason && (
+                  <div style={{fontSize:10, color:"#94a3b8", marginBottom:6, fontStyle:"italic"}}>
+                    {g.picReason}
+                  </div>
+                )}
+                {g.parameters?.length > 0 && (
+                  <table style={{...tableStyle, fontSize:10, marginBottom:6}}>
+                    <thead><tr><th style={thStyle}>파라미터</th><th style={thStyle}>Before → After</th></tr></thead>
+                    <tbody>
+                      {g.parameters.map((p, pi) => (
+                        <tr key={pi}>
+                          <td style={tdStyle}>{p.parameter}</td>
+                          <td style={{...tdStyle,fontWeight:700,color:"#86efac"}}>
+                            {p.before} → <span style={{color:"#34d399"}}>{p.after}</span>
+                          </td>
+                        </tr>
+                      ))}
+                    </tbody>
+                  </table>
+                )}
+                {g.verification && (
+                  <div style={{fontSize:10, color:"#34d399", padding:"4px 8px", background:"rgba(52,211,153,0.08)", borderRadius:4}}>
+                    ✅ {g.verification}
+                  </div>
+                )}
+              </div>
+            ))}
+          </div>
+        )}
 
         {curation.conditionChanges?.visionOffset?.length > 0 && (
           <div style={{marginBottom:10}}>
@@ -5461,6 +5872,59 @@ function BriefingDisplay({ curation, allIssues = [], selectedIds = [], autoSelec
            !curation.testPm.fmvs?.length &&
            !curation.testPm.cutter?.length &&
            !curation.testPm.stackingSepa?.length)) && empty("테스트/PM 활동 없음")}
+
+        {/* ★ 12-Y3: Line 3D Cutter CPC 모니터링 */}
+        {curation.line3DCutterCpc && curation.line3DCutterCpc.status && (
+          <div style={{
+            marginTop:10, padding:"8px 12px",
+            background:"rgba(34,211,238,0.06)",
+            border:"1px solid rgba(34,211,238,0.25)",
+            borderRadius:5,
+          }}>
+            <div style={{fontSize:11, fontWeight:700, color:"#22d3ee", marginBottom:4}}>
+              📡 Line 3D Cutter CPC 이상 (모니터링)
+            </div>
+            <div style={{fontSize:10, color:"#cbd5e1", marginBottom:4}}>{curation.line3DCutterCpc.status}</div>
+            {curation.line3DCutterCpc.details?.length > 0 && (
+              <ul style={{margin:0, paddingLeft:16, fontSize:9.5, color:"#94a3b8", lineHeight:1.6}}>
+                {curation.line3DCutterCpc.details.map((d, di) => <li key={di}>{d}</li>)}
+              </ul>
+            )}
+          </div>
+        )}
+
+        {/* ★ 12-Y3: Stacking 1-AB Sepa Run Issues (만성 라인) */}
+        {curation.chronic1AB && (curation.chronic1AB.title || curation.chronic1AB.byEquipment?.length) && (
+          <div style={{
+            marginTop:10, padding:"10px 12px",
+            background:"rgba(239,68,68,0.06)",
+            border:"1px solid rgba(239,68,68,0.25)",
+            borderLeft:"4px solid #ef4444",
+            borderRadius:5,
+          }}>
+            <div style={{fontSize:11.5, fontWeight:800, color:"#fca5a5", marginBottom:4}}>
+              🔥 {curation.chronic1AB.title || "Stacking 1-AB Sepa Run Issues (지속 모니터링)"}
+            </div>
+            {curation.chronic1AB.patternSummary && (
+              <div style={{fontSize:10, color:"#cbd5e1", marginBottom:6, fontStyle:"italic"}}>
+                → {curation.chronic1AB.patternSummary}
+              </div>
+            )}
+            {curation.chronic1AB.byEquipment?.length > 0 && (
+              <table style={{...tableStyle, fontSize:10}}>
+                <thead><tr><th style={thStyle}>호기</th><th style={thStyle}>다발 NG</th></tr></thead>
+                <tbody>
+                  {curation.chronic1AB.byEquipment.map((e, ei) => (
+                    <tr key={ei}>
+                      <td style={{...tdStyle,fontWeight:700,fontFamily:"monospace"}}>{e.equipment}</td>
+                      <td style={{...tdStyle,color:"#fca5a5"}}>{e.ngList}</td>
+                    </tr>
+                  ))}
+                </tbody>
+              </table>
+            )}
+          </div>
+        )}
       </div>
 
       {/* 5. NG 품질 실적 */}
@@ -5561,7 +6025,15 @@ function MainReportPage({ minutes }) {
         <div style={{fontSize:11,color:"#cbd5e1",lineHeight:1.7}}>
           <strong>분석 기간:</strong> {periodLabel}<br/>
           <strong>출처:</strong> AZS Status Reports WhatsApp 그룹<br/>
-          <strong>레코드:</strong> 부동 이슈 {(minutes.tagged?.issues || []).length}건
+          <strong>레코드:</strong> {(() => {
+            const rb = minutes.curation?.recordBreakdown || {};
+            const parts = [];
+            if (rb.bmDowntime > 0) parts.push(`BM Downtime Bot ${rb.bmDowntime}건`);
+            if (rb.ubm > 0) parts.push(`UBM ${rb.ubm}건`);
+            if (rb.pdDowntime > 0) parts.push(`PD Downtime ${rb.pdDowntime}건`);
+            if (rb.other > 0) parts.push(`기타 ${rb.other}건`);
+            return parts.length > 0 ? parts.join(" + ") : `부동 이슈 ${(minutes.tagged?.issues || []).length}건`;
+          })()}
           {minutes.curation?.summary_text && (
             <>
               <br/>

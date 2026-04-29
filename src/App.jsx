@@ -589,6 +589,23 @@ function extractField(text, fieldName) {
   return text.match(re)?.[1]?.replace(/\*/g, "").trim() || "";
 }
 
+// ★ 영역 12-AD1: 키워드 정밀 매칭 — 짧은 영문 약어는 단어 경계 강제
+// 버그 사례: "NG" 키워드가 "tuangan", "barang", "yang" 등 인도네시아어/일반 단어 안의 "ng" 부분문자열에 잘못 매칭됨
+// 해결: 영문/숫자만으로 구성된 짧은 키워드(1~3자)는 \b 단어 경계로 매칭, 긴 키워드/한글은 부분문자열 그대로
+function matchKeyword(text, kw) {
+  const lowerKw = (kw || "").toLowerCase();
+  if (!lowerKw) return false;
+  const lowerText = (text || "").toLowerCase();
+  // 짧은 영문/숫자 약어 (1~3자) → 단어 경계 강제
+  if (lowerKw.length <= 3 && /^[a-z0-9]+$/.test(lowerKw)) {
+    const escaped = lowerKw.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
+    const re = new RegExp(`\\b${escaped}\\b`, 'i');
+    return re.test(text);
+  }
+  // 긴 키워드 또는 한글/특수문자 포함 → 부분문자열 매칭 (기존 로직)
+  return lowerText.includes(lowerKw);
+}
+
 function classifyMessages(msgs) {
   const downtime = [], equipment = [], general = [];
   // 영역 5: 큐레이션 이력 카테고리
@@ -598,11 +615,11 @@ function classifyMessages(msgs) {
   const classifySubMessage = (subText, baseEntry) => {
     if (!subText || subText.trim().length <= 5) return;
     if (subText.includes("미디어 파일 제외됨")) return;
-    const lowerText = subText.toLowerCase();
     const matched = [];
-    if (QUALITY_KEYWORDS.some(kw => lowerText.includes(kw.toLowerCase()))) matched.push("quality");
-    if (PROCESS_CHANGE_KEYWORDS.some(kw => lowerText.includes(kw.toLowerCase()))) matched.push("process_change");
-    if (TEST_KEYWORDS.some(kw => lowerText.includes(kw.toLowerCase()))) matched.push("test");
+    // ★ 12-AD1: matchKeyword (단어 경계 강제)
+    if (QUALITY_KEYWORDS.some(kw => matchKeyword(subText, kw))) matched.push("quality");
+    if (PROCESS_CHANGE_KEYWORDS.some(kw => matchKeyword(subText, kw))) matched.push("process_change");
+    if (TEST_KEYWORDS.some(kw => matchKeyword(subText, kw))) matched.push("test");
     // 패턴 매칭
     if (!matched.includes("process_change")) {
       const settingPattern = /\d+(?:\.\d+)?\s*(?:→|->|=>|>>)\s*\d+(?:\.\d+)?/;
@@ -676,11 +693,11 @@ function classifyMessages(msgs) {
     if (m.text.trim().length <= 5) continue;
     if (m.text.includes("미디어 파일 제외됨")) continue;
 
-    const lowerText = m.text.toLowerCase();
     const matched = [];
-    if (QUALITY_KEYWORDS.some(kw => lowerText.includes(kw.toLowerCase()))) matched.push("quality");
-    if (PROCESS_CHANGE_KEYWORDS.some(kw => lowerText.includes(kw.toLowerCase()))) matched.push("process_change");
-    if (TEST_KEYWORDS.some(kw => lowerText.includes(kw.toLowerCase()))) matched.push("test");
+    // ★ 12-AD1: matchKeyword (단어 경계 강제) — "ng" 부분문자열 오매칭 차단
+    if (QUALITY_KEYWORDS.some(kw => matchKeyword(m.text, kw))) matched.push("quality");
+    if (PROCESS_CHANGE_KEYWORDS.some(kw => matchKeyword(m.text, kw))) matched.push("process_change");
+    if (TEST_KEYWORDS.some(kw => matchKeyword(m.text, kw))) matched.push("test");
 
     // ★ 영역 12-AB3: 패턴 매칭 — "숫자 → 숫자" 또는 "숫자->숫자" 패턴 발견 시 process_change 자동 분류
     // 예: "39.6 → 40.0", "70.2 -> 70.6", "180 → 200"
@@ -2719,6 +2736,11 @@ export default function App() {
         process_change: [...(cl.processChangeMsgs || []), ...ambigResult.process_change],
         test: [...(cl.testMsgs || []), ...ambigResult.test],
       };
+      // ★ 영역 12-AD2: 최종 카테고리 메시지 분포 로그 (ambiguous 분배 결과 확인용)
+      console.log(`[메시지 최종 분류] quality ${categoryMsgs.quality.length} (직접 ${cl.qualityMsgs?.length || 0} + 모호 ${ambigResult.quality.length}) / process_change ${categoryMsgs.process_change.length} (직접 ${cl.processChangeMsgs?.length || 0} + 모호 ${ambigResult.process_change.length}) / test ${categoryMsgs.test.length} (직접 ${cl.testMsgs?.length || 0} + 모호 ${ambigResult.test.length})`);
+      if (ambig.length > 0 && (ambigResult.skip?.length || 0) > 0) {
+        console.log(`[모호 분류] skip ${ambigResult.skip.length}건 (어디에도 분류 안 됨)`);
+      }
 
       // ★ 영역 12-Y5: 큐레이션에 KB 활용 (Cell_PE / Elec_PE 우선, 없으면 빈 문자열)
       let kbForCuration = "";

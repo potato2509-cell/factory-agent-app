@@ -1119,6 +1119,15 @@ async function runPreCuration(allIssues, kbPE, reportType, categoryMsgs = {}) {
     sender: m.sender || "",
     text: (m.text || "").slice(0, 800).replace(/\n/g, " | "),
   }));
+  // ★ 영역 12-AH1: Part 3 chronic1AB용 quality 메시지 long format (5건 × 600자)
+  // 1AB 라인 메시지 (Stacking 1-AB Sepa Run Problem)에 호기별 NG 정보 풍부 — 200자 슬라이스에선 잘림
+  const qualityDataLong = qualityList.slice(0, 5).map((m, i) => ({
+    no: i + 1,
+    date: m.date || "",
+    time: m.time || "",
+    sender: m.sender || "",
+    text: (m.text || "").slice(0, 600).replace(/\n/g, " | "),
+  }));
 
   // ── ★ 영역 12-AF3: 4분할 병렬 호출 (Part 2를 2a/2b로 분할) ──
   // Part 2b가 conditionChangeGroups 전용 — Sonnet이 짧고 정확하게 처리
@@ -1130,7 +1139,8 @@ async function runPreCuration(allIssues, kbPE, reportType, categoryMsgs = {}) {
     curationPart2a_RecurringSimple(issuesData, processChangeData, allIssues.length, focus, kbText, categoryMsgs),
     // ★ AG1: Part 2b는 long format (10건×800자) 사용
     curationPart2b_ConditionChangeGroups(processChangeDataLong, qualityWithSettingLong, focus, kbText),
-    curationPart3_TestPmQuality(testData, qualityData, focus, kbText, categoryMsgs),
+    // ★ AH1: Part 3에 qualityDataLong 추가 — chronic1AB 1AB 라인 풍부 추출용
+    curationPart3_TestPmQuality(testData, qualityData, focus, kbText, categoryMsgs, qualityDataLong),
   ]);
 
   // Part 2a + 2b 결과 병합 — conditionChangeGroups는 2b에서, 나머지는 2a에서
@@ -1496,7 +1506,7 @@ ${qualityWithSetting.length > 0 ? JSON.stringify(qualityWithSetting, null, 1) : 
 }
 
 // ─── Part 3: 4번 테스트/PM + 5번 품질NG ───────────────────────────────────────
-async function curationPart3_TestPmQuality(testData, qualityData, focus, kbText, categoryMsgs) {
+async function curationPart3_TestPmQuality(testData, qualityData, focus, kbText, categoryMsgs, qualityDataLong = null) {
   const sys = `${FACTORY_PHILOSOPHY}
 
 당신은 AZS 배터리 공장의 ${PERSONAS.Cell_PE.role.replace(" - Cell 공정", "")}입니다.
@@ -1529,36 +1539,78 @@ ${focus}
   "line3DCutterCpc": null
 }
 
-[★ 옵셔널 필드 — 데이터에 명백한 단서 있을 때만]
-chronic1AB / line3DCutterCpc / linePM.startTime/endTime/details 등은
-데이터에 명백히 있을 때만 채우고, 없으면 null 또는 빈 값으로 빠르게 응답.
+[★ chronic1AB — 1AB 만성 라인 NG 추출 (★ 핵심 작업)]
 
-[chronic1AB (옵셔널)]
-1AB 라인 만성 NG 보고가 있을 때만:
-{"title":"Stacking 1-AB Sepa Run Issues (지속 모니터링)",
- "patternSummary":"패턴 요약",
- "byEquipment":[{"equipment":"1-A2","ngList":"NG 내역"}]}
-없으면 null.
+1AB 라인 메시지 패턴 인식:
+- "Stacking 1 - AB Run sepa Problem" 또는 "Update Line 1AB" 시작 메시지
+- "1-A1, 1-A2, 1-A3..." 호기별 JXT lot ID + NG/OK 표시 (✅, ❌, 🔄)
+- "JXT11251121022J66103 ( NG ETC YCS 5X Sepa wrinkle Fist stack)" 형식
+
+★★ chronic1AB 추출 규칙 (정답 레포트 양식) ★★
+1) **NG 표시된 호기만 byEquipment에 포함** — ✅(OK)만 있는 호기는 제외
+2) **NG 패턴 강조** — "NG ETC YCS 5x Sepa wrinkle First stack ❌" 형태로 표기
+3) **반복 패턴 강조** — "이번 기간 최다 7X", "2 lot 연속" 같은 표현 추가
+4) **호기 6개 정도** 정상 (1-A2, 1-A3, 1-A5, 1-A6, 1-B2, 1-B4/5 등)
+5) ✅ 정상 cell은 ngList에서 제외 — 핵심 NG만 표기
+
+[★ Few-shot 예시 — chronic1AB]
+입력 메시지:
+"Stacking 1-AB Run sepa Problem | Update Line 1AB | 1-A1: JXT...J67103✅, JXT...J66103✅
+ 1-A2: JXT...J66103 (NG ETC YCS 5X Sepa wrinkle Fist stack) ❌, JXT...J66102
+ 1-A3: JXT...J66102 (NG ETC Y-CS Y-AS 5X Sepa wrinkle Fist stack) ❌, JXT...J66103 (NG ETC Y-CS Y-AS 5X Sepa wrinkle) ❌
+ 1-A6: JXT...J67102 (NG SEPA FOLD 3X) ❌
+ 1-B2: JXT...J67102 (NG YCS First stack 7X) ❌
+ 1-B4: NG Y-CS 2x Sepa wrinkle"
+
+출력:
+{
+  "title": "Stacking 1-AB Sepa Run Issues (지속 모니터링)",
+  "patternSummary": "Separator wrinkle / YCS / Sepa Fold 3 종류 NG 다발. 1-B2가 7X로 이번 기간 최다, 1-A3은 2 lot 연속 ❌.",
+  "byEquipment": [
+    {"equipment": "1-A2", "ngList": "JXT...J66103 - NG ETC YCS 5x Sepa wrinkle First stack ❌"},
+    {"equipment": "1-A3", "ngList": "JXT...J66102, JXT...J66103 - NG ETC Y-CS·Y-AS 5x Sepa wrinkle ❌ (2 lot 연속)"},
+    {"equipment": "1-A6", "ngList": "JXT...J67102 - NG SEPA FOLD 3X ❌"},
+    {"equipment": "1-B2", "ngList": "JXT...J67102 - NG YCS First stack 7X ❌ (이번 기간 최다)"},
+    {"equipment": "1-B4", "ngList": "NG Y-CS 2x Sepa wrinkle"}
+  ]
+}
+
+★ ✅(OK) cell은 byEquipment에서 제외, NG ❌ 표시된 호기만 포함하세요.
+★ 같은 호기에 NG가 여러 lot 있으면 "JXT-A, JXT-B (2 lot 연속)" 식으로 묶기.
 
 [line3DCutterCpc (옵셔널)]
 Line 3D Cutter CPC 모니터링 보고가 있을 때만:
 {"status":"내용", "details":["보고1","보고2"]}
 없으면 null.
 
+[★ 옵셔널 필드 — 데이터에 명백한 단서 있을 때만]
+line3DCutterCpc / linePM.startTime/endTime/details 등은
+데이터에 명백히 있을 때만 채우고, 없으면 null 또는 빈 값으로 빠르게 응답.
+
 [규칙]
 - testPm 4개 하위 그룹 — 데이터 없으면 빈 배열 []
 - qualityNg.table은 데이터에 있는 일자만 (3일치는 KB 활용 가능, 옵셔널)
 - qualityNg.trend는 비교 분석 형식, 1일치만 있으면 "1일치 데이터 — 비교 불가"
+- chronic1AB는 1AB 라인 메시지에서 NG ❌ 호기만 byEquipment에 포함 (★ 정상 cell 제외)
 - 모든 수치는 숫자만`;
+
+  // ★ AH3: qualityDataLong 있으면 chronic1AB 추출용으로 함께 전달 (1AB 메시지 풍부 데이터)
+  const qualityLongSection = qualityDataLong && qualityDataLong.length > 0
+    ? `\n\n[★ 1AB 만성 라인 분석용 quality 메시지 풀 본문 (chronic1AB 추출 전용) - ${qualityDataLong.length}건]
+${JSON.stringify(qualityDataLong, null, 1)}
+※ 위 메시지 중 "Stacking 1-AB" "Run sepa Problem" 같은 1AB 라인 보고가 있으면 chronic1AB에 풀로 추출.
+※ NG ❌ 표시된 호기만 byEquipment에 포함, ✅ 정상 cell은 제외.`
+    : "";
 
   const userMsg = `[테스트/양산외 생산 메시지 - ${testData.length}건]
 ${testData.length > 0 ? JSON.stringify(testData, null, 1) : "(없음)"}
 
 [품질 이슈 메시지 - ${qualityData.length}건]
-${qualityData.length > 0 ? JSON.stringify(qualityData, null, 1) : "(없음)"}
+${qualityData.length > 0 ? JSON.stringify(qualityData, null, 1) : "(없음)"}${qualityLongSection}
 
 위 데이터를 4번 테스트/PM + 5번 품질NG 형식으로 정리하세요.
-옵셔널 필드(chronic1AB, line3DCutterCpc 등)는 명백한 단서 있을 때만, 없으면 null로 빠르게 응답하세요.`;
+★ 1AB 라인 메시지가 풍부하면 chronic1AB의 byEquipment에 NG 호기 6개 정도 풀로 추출 (✅ 제외, ❌만).
+옵셔널 필드(line3DCutterCpc 등)는 명백한 단서 있을 때만, 없으면 null로 빠르게 응답하세요.`;
 
   return await callCurationPart(sys, userMsg, "Part3-TestPm/Quality");
 }

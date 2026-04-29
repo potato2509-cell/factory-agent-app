@@ -2629,10 +2629,35 @@ export default function App() {
       const mode = d.modeInfo?.mode || "";
       const modeColor = mode === "DEEP" ? "#c0392b" : mode === "STANDARD" ? "#e67e22" : "#27ae60";
       const consensus = d.moderator?.consensus || d.moderator?.summary || d.moderator?.supplement || "";
-      const opinions = (d.opinions || []).map(o => `
-        <div style="margin-top:8px;padding:6px 10px;background:#f5f5f5;border-left:3px solid ${PERSONAS[o.agent]?.color || "#999"};border-radius:3px;">
-          <b>${esc(PERSONAS[o.agent]?.icon || "")} ${esc(o.agent)}</b>: ${esc(JSON.stringify(o.body || o.content || ""))}
-        </div>`).join("");
+      const opinions = (d.opinions || []).map(o => {
+        const p = PERSONAS[o.persona] || {};
+        const op = o.opinion || {};
+        // 페르소나 의견의 주요 필드들을 보기 좋게 표시
+        // (한국어 키 우선 - "현상", "원인", "대책" 등)
+        const fieldOrder = ["stance", "현상", "원인", "대책", "기존조치_평가", "previous_reference", "observation", "recommendation", "risk"];
+        const fieldLabels = {
+          stance: "입장",
+          "현상": "현상",
+          "원인": "원인",
+          "대책": "대책",
+          "기존조치_평가": "기존조치 평가",
+          "previous_reference": "인용",
+          "observation": "관찰",
+          "recommendation": "권고",
+          "risk": "리스크",
+        };
+        const fields = fieldOrder
+          .filter(k => op[k] && op[k] !== "-" && op[k] !== "해당없음" && typeof op[k] === "string")
+          .map(k => `<div style="margin-top:4px;"><b style="color:#555;">${esc(fieldLabels[k] || k)}:</b> ${esc(op[k])}</div>`)
+          .join("");
+        return `
+        <div style="margin-top:8px;padding:8px 12px;background:#f5f5f5;border-left:3px solid ${p.color || "#999"};border-radius:3px;">
+          <div style="font-weight:700;color:${p.color || "#333"};margin-bottom:4px;">
+            ${esc(p.icon || "")} ${esc(p.label || o.persona || "Agent")}
+          </div>
+          ${fields || `<div style="color:#888;font-style:italic;">의견 데이터 없음</div>`}
+        </div>`;
+      }).join("");
       return `
         <div style="margin-bottom:18px;padding:12px 16px;background:#fafafa;border:1px solid #ddd;border-left:4px solid ${modeColor};border-radius:5px;">
           <h4 style="margin-top:0;color:${modeColor};">[${esc(mode)}] ${i + 1}. ${esc(d.issue?.eq || "?")} — ${esc((d.issue?.prob || "").slice(0, 60))}</h4>

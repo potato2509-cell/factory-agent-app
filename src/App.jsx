@@ -290,22 +290,94 @@ async function callClaudeRaw(system, userMsg, opts = {}) {
   return (data.content || []).map(i => i.text || "").join("").trim();
 }
 
+// ─── 영역 12-AN: safeJSON 강화 (raw 정보 보존 + 정규식 추출 + 빈 객체 거부) ─────
 function safeJSON(raw) {
-  const cleaned = raw.replace(/```json|```/gi, "").trim();
+  const rawStr = String(raw || "");
+  const rawLen = rawStr.length;
+
+  // 빈 응답
+  if (rawLen === 0) {
+    const err = new Error("JSON 없음 — raw 응답 빈 문자열 (LLM 무응답)");
+    err._rawSnippet = "";
+    err._rawLength = 0;
+    throw err;
+  }
+
+  // 1. 코드펜스 제거 (```json ... ``` 또는 ``` ... ```)
+  const cleaned = rawStr.replace(/```json|```/gi, "").trim();
+
+  // 2. 첫 { ~ 마지막 } 블록 추출 (기존 방식)
   const s = cleaned.indexOf("{"), e = cleaned.lastIndexOf("}");
-  if (s === -1 || e === -1) throw new Error("JSON 없음");
+  if (s === -1 || e === -1) {
+    // 중괄호 없음 — 정규식으로 한 번 더 시도 (혹시 escape된 것)
+    const reMatch = cleaned.match(/\{[\s\S]*\}/);
+    if (!reMatch) {
+      const err = new Error(`JSON 없음 — 중괄호 없음 (raw 길이=${rawLen})`);
+      err._rawSnippet = rawStr.slice(0, 300);
+      err._rawLength = rawLen;
+      throw err;
+    }
+    // 정규식 hit — 아래 경로로 진입
+    const jsonStr = reMatch[0];
+    try {
+      const parsed = JSON.parse(jsonStr);
+      if (!parsed || typeof parsed !== "object" || Object.keys(parsed).length === 0) {
+        const err = new Error("JSON 없음 — 빈 객체 또는 비객체");
+        err._rawSnippet = rawStr.slice(0, 300);
+        err._rawLength = rawLen;
+        throw err;
+      }
+      return parsed;
+    } catch (parseErr) {
+      const err = new Error(`JSON 파싱 실패 — ${parseErr.message}`);
+      err._rawSnippet = rawStr.slice(0, 300);
+      err._rawLength = rawLen;
+      throw err;
+    }
+  }
+
   let jsonStr = cleaned.slice(s, e + 1);
-  try { return JSON.parse(jsonStr); }
-  catch {
+
+  // 3. 1차 파싱 시도
+  try {
+    const parsed = JSON.parse(jsonStr);
+    if (!parsed || typeof parsed !== "object" || Object.keys(parsed).length === 0) {
+      const err = new Error("JSON 없음 — 빈 객체 또는 비객체 (1차)");
+      err._rawSnippet = rawStr.slice(0, 300);
+      err._rawLength = rawLen;
+      throw err;
+    }
+    return parsed;
+  } catch (e1) {
+    // raw 정보 보존된 throw는 그대로 위로
+    if (e1._rawSnippet !== undefined) throw e1;
+
+    // 4. brace/bracket 자동 균형 맞추기 (잘림 응답 복구)
     jsonStr = jsonStr.replace(/,\s*"[^"]*$/, "").replace(/,\s*\{[^}]*$/, "");
     let ob = 0, cb = 0, oq = 0, cq = 0;
     for (const c of jsonStr) {
-      if (c==="{") ob++; if (c==="}") cb++;
-      if (c==="[") oq++; if (c==="]") cq++;
+      if (c === "{") ob++; if (c === "}") cb++;
+      if (c === "[") oq++; if (c === "]") cq++;
     }
-    for (let i=0; i<oq-cq; i++) jsonStr += "]";
-    for (let i=0; i<ob-cb; i++) jsonStr += "}";
-    return JSON.parse(jsonStr);
+    for (let i = 0; i < oq - cq; i++) jsonStr += "]";
+    for (let i = 0; i < ob - cb; i++) jsonStr += "}";
+
+    try {
+      const parsed = JSON.parse(jsonStr);
+      if (!parsed || typeof parsed !== "object" || Object.keys(parsed).length === 0) {
+        const err = new Error("JSON 없음 — 빈 객체 또는 비객체 (균형 복구 후)");
+        err._rawSnippet = rawStr.slice(0, 300);
+        err._rawLength = rawLen;
+        throw err;
+      }
+      return parsed;
+    } catch (e2) {
+      if (e2._rawSnippet !== undefined) throw e2;
+      const err = new Error(`JSON 파싱 실패 — 균형 복구 후에도 실패: ${e2.message}`);
+      err._rawSnippet = rawStr.slice(0, 300);
+      err._rawLength = rawLen;
+      throw err;
+    }
   }
 }
 
@@ -2034,11 +2106,27 @@ JSON만 출력:
 }`;
 
   await new Promise(r => setTimeout(r, 500));
-  const raw = await callClaudeRaw(sys, `[이슈]\n${issueCtx}\n\n[엔지니어 의견 — 4축]\n${opinionsText}\n\n4축 합의 형식으로 종합 정리하세요.`, {
-    model: MODEL_REASONING,
-    max_tokens: 1000,  // 영역 12: 7필드 수용
-  });
-  return safeJSON(raw);
+  // 영역 12-AN: max_tokens 1000 → 1500 (DEEP 7필드 안전 마진)
+  let rawForDebug = null;
+  try {
+    rawForDebug = await callClaudeRaw(sys, `[이슈]\n${issueCtx}\n\n[엔지니어 의견 — 4축]\n${opinionsText}\n\n4축 합의 형식으로 종합 정리하세요.`, {
+      model: MODEL_REASONING,
+      max_tokens: 1500,
+    });
+    return safeJSON(rawForDebug);
+  } catch (e) {
+    console.error(`[사회자 DEEP 실패] ${e?.message || e}`);
+    if (e._rawSnippet !== undefined) {
+      console.error(`  ↳ raw 길이: ${e._rawLength}`);
+      console.error(`  ↳ raw 첫 300자: ${e._rawSnippet}`);
+    } else if (rawForDebug) {
+      console.error(`  ↳ raw 길이: ${String(rawForDebug).length}`);
+      console.error(`  ↳ raw 첫 300자: ${String(rawForDebug).slice(0, 300)}`);
+    } else {
+      console.error(`  ↳ API 단계 실패 (네트워크/timeout/인증)`);
+    }
+    throw e;
+  }
 }
 
 // ─── 5. 사회자: STANDARD — 영역 12-E 새 필드 적용 ───────────────────────────────
@@ -2070,11 +2158,27 @@ JSON만 출력:
 }`;
 
   await new Promise(r => setTimeout(r, 500));
-  const raw = await callClaudeRaw(sys, `[이슈]\n${issueCtx}\n\n[의견 — 4축]\n${opinionsText}\n\n액션 플랜으로 정리.`, {
-    model: MODEL_REASONING,
-    max_tokens: 900,
-  });
-  return safeJSON(raw);
+  // 영역 12-AN: max_tokens 900 → 1300
+  let rawForDebug = null;
+  try {
+    rawForDebug = await callClaudeRaw(sys, `[이슈]\n${issueCtx}\n\n[의견 — 4축]\n${opinionsText}\n\n액션 플랜으로 정리.`, {
+      model: MODEL_REASONING,
+      max_tokens: 1300,
+    });
+    return safeJSON(rawForDebug);
+  } catch (e) {
+    console.error(`[사회자 STANDARD 실패] ${e?.message || e}`);
+    if (e._rawSnippet !== undefined) {
+      console.error(`  ↳ raw 길이: ${e._rawLength}`);
+      console.error(`  ↳ raw 첫 300자: ${e._rawSnippet}`);
+    } else if (rawForDebug) {
+      console.error(`  ↳ raw 길이: ${String(rawForDebug).length}`);
+      console.error(`  ↳ raw 첫 300자: ${String(rawForDebug).slice(0, 300)}`);
+    } else {
+      console.error(`  ↳ API 단계 실패 (네트워크/timeout/인증)`);
+    }
+    throw e;
+  }
 }
 
 // ─── 6. 사회자: LITE 압축 평가 (단독 호출, 페르소나 호출 없음) ──────────────────
@@ -2090,11 +2194,27 @@ JSON만 출력:
 }`;
 
   await new Promise(r => setTimeout(r, 400));
-  const raw = await callClaudeRaw(sys, `[완료된 이슈]\n${issueCtx}\n\n짧게 평가.`, {
-    model: MODEL_REASONING,
-    max_tokens: 400,
-  });
-  return safeJSON(raw);
+  // 영역 12-AN: max_tokens 400 → 600
+  let rawForDebug = null;
+  try {
+    rawForDebug = await callClaudeRaw(sys, `[완료된 이슈]\n${issueCtx}\n\n짧게 평가.`, {
+      model: MODEL_REASONING,
+      max_tokens: 600,
+    });
+    return safeJSON(rawForDebug);
+  } catch (e) {
+    console.error(`[사회자 LITE 실패] ${e?.message || e}`);
+    if (e._rawSnippet !== undefined) {
+      console.error(`  ↳ raw 길이: ${e._rawLength}`);
+      console.error(`  ↳ raw 첫 300자: ${e._rawSnippet}`);
+    } else if (rawForDebug) {
+      console.error(`  ↳ raw 길이: ${String(rawForDebug).length}`);
+      console.error(`  ↳ raw 첫 300자: ${String(rawForDebug).slice(0, 300)}`);
+    } else {
+      console.error(`  ↳ API 단계 실패 (네트워크/timeout/인증)`);
+    }
+    throw e;
+  }
 }
 
 // ─── 6-1. 사회자 폴백 통합 함수 (영역 12-AL: D3-b 2회 retry + D4-b 4축 stitching) ──
@@ -2146,37 +2266,49 @@ async function moderateRetrySimple(mode, issueCtx, opinions) {
     return `${p.label}: 근본원인=${op["근본원인"] || op["원인"] || "-"} / 조치평가=${op["조치안_평가"] || op["기존조치_평가"] || "-"} / 개선안=${op["개선안"] || op["대책"] || "-"}`;
   }).join("\n");
 
+  // 영역 12-AN: try/catch + raw 로깅 추가
+  const tryCall = async (sys, userMsg, maxTokens, label) => {
+    let rawForDebug = null;
+    try {
+      rawForDebug = await callClaudeRaw(sys, userMsg, { model: MODEL_REASONING, max_tokens: maxTokens });
+      return safeJSON(rawForDebug);
+    } catch (e) {
+      console.error(`[사회자 retry simple ${label} 실패] ${e?.message || e}`);
+      if (e._rawSnippet !== undefined) {
+        console.error(`  ↳ raw 길이: ${e._rawLength}`);
+        console.error(`  ↳ raw 첫 300자: ${e._rawSnippet}`);
+      } else if (rawForDebug) {
+        console.error(`  ↳ raw 길이: ${String(rawForDebug).length}`);
+        console.error(`  ↳ raw 첫 300자: ${String(rawForDebug).slice(0, 300)}`);
+      } else {
+        console.error(`  ↳ API 단계 실패`);
+      }
+      throw e;
+    }
+  };
+
   if (mode === "DEEP") {
     const sys = `다음 의견들을 4축 합의 형식으로 짧게 종합하세요. JSON만:
 {"근본원인_합의":"...","조치안_평가_합의":"...","개선안_합의":"...","재발방지책_합의":"...","충돌점":"...","추가_논의_필요":"...","consensus":"한 문장 요약"}`;
     await new Promise(r => setTimeout(r, 400));
-    const raw = await callClaudeRaw(sys, `[이슈]\n${issueCtx.slice(0, 300)}\n\n[의견]\n${opinionsCompact}`, {
-      model: MODEL_REASONING,
-      max_tokens: 600,
-    });
-    return safeJSON(raw);
+    // 영역 12-AN: max_tokens 600 → 900
+    return await tryCall(sys, `[이슈]\n${issueCtx.slice(0, 300)}\n\n[의견]\n${opinionsCompact}`, 900, "DEEP");
   }
 
   if (mode === "STANDARD") {
     const sys = `다음 의견을 액션 플랜으로 짧게 정리. JSON만:
 {"근본원인_합의":"...","조치안_평가_합의":"...","actions":[{"action":"행동","owner":"담당","priority":"우선순위","duration":"기간","type":"개선안/재발방지"}],"needsMore":"...","summary":"요약"}`;
     await new Promise(r => setTimeout(r, 400));
-    const raw = await callClaudeRaw(sys, `[이슈]\n${issueCtx.slice(0, 300)}\n\n[의견]\n${opinionsCompact}`, {
-      model: MODEL_REASONING,
-      max_tokens: 600,
-    });
-    return safeJSON(raw);
+    // 영역 12-AN: max_tokens 600 → 900
+    return await tryCall(sys, `[이슈]\n${issueCtx.slice(0, 300)}\n\n[의견]\n${opinionsCompact}`, 900, "STANDARD");
   }
 
   // LITE
   const sys = `다음 이슈를 짧게 평가. JSON만:
 {"supplement":"보완점","recurRisk":"재발우려","prevention":"방지책"}`;
   await new Promise(r => setTimeout(r, 400));
-  const raw = await callClaudeRaw(sys, `[이슈]\n${issueCtx.slice(0, 300)}`, {
-    model: MODEL_REASONING,
-    max_tokens: 300,
-  });
-  return safeJSON(raw);
+  // 영역 12-AN: max_tokens 300 → 500
+  return await tryCall(sys, `[이슈]\n${issueCtx.slice(0, 300)}`, 500, "LITE");
 }
 
 // 최종 폴백 - 코드 레벨 4축 stitching (영역 12-AL D4-b: 모든 페르소나 의견을 4축별로 모음)

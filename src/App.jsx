@@ -1956,14 +1956,36 @@ ${focus} 다음 이슈를 ${p.role.split(" ")[0]} 관점에서 분석하세요.
   "재발방지책": "장기 재발 방지 방법 (PM 항목 추가, horizontal deployment 등, 80자이내)"
 }`;
 
+  // ★ 영역 12-AM: 진단 코드 — 페르소나 호출 실패 원인 추적용 (Console 출력)
+  let rawForDebug = null;
+  const t0 = Date.now();
   try {
     await new Promise(r => setTimeout(r, 600));
-    const raw = await callClaudeRaw(sys, `[이슈]\n${issueCtx}${prevText}`, {
+    rawForDebug = await callClaudeRaw(sys, `[이슈]\n${issueCtx}${prevText}`, {
       model: MODEL_REASONING,
       max_tokens: 1200,  // 영역 12 Phase 2: say 자유 텍스트 추가로 토큰 ↑
     });
-    return safeJSON(raw);
-  } catch {
+    const parsed = safeJSON(rawForDebug);
+    // safeJSON이 null/empty/비객체 반환 시 진단 대상
+    if (!parsed || typeof parsed !== "object" || Object.keys(parsed).length === 0) {
+      console.error(`[페르소나 ${personaCode}] safeJSON 빈 결과 — raw 길이=${String(rawForDebug || "").length}, raw 첫 300자:`, String(rawForDebug || "").slice(0, 300));
+      throw new Error(`safeJSON returned empty (raw length=${String(rawForDebug || "").length})`);
+    }
+    return parsed;
+  } catch (e) {
+    const elapsed = Date.now() - t0;
+    const issueShort = String(issueCtx || "").slice(0, 80).replace(/\n/g, " ");
+    console.error(`[페르소나 호출 실패] ${personaCode} (${elapsed}ms) | 이슈: ${issueShort}`);
+    console.error(`  ↳ 에러 타입: ${e?.name || "Unknown"}`);
+    console.error(`  ↳ 에러 메시지: ${e?.message || String(e)}`);
+    if (e?.status) console.error(`  ↳ HTTP 상태: ${e.status}`);
+    if (e?.cause) console.error(`  ↳ 원인:`, e.cause);
+    if (rawForDebug) {
+      console.error(`  ↳ raw 응답 길이: ${String(rawForDebug).length}`);
+      console.error(`  ↳ raw 첫 300자: ${String(rawForDebug).slice(0, 300)}`);
+    } else {
+      console.error(`  ↳ raw 응답: 없음 (API 단계 실패 — 네트워크/인증/timeout)`);
+    }
     return {
       say: "분석 중 오류 발생",
       quote: "",
@@ -1974,6 +1996,9 @@ ${focus} 다음 이슈를 ${p.role.split(" ")[0]} 관점에서 분석하세요.
       "조치안_평가": "-",
       "개선안": "-",
       "재발방지책": "-",
+      _error: `${e?.name || "Error"}: ${e?.message || String(e)}`.slice(0, 200),
+      _rawSnippet: rawForDebug ? String(rawForDebug).slice(0, 150) : null,
+      _elapsedMs: elapsed,
     };
   }
 }

@@ -3580,76 +3580,85 @@ export default function App() {
   // 보안: Webhook URL은 클라이언트 미보유 — Apps Script Properties Service 경유
 
   // 12-AK-1: 메인 레포트 → 단순 텍스트 변환 (Q3=a, 최소 변환)
-  const reportToTeamsText = () => {
-    if (!minutes) return "";
+  // 12-AS-1: 메인 레포트 → 구조화된 페이로드 객체 (옵션 3 풀 디자인용)
+  // 이전 12-AK-1 reportToTeamsText는 텍스트 한 덩어리 → 12-AS에서 객체로 변경
+  const reportToTeamsPayload = () => {
+    if (!minutes) return null;
     const cur = minutes.curation || {};
     const insights = minutes.insights || [];
     const actions = minutes.actions || [];
     const tagged = minutes.tagged || { issues: [], counts: {} };
     const issuesCount = (tagged.issues || []).length;
     const long30 = (cur.longDowntime || []).filter(it => Number(it.duration || it.durMin || 0) >= 30);
+
+    // TOP 5 (score 기준)
+    const scoredIssues = (tagged.issues || [])
+      .filter(it => typeof it.score === "number")
+      .sort((a, b) => b.score - a.score)
+      .slice(0, 5)
+      .map((it, i) => ({
+        rank: i + 1,
+        score: it.score,
+        equipment: it.eq || it.equipment || "?",
+        problem: (it.problem || it.text || "").slice(0, 80),
+        durationMin: it.durMin || it.duration || 0,
+      }));
+
+    // 인사이트 5개로 truncate (Q5=a)
+    const trimmedInsights = insights.slice(0, 5).map((ins, i) => {
+      if (typeof ins === "string") {
+        return { rank: i + 1, title: ins.slice(0, 80), bulletPoints: [], confidence: "", evidence: "" };
+      }
+      return {
+        rank: i + 1,
+        title: (ins.title || "").slice(0, 100),
+        bulletPoints: (ins.bulletPoints || []).slice(0, 3).map(bp => String(bp || "").slice(0, 200)),
+        confidence: ins.confidence || "",
+        evidence: (ins.evidence || "").slice(0, 80),
+      };
+    });
+
+    // 액션 7개로 truncate, P0 우선 (Q5=a)
+    const sortedActions = [...actions].sort((a, b) => {
+      const order = { P0: 0, P1: 1, P2: 2 };
+      return (order[a.priority] ?? 9) - (order[b.priority] ?? 9);
+    });
+    const trimmedActions = sortedActions.slice(0, 7).map(a => ({
+      priority: a.priority || "P2",
+      action: (a.action || "").slice(0, 100),
+      context: (a.context || "").slice(0, 60),
+    }));
+
+    return {
+      title: minutes.title || "AZS Factory 일일 이슈 레포트",
+      date: minutes.date || "",
+      summary_text: (cur.summary_text || "").slice(0, 400),
+      criticalSummary: (cur.criticalSummary || []).slice(0, 4).map(s => String(s).slice(0, 200)),
+      stats: {
+        totalIssues: issuesCount,
+        longDowntime30: long30.length,
+        recurringCategories: (cur.recurringByCategory || []).length,
+        conditionChangeGroups: (cur.conditionChangeGroups || []).length,
+      },
+      topIssues: scoredIssues,
+      insights: trimmedInsights,
+      actions: trimmedActions,
+      sentAt: new Date().toLocaleString("ko-KR"),
+    };
+  };
+
+  // 옛 텍스트 함수 호환 (deprecated — 향후 제거 가능)
+  // eslint-disable-next-line no-unused-vars
+  const reportToTeamsText = () => {
+    const p = reportToTeamsPayload();
+    if (!p) return "";
     const lines = [];
-
-    // 헤더
-    lines.push(`📊 *${minutes.title || "AZS Factory 일일 이슈 레포트"}*`);
-    lines.push(`📅 ${minutes.date || "-"}`);
-    lines.push("");
-
-    // 핵심 요약
-    if (cur.summary_text) {
-      lines.push(`📋 *핵심 요약*`);
-      lines.push(cur.summary_text);
-      lines.push("");
+    lines.push(`📊 ${p.title}\n📅 ${p.date}\n`);
+    if (p.summary_text) lines.push(`📋 핵심 요약\n${p.summary_text}\n`);
+    if (p.topIssues.length > 0) {
+      lines.push(`🚨 핵심 이슈 TOP ${p.topIssues.length}`);
+      p.topIssues.forEach(it => lines.push(`${it.rank}. [${it.score}점] ${it.equipment} — ${it.problem} (${it.durationMin}분)`));
     }
-    if ((cur.criticalSummary || []).length > 0) {
-      lines.push(`⚠️ *중요 사항*`);
-      cur.criticalSummary.forEach(c => lines.push(`• ${c}`));
-      lines.push("");
-    }
-
-    // 통계
-    lines.push(`📈 *통계*`);
-    lines.push(`• 전체 부동: ${issuesCount}건`);
-    lines.push(`• 30분+ 장기부동: ${long30.length}건`);
-    if ((cur.recurringByCategory || []).length > 0) lines.push(`• 반복 카테고리: ${cur.recurringByCategory.length}개`);
-    if ((cur.conditionChangeGroups || []).length > 0) lines.push(`• 조건 변경 그룹: ${cur.conditionChangeGroups.length}개`);
-    lines.push("");
-
-    // TOP 5 (score 기준, scored 결과 → tagged.issues에서 score 보유)
-    const scoredIssues = (tagged.issues || []).filter(it => typeof it.score === "number").sort((a, b) => b.score - a.score).slice(0, 5);
-    if (scoredIssues.length > 0) {
-      lines.push(`🚨 *핵심 이슈 TOP ${scoredIssues.length}*`);
-      scoredIssues.forEach((it, i) => {
-        const eq = it.eq || it.equipment || "?";
-        const prob = (it.problem || it.text || "").slice(0, 60);
-        const dur = it.durMin || it.duration || 0;
-        lines.push(`${i + 1}. [${it.score}점] ${eq} — ${prob}${dur ? ` (${dur}분)` : ""}`);
-      });
-      lines.push("");
-    }
-
-    // 인사이트
-    if (insights.length > 0) {
-      lines.push(`💡 *주목할 사항*`);
-      insights.slice(0, 5).forEach((ins, i) => {
-        const text = typeof ins === "string" ? ins : (ins.text || ins.content || JSON.stringify(ins));
-        lines.push(`${i + 1}. ${text.slice(0, 200)}`);
-      });
-      lines.push("");
-    }
-
-    // 액션 (P0 위주)
-    const p0Actions = actions.filter(a => a.priority === "P0");
-    const p1Actions = actions.filter(a => a.priority === "P1");
-    if (p0Actions.length > 0 || p1Actions.length > 0) {
-      lines.push(`📌 *액션 후속 (P0/P1)*`);
-      [...p0Actions, ...p1Actions].slice(0, 6).forEach(a => {
-        lines.push(`• [${a.priority}] ${a.action} ${a.context ? `— ${a.context}` : ""}`);
-      });
-      lines.push("");
-    }
-
-    lines.push(`— ESHM AI 공유방 자동 발송 · ${new Date().toLocaleString("ko-KR")}`);
     return lines.join("\n");
   };
 
@@ -3668,17 +3677,27 @@ export default function App() {
     setTeamsSending(true);
     setTeamsResult(null);
     try {
-      const text = reportToTeamsText();
+      // 12-AS: 구조화된 payload (Apps Script가 6섹션 Adaptive Card로 변환)
+      const reportData = reportToTeamsPayload();
+      if (!reportData) {
+        setTeamsResult({ ok: false, msg: "❌ 레포트 데이터 없음" });
+        setTeamsSending(false);
+        setTimeout(() => setTeamsResult(null), 5000);
+        return;
+      }
       const payload = {
         action: "send_report",
         secret: SHARED_SECRET,
-        text,
-        title: minutes.title || "AZS 일일 이슈 레포트",
-        date: minutes.date || "",
+        version: "v3",  // ★ 12-AS: 구조화 payload 버전 (Apps Script가 v3 인식 시 풀 디자인 사용)
+        report: reportData,
+        // 옛 호환 필드 (Apps Script가 v3 미인식 시 fallback)
+        title: reportData.title,
+        date: reportData.date,
+        text: reportToTeamsText(),
         meta: {
-          issuesCount: (minutes.tagged?.issues || []).length,
-          insightsCount: (minutes.insights || []).length,
-          actionsCount: (minutes.actions || []).length,
+          issuesCount: reportData.stats.totalIssues,
+          insightsCount: reportData.insights.length,
+          actionsCount: reportData.actions.length,
         },
       };
       const res = await fetch(APPS_SCRIPT_URL, {

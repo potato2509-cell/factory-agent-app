@@ -2645,57 +2645,42 @@ async function generateInsightsAndActions(curation, discussions, taggedResult, k
     quality_top3: extractKeyEventMsgs(categoryMsgs.quality, 3),
   };
 
-  const sys = `${FACTORY_PHILOSOPHY}
+  // 영역 12-AP: 분할 병렬 호출 (옵션 E — 504 timeout 근본 조치)
+  // 1회(max_tokens 3500) → 2회 병렬 (인사이트 1500 + 액션 1800), 각 12~16초 → 26초 안에 완료
+  // Sonnet 유지, 깊이 유지, max_tokens 축소로 안전 마진 추가
+
+  // 인사이트 전용 시스템 프롬프트 (6번만)
+  const sysInsights = `${FACTORY_PHILOSOPHY}
 
 당신은 AZS 배터리 공장의 시니어 엔지니어로서, 페르소나 논의 결과 + PE 큐레이션 + 통계를 바탕으로
-보고서의 6번 "가장 주목할 사항"과 7번 "액션 후속 사항"을 작성합니다.${kbText}
+보고서의 6번 "가장 주목할 사항"만 작성합니다.${kbText}
 
 ${focus}
 
-[★ 영역 12 — 페르소나 4축 합의 활용 강조]
-페르소나 사회자 종합은 다음 4축으로 정리되어 있습니다 (방식 나):
-  1) 근본원인_합의 — root cause에 대한 합의
-  2) 조치안_평가_합의 — 기존 조치의 적절성 평가
-  3) 개선안_합의 — 향후 개선 방향
-  4) 재발방지책_합의 — 장기 재발 방지
+[★ 영역 12 — 페르소나 4축 합의 활용]
+페르소나 사회자 종합은 다음 4축으로 정리되어 있습니다:
+  1) 근본원인_합의 / 2) 조치안_평가_합의 / 3) 개선안_합의 / 4) 재발방지책_합의
 
-★ 인사이트(6번)와 액션(7번) 작성 시 위 4축을 다음과 같이 활용:
-  - 6번 인사이트의 근거(evidence)는 "[설비명] 근본원인_합의" 또는 "[설비명] 충돌점" 형태로 명시
-  - 7번 액션은 사회자 "개선안_합의"와 "재발방지책_합의"에서 직접 도출 (P0/P1/P2 분류)
-  - "충돌점"이 있는 이슈는 "가설-검증필요" confidence + "추가 논의 필요" 액션으로 기재
+★ 6번 인사이트의 근거(evidence)는 "[설비명] 근본원인_합의" 또는 "[설비명] 충돌점" 형태로 명시
+★ "충돌점"이 있는 이슈는 "가설-검증필요" confidence로 기재
 
 [★★★ 영역 12-AI1 — 사건 단위 디테일 작성 (가장 중요) ★★★]
 6번 인사이트는 **개념적 통계가 아니라 구체적 사건 단위**로 작성하세요.
 
 ❌ 나쁜 예 (개념적, 통계만):
   "STK-4호기 다발 부동 — 설비 정비 품질 악화 신호"
-  "Ejector 타임아웃 & Servo Fault 반복 — 근본조치 미완"
 
 ✅ 좋은 예 (구체적, 시각·분·인과 명시):
-  "STK-4-B1 Stack Table R Servo 47분 간격 2회 발생: 14:17 Servo Forward Over Run → 2nd PnP(+) 충돌, 15:42 Servo Total Fault → Servo R 자체 교체. 1차 조치(homing/tunning)로 해결 안 됨, servo 자체 결함 가능성"
-  "STK-3-C4 Heat Press 영역 8분 간격 2회: 04:57 cable loose, 05:38 mechanical interference. 두 이슈가 timing fault로 연관 가능성"
+  "STK-4-B1 Stack Table R Servo 47분 간격 2회 발생: 14:17 Servo Forward Over Run → 2nd PnP(+) 충돌, 15:42 Servo Total Fault → Servo R 자체 교체"
   "STK-3-B2 Overhang — 10개 파라미터 동시 변경 후 Agam 매니저 직접 개입 (Gearbox 교체 deep investigation 지시)"
 
 ★ 입력 데이터의 conditionChangeGroups, recurringSameEquipment, raw 메시지를 활용해
   시각, 호기명, 부품명, 분 수치, 매니저 지시 등 구체적 사실을 포함하세요.
 
-[★ 7번 액션 — P0 우선순위 명시 (가장 중요)]
-P0 (안전·환경, 매니저 직접 지시, horizontal deployment) 액션을 반드시 포함하세요.
-다음 패턴은 P0:
-  - 매니저 직접 지시 사항 (예: "Agam 매니저 → Gearbox 교체 deep investigation")
-  - 동일 호기 짧은 간격 재발 → horizontal deployment (예: "Servo R 31137 single turn fault 점검")
-  - mechanical interference 의심 → 합동 조사
-
-[환각 방지 규칙 — 매우 중요]
-- 각 인사이트와 액션에 confidence 라벨 (확실/가설-검증필요)을 반드시 명시
-- 가설(검증 필요)인 경우, 어느 데이터에서 도출했는지 근거(evidence) 명시
-- 데이터로 확실히 뒷받침되지 않는 인과 추론은 반드시 "가설-검증필요"로 표기
-- 알려지지 않은 과거 사례를 추측해서 만들지 마세요 — 직접 데이터에 없으면 언급 금지
-
-[7번 P0/P1/P2 분류 기준]
-- P0: 매니저 직접 지시, 안전·환경 키워드, horizontal deployment, mechanical interference 합동 조사
-- P1: 미해결 이슈, root cause 미파악, 4시간+ 부동, 예방 교체 cycle 표준화
-- P2: 모니터링, 일정 협의, 단일 설비 단발 이슈, 1시간 이하
+[환각 방지 규칙]
+- 각 인사이트에 confidence 라벨 (확실/가설-검증필요)을 반드시 명시
+- 가설인 경우 어느 데이터에서 도출했는지 evidence 명시
+- 알려지지 않은 과거 사례를 추측해서 만들지 마세요
 
 [필수 출력 - JSON만, 다른 텍스트 금지]
 {
@@ -2709,7 +2694,45 @@ P0 (안전·환경, 매니저 직접 지시, horizontal deployment) 액션을 �
       "confidence": "확실 또는 가설-검증필요",
       "evidence": "어느 이슈/데이터에서 도출했는지"
     }
-  ],
+  ]
+}
+
+[규칙]
+- section6_insights: **5~6개** (사용자 레포트와 동일 분량)
+- 각 인사이트는 bulletPoints 1~3개
+- ★ 인사이트는 통계 카테고리가 아닌 **사건 단위**로 작성 (시각, 호기, 분, 부품, 인과)
+- 데이터 근거 없는 추측은 절대 만들지 마세요`;
+
+  // 액션 전용 시스템 프롬프트 (7번만)
+  const sysActions = `${FACTORY_PHILOSOPHY}
+
+당신은 AZS 배터리 공장의 시니어 엔지니어로서, 페르소나 논의 결과 + PE 큐레이션 + 통계를 바탕으로
+보고서의 7번 "액션 후속 사항"만 작성합니다.${kbText}
+
+${focus}
+
+[★ 영역 12 — 페르소나 4축 합의 활용]
+★ 7번 액션은 사회자 "개선안_합의"와 "재발방지책_합의"에서 직접 도출 (P0/P1/P2 분류)
+★ "충돌점"이 있는 이슈는 "추가 논의 필요" 액션으로 기재
+
+[★ 7번 액션 — P0 우선순위 명시 (가장 중요)]
+P0 (안전·환경, 매니저 직접 지시, horizontal deployment) 액션을 반드시 포함하세요.
+다음 패턴은 P0:
+  - 매니저 직접 지시 사항 (예: "Agam 매니저 → Gearbox 교체 deep investigation")
+  - 동일 호기 짧은 간격 재발 → horizontal deployment (예: "Servo R 31137 single turn fault 점검")
+  - mechanical interference 의심 → 합동 조사
+
+[7번 P0/P1/P2 분류 기준]
+- P0: 매니저 직접 지시, 안전·환경 키워드, horizontal deployment, mechanical interference 합동 조사
+- P1: 미해결 이슈, root cause 미파악, 4시간+ 부동, 예방 교체 cycle 표준화
+- P2: 모니터링, 일정 협의, 단일 설비 단발 이슈, 1시간 이하
+
+[환각 방지 규칙]
+- 각 액션에 confidence 라벨 (확실/가설-검증필요)을 반드시 명시
+- 가설인 경우 어느 데이터에서 도출했는지 evidence 명시
+
+[필수 출력 - JSON만, 다른 텍스트 금지]
+{
   "section7_actions": [
     {
       "priority": "P0/P1/P2",
@@ -2722,45 +2745,94 @@ P0 (안전·환경, 매니저 직접 지시, horizontal deployment) 액션을 �
 }
 
 [규칙]
-- section6_insights: **5~6개** (사용자 레포트와 동일 분량)
 - section7_actions: **P0 2~3개 + P1 3~4개 + P2 2~3개 = 총 7~10개** (P0 반드시 포함)
-- 각 인사이트는 bulletPoints 1~3개
-- ★ 인사이트는 통계 카테고리가 아닌 **사건 단위**로 작성 (시각, 호기, 분, 부품, 인과)
-- 데이터 근거 없는 추측은 절대 만들지 마세요
-- confidence는 데이터로 명확히 검증된 것만 "확실", 추론/가설은 "가설-검증필요"`;
+- 데이터 근거 없는 추측은 절대 만들지 마세요`;
 
+  // 공통 user message
   const userMsg = `[PE 큐레이션 요약]
 ${JSON.stringify(briefingSummary, null, 1)}
 
 [페르소나 논의 결과 — 사회자 4축 합의 (영역 12 방식 나)]
-${moderatorSummary.length > 0 ? JSON.stringify(moderatorSummary, null, 1) : "(논의된 이슈 없음 — 큐레이션만으로 인사이트 도출)"}
+${moderatorSummary.length > 0 ? JSON.stringify(moderatorSummary, null, 1) : "(논의된 이슈 없음 — 큐레이션만으로 도출)"}
 
 [★ 영역 12-AI1: raw 핵심 메시지 (사건 단위 디테일 추출용)]
 ${JSON.stringify(rawEventContext, null, 1)}
-※ 위 process_change_top5에 매니저 지시 ("hadehh, please do investigation deeply ... gearbox change")나
+※ 위 process_change_top5에 매니저 지시 ("please do investigation deeply ... gearbox change")나
    동일 호기 다중 파라미터 변경 같은 정보가 있을 수 있음. 사건 단위 디테일에 활용.
 
 [5-카테고리 통계]
 장기부동: ${counts.LONG_DOWNTIME || 0} / 반복: ${counts.HIGH_FREQUENCY || 0} / 조건변경: ${counts.CONDITION_CHANGE || 0} / 테스트PM: ${counts.TEST_PM || 0} / 품질NG: ${counts.QUALITY_NG || 0}
 
-위 데이터를 바탕으로:
-★ 6번 "가장 주목할 사항" 5~6건 — **사건 단위** (시각·호기·분·부품·인과 구체 명시)
-★ 7번 "액션 후속 사항" 총 7~10건 — **P0 2~3개 반드시 포함** (매니저 직접 지시, horizontal deployment 등)
 환각 방지를 위해 confidence와 evidence를 반드시 명시하세요.`;
 
+  // ★ 12-AP: 두 호출을 Promise.all로 병렬 실행
+  const t0 = Date.now();
   try {
     await new Promise(r => setTimeout(r, 500));
-    const raw = await callClaudeRaw(sys, userMsg, {
-      model: MODEL_REASONING,  // ★ AI1: Haiku → Sonnet (사건 단위 디테일에 추론력 필요)
-      max_tokens: 3500,  // P0 포함 7~10개 액션 + 5~6개 인사이트 풀 작성
-    });
-    const parsed = safeJSON(raw);
 
-    // 룰 검증 (Z 옵션) — LLM 분류 결과를 안전 룰로 보정
-    const insights = Array.isArray(parsed.section6_insights) ? parsed.section6_insights : [];
-    const actions = Array.isArray(parsed.section7_actions) ? parsed.section7_actions : [];
+    const [insightsResult, actionsResult] = await Promise.allSettled([
+      // 호출 A: 6번 인사이트 (max_tokens 1500 — 5~6개 인사이트 풀 작성)
+      callClaudeRaw(sysInsights, userMsg, {
+        model: MODEL_REASONING,
+        max_tokens: 1500,
+      }),
+      // 호출 B: 7번 액션 (max_tokens 1800 — P0 포함 7~10개 액션 풀 작성)
+      callClaudeRaw(sysActions, userMsg, {
+        model: MODEL_REASONING,
+        max_tokens: 1800,
+      }),
+    ]);
 
-    // P0/P1/P2 룰 검증
+    const elapsed = ((Date.now() - t0) / 1000).toFixed(1);
+    console.log(`[6/7번 분할 병렬] 완료 (${elapsed}초) — 인사이트 ${insightsResult.status} / 액션 ${actionsResult.status}`);
+
+    // 인사이트 파싱
+    let insights = [];
+    if (insightsResult.status === "fulfilled") {
+      try {
+        const parsed = safeJSON(insightsResult.value);
+        insights = Array.isArray(parsed.section6_insights) ? parsed.section6_insights : [];
+      } catch (e) {
+        console.error(`[6번 인사이트 파싱 실패]`, e?.message || e);
+        if (e._rawSnippet) console.error(`  ↳ raw 첫 300자: ${e._rawSnippet}`);
+      }
+    } else {
+      console.error(`[6번 인사이트 호출 실패]`, insightsResult.reason?.message || insightsResult.reason);
+    }
+
+    // 액션 파싱
+    let actions = [];
+    if (actionsResult.status === "fulfilled") {
+      try {
+        const parsed = safeJSON(actionsResult.value);
+        actions = Array.isArray(parsed.section7_actions) ? parsed.section7_actions : [];
+      } catch (e) {
+        console.error(`[7번 액션 파싱 실패]`, e?.message || e);
+        if (e._rawSnippet) console.error(`  ↳ raw 첫 300자: ${e._rawSnippet}`);
+      }
+    } else {
+      console.error(`[7번 액션 호출 실패]`, actionsResult.reason?.message || actionsResult.reason);
+    }
+
+    // 둘 다 실패면 룰 폴백
+    if (insights.length === 0 && actions.length === 0) {
+      console.warn(`[6/7번] 둘 다 실패 — 룰 폴백 사용`);
+      return buildFallbackInsightsAndActions(curation, taggedResult);
+    }
+
+    // 한 쪽만 실패 — 나머지는 룰로 보완
+    if (insights.length === 0) {
+      console.warn(`[6번] 인사이트 실패 — 액션만 LLM, 인사이트는 룰 폴백`);
+      const fallback = buildFallbackInsightsAndActions(curation, taggedResult);
+      insights = fallback.section6_insights || [];
+    }
+    if (actions.length === 0) {
+      console.warn(`[7번] 액션 실패 — 인사이트만 LLM, 액션은 룰 폴백`);
+      const fallback = buildFallbackInsightsAndActions(curation, taggedResult);
+      actions = fallback.section7_actions || [];
+    }
+
+    // P0/P1/P2 룰 검증 (기존 로직 유지)
     const validatedActions = actions.map(a => {
       const text = `${a.action || ""} ${a.context || ""} ${a.evidence || ""}`.toLowerCase();
       // 룰 1: safety/환경/9시간+ → P0 강제
@@ -2783,7 +2855,7 @@ ${JSON.stringify(rawEventContext, null, 1)}
       section7_actions: validatedActions,
     };
   } catch (e) {
-    console.error("[6/7번 생성 실패]", e);
+    console.error("[6/7번 생성 전체 실패]", e);
     return buildFallbackInsightsAndActions(curation, taggedResult);
   }
 }

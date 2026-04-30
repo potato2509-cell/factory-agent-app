@@ -2072,30 +2072,43 @@ JSON만 출력:
   return safeJSON(raw);
 }
 
-// ─── 6-1. 사회자 3단계 폴백 통합 함수 ───────────────────────────────────────────
+// ─── 6-1. 사회자 폴백 통합 함수 (영역 12-AL: D3-b 2회 retry + D4-b 4축 stitching) ──
+// 단계: 1차 정상 → 1초 대기 → 정상 재시도 → 3초 대기 → 단순 프롬프트 → 코드 stitching
 async function moderateWithFallback(mode, issueCtx, opinions) {
+  const callPrimary = async () => {
+    if (mode === "DEEP")     return await moderateDeep(issueCtx, opinions);
+    if (mode === "STANDARD") return await moderateStandard(issueCtx, opinions);
+    if (mode === "LITE")     return await moderateLite(issueCtx);
+    throw new Error(`Unknown mode: ${mode}`);
+  };
+
   // 1차: 정상 호출
   try {
-    let primary;
-    if (mode === "DEEP")     primary = await moderateDeep(issueCtx, opinions);
-    else if (mode === "STANDARD") primary = await moderateStandard(issueCtx, opinions);
-    else if (mode === "LITE")     primary = await moderateLite(issueCtx);
-    else throw new Error(`Unknown mode: ${mode}`);
-
+    const primary = await callPrimary();
     return { ...primary, _fallback_level: "primary" };
   } catch (e1) {
-    console.warn(`[Moderator 1차 실패] ${mode}:`, e1.message);
+    console.warn(`[Moderator 1차 실패] ${mode}: ${e1.message} — 1초 후 retry 1`);
 
-    // 2차: 단순 프롬프트로 재시도
+    // retry 1: 1초 대기 후 동일 정상 호출 재시도
+    await new Promise(r => setTimeout(r, 1000));
     try {
-      const retry = await moderateRetrySimple(mode, issueCtx, opinions);
-      return { ...retry, _fallback_level: "retry" };
+      const r1 = await callPrimary();
+      return { ...r1, _fallback_level: "retry_primary" };
     } catch (e2) {
-      console.warn(`[Moderator 2차 실패] ${mode}:`, e2.message);
+      console.warn(`[Moderator retry 1 실패] ${mode}: ${e2.message} — 3초 후 retry 2 (단순)`);
 
-      // 3차: 코드 레벨 자동 생성 (API 호출 없음)
-      const codeFallback = codeFallbackModerator(mode, opinions);
-      return { ...codeFallback, _fallback_level: "code_fallback" };
+      // retry 2: 3초 대기 후 단순 프롬프트
+      await new Promise(r => setTimeout(r, 3000));
+      try {
+        const r2 = await moderateRetrySimple(mode, issueCtx, opinions);
+        return { ...r2, _fallback_level: "retry_simple" };
+      } catch (e3) {
+        console.warn(`[Moderator retry 2 실패] ${mode}: ${e3.message} — 코드 stitching 사용`);
+
+        // 최종: 코드 레벨 stitching (4축별 페르소나 의견 모음)
+        const stitched = codeFallbackModerator(mode, opinions);
+        return { ...stitched, _fallback_level: "code_stitching" };
+      }
     }
   }
 }
@@ -2141,9 +2154,9 @@ async function moderateRetrySimple(mode, issueCtx, opinions) {
   return safeJSON(raw);
 }
 
-// 3차 폴백 - 코드 레벨 자동 생성 (페르소나 의견을 직접 합쳐 결과 생성)
+// 최종 폴백 - 코드 레벨 4축 stitching (영역 12-AL D4-b: 모든 페르소나 의견을 4축별로 모음)
 function codeFallbackModerator(mode, opinions) {
-  // 페르소나별 의견 간단 정리 (영역 12: 새 필드 + 옛 필드 호환)
+  // 페르소나별 의견 정리 (영역 12: 새 필드 + 옛 필드 호환)
   const opinionsByPersona = opinions.map(o => {
     const p = PERSONAS[o.persona];
     const op = o.opinion || {};
@@ -2155,6 +2168,7 @@ function codeFallbackModerator(mode, opinions) {
       조치안_평가: op["조치안_평가"] || op["기존조치_평가"] || "해당없음",
       개선안: op["개선안"] || op["대책"] || "(의견 없음)",
       재발방지책: op["재발방지책"] || "(의견 없음)",
+      say: op.say || "",
     };
   });
 
@@ -2162,39 +2176,43 @@ function codeFallbackModerator(mode, opinions) {
   const stances = opinionsByPersona.map(o => o.stance);
   const hasConflict = stances.includes("반대") || stances.includes("부분동의");
 
-  if (mode === "DEEP") {
-    const 근본원인_합의 = opinionsByPersona[0]?.근본원인 || "분석 미수행";
-    const 조치안_평가_합의 = opinionsByPersona[0]?.조치안_평가 || "평가 미수행";
-    const 개선안_합의 = opinionsByPersona[0]?.개선안 || "권고 없음";
-    const 재발방지책_합의 = opinionsByPersona[0]?.재발방지책 || "수립 필요";
-    const 충돌점 = hasConflict
-      ? `반대/부분동의 ${stances.filter(s => s === "반대" || s === "부분동의").length}건`
-      : "없음";
-    const consensus = `${opinionsByPersona.length}명 분석 — 자동 종합 (사회자 호출 실패)`;
+  // ★ D4-b 핵심: 4축별로 모든 페르소나 의견을 [라벨: 의견] 형식으로 합치기
+  const stitchAxis = (axisKey) => {
+    const parts = opinionsByPersona
+      .filter(o => o[axisKey] && o[axisKey] !== "(의견 없음)" && o[axisKey] !== "해당없음")
+      .map(o => `${o.label}[${String(o[axisKey]).slice(0, 120)}]`);
+    if (parts.length === 0) return "(의견 없음 — 사회자 미합의, 자동 stitching)";
+    return `${parts.join(" / ")} (사회자 미합의 — 자동 stitching)`;
+  };
 
+  if (mode === "DEEP") {
     return {
-      근본원인_합의, 조치안_평가_합의, 개선안_합의, 재발방지책_합의,
-      충돌점,
-      추가_논의_필요: "★ 사회자 호출 실패 — 페르소나 개별 의견 직접 검토 필요",
-      consensus,
+      근본원인_합의: stitchAxis("근본원인"),
+      조치안_평가_합의: stitchAxis("조치안_평가"),
+      개선안_합의: stitchAxis("개선안"),
+      재발방지책_합의: stitchAxis("재발방지책"),
+      충돌점: hasConflict
+        ? `반대/부분동의 ${stances.filter(s => s === "반대" || s === "부분동의").length}건 — 자동 감지 (사회자 미합의)`
+        : "없음 (자동 판정)",
+      추가_논의_필요: "★ 사회자 LLM 호출 실패 — 페르소나 4축 의견을 자동 stitching으로 표시. 정확한 합의는 재실행 권장",
+      consensus: `${opinionsByPersona.length}명 의견 자동 stitching: ` + opinionsByPersona.map(o => `${o.label} ${o.stance}`).join(" / ") + " (사회자 호출 실패)",
     };
   }
 
   if (mode === "STANDARD") {
-    const summary = `${opinionsByPersona.length}명 의견 자동 정리 (사회자 호출 실패)`;
     const actions = opinionsByPersona.map(o => ({
-      action: o.개선안.slice(0, 60),
+      action: (o.개선안 || "").slice(0, 80),
       owner: o.code,
       priority: o.stance === "반대" ? "낮음" : "중간",
       duration: "검토 필요",
-      type: "개선안",
-    }));
+      type: "개선안 (자동)",
+    })).filter(a => a.action);
     return {
-      근본원인_합의: opinionsByPersona[0]?.근본원인 || "-",
-      조치안_평가_합의: opinionsByPersona[0]?.조치안_평가 || "-",
+      근본원인_합의: stitchAxis("근본원인"),
+      조치안_평가_합의: stitchAxis("조치안_평가"),
       actions,
-      needsMore: "★ 사회자 호출 실패 — 페르소나 의견 직접 검토 필요",
-      summary,
+      needsMore: "★ 사회자 LLM 호출 실패 — 페르소나 4축 자동 stitching으로 표시",
+      summary: `${opinionsByPersona.length}명 의견 자동 정리 (사회자 호출 실패)`,
     };
   }
 
@@ -3294,7 +3312,178 @@ export default function App() {
     finally { setRunning(false); }
   };
 
-  // ─── ★ 영역 11-H: HTML 다운로드 (메인 1~7번 + 유첨 page-break) ────────────────
+  // ─── ★ 영역 12-AK: Teams 자동송부 인프라 (Phase E 사양 14.5 / 14.3 / 14.4) ────────
+  // α: 수동 버튼 (Phase B/C/D 독립 — 즉시 동작)
+  // β: 알람 룰 4종 골격 (Phase B 후 활성화)
+  // γ: 일일 레포트 골격 (Phase D 후 활성화)
+  // 보안: Webhook URL은 클라이언트 미보유 — Apps Script Properties Service 경유
+
+  // 12-AK-1: 메인 레포트 → 단순 텍스트 변환 (Q3=a, 최소 변환)
+  const reportToTeamsText = () => {
+    if (!minutes) return "";
+    const cur = minutes.curation || {};
+    const insights = minutes.insights || [];
+    const actions = minutes.actions || [];
+    const tagged = minutes.tagged || { issues: [], counts: {} };
+    const issuesCount = (tagged.issues || []).length;
+    const long30 = (cur.longDowntime || []).filter(it => Number(it.duration || it.durMin || 0) >= 30);
+    const lines = [];
+
+    // 헤더
+    lines.push(`📊 *${minutes.title || "AZS Factory 일일 이슈 레포트"}*`);
+    lines.push(`📅 ${minutes.date || "-"}`);
+    lines.push("");
+
+    // 핵심 요약
+    if (cur.summary_text) {
+      lines.push(`📋 *핵심 요약*`);
+      lines.push(cur.summary_text);
+      lines.push("");
+    }
+    if ((cur.criticalSummary || []).length > 0) {
+      lines.push(`⚠️ *중요 사항*`);
+      cur.criticalSummary.forEach(c => lines.push(`• ${c}`));
+      lines.push("");
+    }
+
+    // 통계
+    lines.push(`📈 *통계*`);
+    lines.push(`• 전체 부동: ${issuesCount}건`);
+    lines.push(`• 30분+ 장기부동: ${long30.length}건`);
+    if ((cur.recurringByCategory || []).length > 0) lines.push(`• 반복 카테고리: ${cur.recurringByCategory.length}개`);
+    if ((cur.conditionChangeGroups || []).length > 0) lines.push(`• 조건 변경 그룹: ${cur.conditionChangeGroups.length}개`);
+    lines.push("");
+
+    // TOP 5 (score 기준, scored 결과 → tagged.issues에서 score 보유)
+    const scoredIssues = (tagged.issues || []).filter(it => typeof it.score === "number").sort((a, b) => b.score - a.score).slice(0, 5);
+    if (scoredIssues.length > 0) {
+      lines.push(`🚨 *핵심 이슈 TOP ${scoredIssues.length}*`);
+      scoredIssues.forEach((it, i) => {
+        const eq = it.eq || it.equipment || "?";
+        const prob = (it.problem || it.text || "").slice(0, 60);
+        const dur = it.durMin || it.duration || 0;
+        lines.push(`${i + 1}. [${it.score}점] ${eq} — ${prob}${dur ? ` (${dur}분)` : ""}`);
+      });
+      lines.push("");
+    }
+
+    // 인사이트
+    if (insights.length > 0) {
+      lines.push(`💡 *주목할 사항*`);
+      insights.slice(0, 5).forEach((ins, i) => {
+        const text = typeof ins === "string" ? ins : (ins.text || ins.content || JSON.stringify(ins));
+        lines.push(`${i + 1}. ${text.slice(0, 200)}`);
+      });
+      lines.push("");
+    }
+
+    // 액션 (P0 위주)
+    const p0Actions = actions.filter(a => a.priority === "P0");
+    const p1Actions = actions.filter(a => a.priority === "P1");
+    if (p0Actions.length > 0 || p1Actions.length > 0) {
+      lines.push(`📌 *액션 후속 (P0/P1)*`);
+      [...p0Actions, ...p1Actions].slice(0, 6).forEach(a => {
+        lines.push(`• [${a.priority}] ${a.action} ${a.context ? `— ${a.context}` : ""}`);
+      });
+      lines.push("");
+    }
+
+    lines.push(`— ESHM AI 공유방 자동 발송 · ${new Date().toLocaleString("ko-KR")}`);
+    return lines.join("\n");
+  };
+
+  // 12-AK-2: Teams 발송 핸들러 (Apps Script proxy POST)
+  const [teamsSending, setTeamsSending] = useState(false);
+  const [teamsResult, setTeamsResult] = useState(null);  // {ok, msg}
+  const sendToTeams = async () => {
+    if (!minutes || teamsSending) return;
+    const APPS_SCRIPT_URL = import.meta.env.VITE_APPS_SCRIPT_URL || "";
+    const SHARED_SECRET = import.meta.env.VITE_TEAMS_SHARED_SECRET || "";
+    if (!APPS_SCRIPT_URL) {
+      setTeamsResult({ ok: false, msg: "VITE_APPS_SCRIPT_URL 환경변수 미설정 — SETUP.md 참조" });
+      setTimeout(() => setTeamsResult(null), 5000);
+      return;
+    }
+    setTeamsSending(true);
+    setTeamsResult(null);
+    try {
+      const text = reportToTeamsText();
+      const payload = {
+        action: "send_report",
+        secret: SHARED_SECRET,
+        text,
+        title: minutes.title || "AZS 일일 이슈 레포트",
+        date: minutes.date || "",
+        meta: {
+          issuesCount: (minutes.tagged?.issues || []).length,
+          insightsCount: (minutes.insights || []).length,
+          actionsCount: (minutes.actions || []).length,
+        },
+      };
+      const res = await fetch(APPS_SCRIPT_URL, {
+        method: "POST",
+        // Apps Script Web App: text/plain로 전송 (CORS preflight 우회)
+        headers: { "Content-Type": "text/plain;charset=utf-8" },
+        body: JSON.stringify(payload),
+      });
+      const data = await res.json().catch(() => ({}));
+      if (res.ok && data.ok) {
+        setTeamsResult({ ok: true, msg: "✅ Teams 채널에 발송 완료" });
+      } else {
+        setTeamsResult({ ok: false, msg: `❌ 발송 실패: ${data.error || res.status}` });
+      }
+    } catch (e) {
+      setTeamsResult({ ok: false, msg: `❌ 네트워크 오류: ${e?.message || e}` });
+    } finally {
+      setTeamsSending(false);
+      setTimeout(() => setTeamsResult(null), 6000);
+    }
+  };
+
+  // 12-AK-3: 알람 룰 4종 골격 (β — Phase B 실시간 데이터 후 활성화)
+  // 입력: 신규 메시지 1건 + 현재 누적 부동 상태
+  // 출력: 발송할 알람 텍스트 배열 (없으면 빈 배열)
+  // eslint-disable-next-line no-unused-vars
+  const evaluateAlarmRules = (msg, contextState = {}) => {
+    if (!msg || typeof msg.text !== "string") return [];
+    const alarms = [];
+    const text = msg.text.toLowerCase();
+
+    // 룰 1: 안전·환경 키워드
+    const SAFETY_KEYWORDS = ["위험", "사고", "fire", "환경", "safety", "danger", "emergency", "injury"];
+    if (SAFETY_KEYWORDS.some(kw => text.includes(kw))) {
+      alarms.push({ rule: "safety", level: "🚨", text: `🚨 안전·환경 키워드 감지\n${msg.text.slice(0, 300)}` });
+    }
+    // 룰 2: 장기부동 60분↑
+    const dur = Number(msg.durMin || msg.duration || 0);
+    if (dur >= 60) {
+      alarms.push({ rule: "long_downtime", level: "🚨", text: `🚨 장기부동 ${dur}분\n${msg.equipment || "?"} — ${msg.problem || msg.text}` });
+    }
+    // 룰 3: Full Stop
+    if (/full[\s_]?stop/i.test(msg.text)) {
+      alarms.push({ rule: "full_stop", level: "🚨", text: `🚨 Full Stop 발생\n${msg.text.slice(0, 300)}` });
+    }
+    // 룰 4: 점수 임계값 (잠정 20, Phase E 시작 시 시뮬레이션 후 확정)
+    const SCORE_THRESHOLD = 20;
+    if (typeof msg.score === "number" && msg.score >= SCORE_THRESHOLD) {
+      alarms.push({ rule: "high_score", level: "🚨", text: `🚨 고위험 점수 ${msg.score}점\n${msg.equipment || "?"} — ${msg.problem || msg.text}` });
+    }
+    return alarms;
+  };
+
+  // 12-AK-4: 일일 레포트 텍스트 변환 (γ — Phase D Sheets 데이터 후 활성화)
+  // cron 07:00 호출용 — Apps Script 측에서 자체 분석 후 호출하므로 이 함수는 React 측 미호출
+  // 골격만 유지 (스펙 가이드 역할)
+  // eslint-disable-next-line no-unused-vars
+  const composeDailyReport = (analysisResult) => {
+    // analysisResult: Phase D에서 Sheets 조회 후 분석한 결과 (현재 minutes와 동일 구조 가정)
+    // 향후 Apps Script 또는 Netlify Function이 React 분석 로직을 호출 → 이 함수에 주입 → 텍스트 반환
+    if (!analysisResult) return "";
+    // 임시: reportToTeamsText와 동일 로직 재사용 가능 (Phase D 시점에 분기)
+    return "[Phase D 후 활성화] 일일 레포트 자동 생성 골격";
+  };
+
+  // ─── ★ 영역 11-H: HTML 다운로드 (메인 1~7번) ──────────────────────────────────
   const downloadHtml = () => {
     if (!minutes) return;
     const title = minutes.title || "AZS Factory 일일 이슈 레포트";
@@ -3308,9 +3497,30 @@ export default function App() {
     // 헬퍼: HTML 이스케이프
     const esc = (s) => String(s || "").replace(/&/g, "&amp;").replace(/</g, "&lt;").replace(/>/g, "&gt;").replace(/"/g, "&quot;");
 
+    // ★ 영역 12-AL: 중복 제거 — 동일 discussion이 여러 섹션에 표시되지 않도록 Set으로 추적
+    // 우선순위: 1번 장기부동 > 2번 큰 그룹 > 2번 작은 그룹 > 3,4번 영역 > 5번 품질 NG > 7번 액션
+    const printedDiscussionIds = new Set();
+    const discussionIdOf = (d) => {
+      if (!d || !d.issue) return null;
+      const eq = d.issue.eq || "?";
+      const dur = d.issue.durMin || 0;
+      const text = (d.issue.problem || d.issue.text || "").slice(0, 30);
+      return `${eq}|${dur}|${text}`;
+    };
+    const isAlreadyPrinted = (d) => {
+      const id = discussionIdOf(d);
+      return id && printedDiscussionIds.has(id);
+    };
+    const markPrinted = (d) => {
+      const id = discussionIdOf(d);
+      if (id) printedDiscussionIds.add(id);
+    };
+
     // ★ Phase 2: 페르소나 대화 HTML 생성 헬퍼 (좌우 번갈아 + 색상 + 인용구 + 사회자 종합)
+    // 12-AL: 표시 즉시 markPrinted 호출 → 중복 표시 방지
     const buildPersonaConvHtml = (matched) => {
       if (!matched) return "";
+      markPrinted(matched);  // ★ 12-AL: 표시 추적
       const opinions = matched.opinions || [];
       const m = matched.moderator || {};
       const mode = matched.modeInfo?.mode || "?";
@@ -3539,8 +3749,7 @@ export default function App() {
       </div>
     ` : "";
 
-    // ★ 영역 12-X6 (1): 2~5번 섹션 매칭 페르소나 논의 헬퍼 ─────────────────
-    // 카테고리별 / 설비별 매칭 — equipments 배열에서 설비명을 추출해 discussions와 매칭
+    // ★ 영역 12-X6 (1) → 12-AL: 2~5번 섹션 매칭 페르소나 논의 헬퍼 (그룹 단위 통합) ───
     const findDiscussionsByEquipments = (equipments) => {
       const ds = minutes.discussions || [];
       if (!ds.length || !equipments?.length) return [];
@@ -3552,12 +3761,69 @@ export default function App() {
       if (!ds.length || !equipment) return [];
       return ds.filter(d => d.issue?.eq === equipment);
     };
-    const buildMultiplePersonaConvs = (matches) => {
+
+    // ★ 12-AL D2-c: 그룹 단위 표시 — 미표시 멤버 중 가장 부동시간 긴 1개를 대표로 표시
+    // + 그룹의 다른 멤버는 "이 그룹의 다른 N건은 [위치] 참조" 안내만 추가
+    const buildGroupRepresentativeConv = (matches, groupLabel = "이 그룹") => {
       if (!matches?.length) return "";
-      return matches.map(m => buildPersonaConvHtml(m)).join("");
+      // 미표시 멤버만 필터
+      const unprinted = matches.filter(m => !isAlreadyPrinted(m));
+      // 이미 표시된 멤버 수
+      const alreadyShown = matches.length - unprinted.length;
+
+      if (unprinted.length === 0) {
+        // 전부 다른 섹션에서 표시됨 → 안내만
+        return `<div style="margin-top:8px;padding:8px 12px;background:#f5f5f5;border-left:3px solid #94a3b8;border-radius:4px;font-size:0.88em;color:#64748b;">📌 ${esc(groupLabel)}의 페르소나 논의 ${matches.length}건은 모두 1번 장기부동 또는 상위 섹션에 표시되었습니다.</div>`;
+      }
+
+      // 대표 1개: 미표시 중 가장 부동시간 긴 것
+      const rep = unprinted.sort((a, b) => (b.issue?.durMin || 0) - (a.issue?.durMin || 0))[0];
+      const repEq = rep.issue?.eq || "?";
+      const repDur = rep.issue?.durMin || 0;
+
+      // 미표시 나머지도 markPrinted 처리 (이번 그룹에서 다 다뤘다고 간주)
+      unprinted.forEach(m => { if (m !== rep) markPrinted(m); });
+
+      // 안내 메시지
+      const noticeParts = [];
+      if (matches.length > 1) {
+        noticeParts.push(`이 ${esc(groupLabel)}는 총 ${matches.length}건 (대표: ${esc(repEq)} ${repDur}분)`);
+      }
+      if (alreadyShown > 0) {
+        noticeParts.push(`${alreadyShown}건은 1번 장기부동 또는 상위 섹션에 표시됨`);
+      }
+      if (unprinted.length > 1) {
+        const others = unprinted.filter(m => m !== rep).map(m => `${m.issue?.eq}(${m.issue?.durMin}분)`).join(", ");
+        noticeParts.push(`다른 ${unprinted.length - 1}건은 동일 패턴으로 간주: ${others}`);
+      }
+
+      const noticeHtml = noticeParts.length > 0
+        ? `<div style="margin-bottom:8px;padding:6px 10px;background:#fffbe6;border-left:3px solid #fbbf24;border-radius:4px;font-size:0.87em;color:#92400e;">📋 ${noticeParts.join(" · ")}</div>`
+        : "";
+
+      return noticeHtml + buildPersonaConvHtml(rep);
     };
 
-    // 2번 발생빈도 — 카테고리별 매칭 페르소나 논의 통합
+    // 옛 호환 (단일 표시 — 1번 장기부동에서만 사용)
+    const buildMultiplePersonaConvs = (matches) => {
+      if (!matches?.length) return "";
+      // 미표시만 필터링 후 모두 표시 (3,4,5번 영역에서 사용)
+      const unprinted = matches.filter(m => !isAlreadyPrinted(m));
+      if (unprinted.length === 0) {
+        return `<div style="margin-top:6px;padding:6px 10px;background:#f5f5f5;border-left:3px solid #94a3b8;border-radius:4px;font-size:0.85em;color:#64748b;">📌 이 영역의 페르소나 논의 ${matches.length}건은 모두 상위 섹션에 표시되었습니다.</div>`;
+      }
+      return unprinted.map(m => buildPersonaConvHtml(m)).join("");
+    };
+
+    // ★ 12-AL: 그룹 정렬 — 큰 그룹 우선 (C-3), 그래야 큰 그룹의 멤버들이 작은 그룹보다 먼저 등록됨
+    const recurringByCategorySorted = [...(cur.recurringByCategory || [])]
+      .map(c => ({ ...c, _matches: findDiscussionsByEquipments(c.equipments || []) }))
+      .sort((a, b) => (b._matches?.length || 0) - (a._matches?.length || 0));
+    const recurringSameEquipmentSorted = [...(cur.recurringSameEquipment || [])]
+      .map(e => ({ ...e, _matches: findDiscussionsByEquipment(e.equipment) }))
+      .sort((a, b) => (b._matches?.length || 0) - (a._matches?.length || 0));
+
+    // 2번 발생빈도 — 카테고리별 그룹 단위 표시
     const recurringCatHtml = (cur.recurringByCategory || []).length > 0 ? `
       <h3>카테고리별</h3>
       <table>
@@ -3566,19 +3832,23 @@ export default function App() {
           ${cur.recurringByCategory.map(c => `<tr><td><b>${esc(c.category)}</b></td><td class="num"><b>${c.count}</b></td><td>${esc((c.equipments || []).join(", "))}</td></tr>`).join("")}
         </tbody>
       </table>
-      ${cur.recurringByCategory.map(c => {
-        const matches = findDiscussionsByEquipments(c.equipments || []);
+      ${recurringByCategorySorted.map(c => {
+        const matches = c._matches || [];
         if (!matches.length) return "";
-        return `<div style="margin-top:8px;padding-left:10px;border-left:3px solid #ddd;"><div style="font-size:0.88em;color:#666;margin-bottom:6px;"><b>📌 [${esc(c.category)}] 카테고리</b> 관련 페르소나 논의:</div>${buildMultiplePersonaConvs(matches)}</div>`;
+        const groupLabel = `[${c.category}] 카테고리`;
+        const groupConv = buildGroupRepresentativeConv(matches, groupLabel);
+        return `<div style="margin-top:8px;padding-left:10px;border-left:3px solid #ddd;"><div style="font-size:0.88em;color:#666;margin-bottom:6px;"><b>📌 ${esc(groupLabel)}</b> 그룹 종합 (대표 1건):</div>${groupConv}</div>`;
       }).join("")}` : "";
 
     const recurringEqHtml = (cur.recurringSameEquipment || []).length > 0 ? `
       <h3>동일 설비 다발</h3>
       <ul>${cur.recurringSameEquipment.map(e => `<li><b>${esc(e.equipment)}</b>: ${e.count}건${e.detail ? ` — ${esc(e.detail)}` : ""}</li>`).join("")}</ul>
-      ${cur.recurringSameEquipment.map(e => {
-        const matches = findDiscussionsByEquipment(e.equipment);
+      ${recurringSameEquipmentSorted.map(e => {
+        const matches = e._matches || [];
         if (!matches.length) return "";
-        return `<div style="margin-top:8px;padding-left:10px;border-left:3px solid #ddd;"><div style="font-size:0.88em;color:#666;margin-bottom:6px;"><b>📌 [${esc(e.equipment)}]</b> 관련 페르소나 논의:</div>${buildMultiplePersonaConvs(matches)}</div>`;
+        const groupLabel = `[${e.equipment}] 호기`;
+        const groupConv = buildGroupRepresentativeConv(matches, groupLabel);
+        return `<div style="margin-top:8px;padding-left:10px;border-left:3px solid #ddd;"><div style="font-size:0.88em;color:#666;margin-bottom:6px;"><b>📌 ${esc(groupLabel)}</b> 그룹 종합 (대표 1건):</div>${groupConv}</div>`;
       }).join("")}` : "";
 
     // 3번 조건 변경 — 설비별 매칭 페르소나 논의
@@ -3658,83 +3928,8 @@ export default function App() {
         }).join("")}</tbody>
       </table>` : "<p>액션 항목 없음</p>";
 
-    // 유첨 (페르소나 논의)
-    const appendixHtml = (discussions || []).map((d, i) => {
-      const mode = d.modeInfo?.mode || "";
-      const modeColor = mode === "DEEP" ? "#c0392b" : mode === "STANDARD" ? "#e67e22" : "#27ae60";
-      const consensus = d.moderator?.consensus || d.moderator?.summary || d.moderator?.supplement || "";
-      const opinions = (d.opinions || []).map(o => {
-        const p = PERSONAS[o.persona] || {};
-        const op = o.opinion || {};
-        // 영역 12: 새 필드 우선 (근본원인 / 조치안_평가 / 개선안 / 재발방지책), 옛 필드 호환
-        const fieldOrder = [
-          "stance", "previous_reference",
-          "근본원인", "조치안_평가", "개선안", "재발방지책",
-          // 옛 필드 호환
-          "현상", "원인", "대책", "기존조치_평가",
-          "observation", "recommendation", "risk",
-        ];
-        const fieldLabels = {
-          stance: "입장",
-          "previous_reference": "인용",
-          "근본원인": "근본원인",
-          "조치안_평가": "조치안 평가",
-          "개선안": "개선안",
-          "재발방지책": "재발방지책",
-          "현상": "현상 (옛)",
-          "원인": "원인 (옛)",
-          "대책": "대책 (옛)",
-          "기존조치_평가": "기존조치 평가 (옛)",
-          "observation": "관찰",
-          "recommendation": "권고",
-          "risk": "리스크",
-        };
-        const fields = fieldOrder
-          .filter(k => op[k] && op[k] !== "-" && op[k] !== "해당없음" && typeof op[k] === "string")
-          .map(k => `<div style="margin-top:4px;"><b style="color:#555;">${esc(fieldLabels[k] || k)}:</b> ${esc(op[k])}</div>`)
-          .join("");
-        return `
-        <div style="margin-top:8px;padding:8px 12px;background:#f5f5f5;border-left:3px solid ${p.color || "#999"};border-radius:3px;">
-          <div style="font-weight:700;color:${p.color || "#333"};margin-bottom:4px;">
-            ${esc(p.icon || "")} ${esc(p.label || o.persona || "Agent")}
-          </div>
-          ${fields || `<div style="color:#888;font-style:italic;">의견 데이터 없음</div>`}
-        </div>`;
-      }).join("");
-      // 영역 12: 사회자 4축 합의 표시
-      const m = d.moderator || {};
-      const moderatorBody = (() => {
-        const parts = [];
-        if (m["근본원인_합의"]) parts.push(`<div><b style="color:#c0392b;">🎯 근본원인 합의:</b> ${esc(m["근본원인_합의"])}</div>`);
-        if (m["조치안_평가_합의"]) parts.push(`<div style="margin-top:4px;"><b style="color:#e67e22;">⚖️ 조치안 평가:</b> ${esc(m["조치안_평가_합의"])}</div>`);
-        if (m["개선안_합의"]) parts.push(`<div style="margin-top:4px;"><b style="color:#2980b9;">💡 개선안 합의:</b> ${esc(m["개선안_합의"])}</div>`);
-        if (m["재발방지책_합의"]) parts.push(`<div style="margin-top:4px;"><b style="color:#27ae60;">🛡️ 재발방지책:</b> ${esc(m["재발방지책_합의"])}</div>`);
-        if (m["충돌점"] && m["충돌점"] !== "없음") parts.push(`<div style="margin-top:4px;color:#c0392b;"><b>⚠️ 충돌점:</b> ${esc(m["충돌점"])}</div>`);
-        if (m["추가_논의_필요"] && m["추가_논의_필요"] !== "없음") parts.push(`<div style="margin-top:4px;color:#e67e22;"><b>🔍 추가 논의 필요:</b> ${esc(m["추가_논의_필요"])}</div>`);
-        // STANDARD 모드: actions 표시
-        if (Array.isArray(m.actions) && m.actions.length > 0) {
-          const actionsHtml = m.actions.map(a => `<li><b>[${esc(a.priority || "-")}]</b> ${esc(a.action || "")} <span style="color:#666;">(${esc(a.owner || "-")} / ${esc(a.duration || "-")})</span></li>`).join("");
-          parts.push(`<div style="margin-top:6px;"><b style="color:#2980b9;">📋 액션 플랜:</b><ul style="margin:4px 0;padding-left:20px;">${actionsHtml}</ul></div>`);
-        }
-        // LITE 모드: supplement/recurRisk/prevention
-        if (m.supplement) parts.push(`<div><b>📌 보완:</b> ${esc(m.supplement)}</div>`);
-        if (m.recurRisk) parts.push(`<div style="margin-top:4px;"><b>⚠️ 재발 우려:</b> ${esc(m.recurRisk)}</div>`);
-        if (m.prevention) parts.push(`<div style="margin-top:4px;"><b>🛡️ 방지책:</b> ${esc(m.prevention)}</div>`);
-        // 항상 한 줄 종합 표시
-        if (consensus && parts.length === 0) parts.push(`<div>${esc(consensus.slice(0, 500))}</div>`);
-        else if (consensus) parts.unshift(`<div style="font-style:italic;color:#444;margin-bottom:8px;">${esc(consensus.slice(0, 200))}</div>`);
-        return parts.join("");
-      })();
-
-      return `
-        <div style="margin-bottom:18px;padding:12px 16px;background:#fafafa;border:1px solid #ddd;border-left:4px solid ${modeColor};border-radius:5px;">
-          <h4 style="margin-top:0;color:${modeColor};">[${esc(mode)}] ${i + 1}. ${esc(d.issue?.eq || "?")} — ${esc((d.issue?.prob || "").slice(0, 60))}</h4>
-          <div style="background:#fff;padding:10px 14px;border-radius:4px;border:1px solid #e0e0e0;margin-bottom:8px;">
-            ${moderatorBody || `<i style="color:#888;">사회자 합의 없음</i>`}
-          </div>
-          ${opinions ? `<details><summary style="cursor:pointer;color:#666;font-weight:600;">▶ 페르소나 개별 의견 펼치기 (${(d.opinions || []).length}명)</summary>${opinions}</details>` : ""}
-        </div>`;
-    }).join("");
+    // 영역 12-AJ: 유첨(페르소나 논의 모아보기) 제거 — 메인 1~5번 섹션의 inline 논의와 중복
+    // 페르소나 논의는 메인 섹션 각 이슈의 [💬 페르소나 논의] details 안에 그대로 유지됨
 
     const html = `<!DOCTYPE html>
 <html lang="ko">
@@ -3765,8 +3960,6 @@ export default function App() {
   .p0 { color: #c0392b; }
   .p1 { color: #e67e22; }
   .p2 { color: #d4ac0d; }
-  .appendix-page { page-break-before: always; padding-top: 2em; border-top: 3px double #888; margin-top: 3em; }
-  @media print { .appendix-page { page-break-before: always; } }
 </style>
 </head>
 <body>
@@ -3831,14 +4024,8 @@ ${insightsHtml}
 ${actionsHtml}
 
 <hr>
-<p class="meta" style="text-align:center;">— 메인 레포트 종료 —<br>
+<p class="meta" style="text-align:center;">— 레포트 종료 —<br>
 AZS Status Reports WhatsApp 데이터 기반 · ${new Date().toLocaleString("ko-KR")}</p>
-
-<div class="appendix-page">
-<h1>📎 전체 페르소나 논의 모아보기</h1>
-<p class="meta">각 이슈별 페르소나 논의는 메인 페이지의 1~5번 섹션에 직접 매칭되어 표시되며, 아래는 통합 조회용입니다.</p>
-${appendixHtml || "<p>페르소나 논의 없음</p>"}
-</div>
 
 </body>
 </html>`;
@@ -5026,13 +5213,30 @@ ${userText}
                 background:"linear-gradient(135deg,#3b82f6,#22d3ee)",
                 border:"none", borderRadius:8, color:"#fff",
                 fontSize:13, fontWeight:800, cursor:"pointer",
-              }}>📥 HTML 다운로드 (메인 + 유첨)</button>
+              }}>📥 HTML 다운로드</button>
+              <button onClick={sendToTeams} disabled={teamsSending} style={{
+                flex:1, padding:"11px",
+                background: teamsSending ? "rgba(100,116,139,0.4)" : "linear-gradient(135deg,#8b5cf6,#ec4899)",
+                border:"none", borderRadius:8, color:"#fff",
+                fontSize:13, fontWeight:800, cursor: teamsSending ? "wait" : "pointer",
+                opacity: teamsSending ? 0.7 : 1,
+              }}>{teamsSending ? "⏳ 발송 중..." : "📤 Teams 발송"}</button>
               <button onClick={()=>{setStep(3);setMinutes(null);setDiscussions([]);setProgress([]);}} style={{
                 flex:1, padding:"11px", background:"transparent",
                 border:"1.5px solid rgba(167,139,250,0.35)", borderRadius:8,
                 color:"#a78bfa", fontSize:13, fontWeight:800, cursor:"pointer",
               }}>🔄 다시 분석</button>
             </div>
+            {/* 12-AK-5: Teams 발송 결과 토스트 */}
+            {teamsResult && (
+              <div style={{
+                marginBottom: 10, padding: "9px 14px", borderRadius: 8,
+                background: teamsResult.ok ? "rgba(34,197,94,0.15)" : "rgba(239,68,68,0.15)",
+                border: `1px solid ${teamsResult.ok ? "rgba(34,197,94,0.4)" : "rgba(239,68,68,0.4)"}`,
+                color: teamsResult.ok ? "#86efac" : "#fca5a5",
+                fontSize: 12, fontWeight: 600, animation: "fadeUp 0.3s",
+              }}>{teamsResult.msg}</div>
+            )}
             <button onClick={()=>{setStep(1);setMinutes(null);setDiscussions([]);setProgress([]);setReportType("meeting");}} style={{
               width:"100%", padding:"10px", background:"transparent",
               border:"1.5px solid rgba(51,65,85,0.4)", borderRadius:8,

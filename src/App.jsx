@@ -79,6 +79,36 @@ const TEST_KEYWORDS = [
   "Stack vision", "stack vision", "F/I check", "f/i check",
 ];
 
+// ─── 영역 12-AU: Critical 카테고리 (라인 정지/매니저 직접 개입/주요 부품 교체 등) ───
+// 일반 메시지(general)로 빠지던 핵심 사건들을 별도 분류 → 6번 인사이트에 강제 포함
+const CRITICAL_KEYWORDS = [
+  // 라인/공정 정지 (가장 큰 신호)
+  "Sudden Trip", "sudden trip", "Sudden trip", "Trip occur", "trip occur",
+  "All Line", "all line", "전 라인", "전라인", "all machine stop", "All machine stop",
+  "Assembly Line", "assembly line",
+  "All Stop", "all stop",
+  // 인프라 (CDA/BCU/Main Power)
+  "Main CDA", "main CDA", "main cda",
+  "BCU", "bcu",
+  "Main Power", "main power",
+  "blinking",
+  // 자재 부족 / WIP 통제
+  "Cathode Shortage", "cathode shortage", "Material Shortage", "material shortage",
+  "Stop Empty", "stop empty",
+  "WIP 통제", "wip 통제",
+  // 핵심 부품 교체 (Critical part)
+  "Cable profinet", "cable profinet", "profinet",
+  "Servo Drive", "servo drive 교체",
+  // 매니저 직접 개입
+  "주임", "직접 개입", "Manager direct", "manager direct",
+  // 사고 강도
+  "Critical", "critical event", "Urgent", "urgent",
+  "Emergency", "emergency",
+  "horizontal deployment",
+  // 알람 클리어 / 재가동 지시
+  "clear errors", "clear alarm", "restart operation",
+];
+
 // 명세서 §5.2 키워드 가중치 매트릭스 (점수 보너스)
 const SCORE_KEYWORD_MATRIX = {
   safety_env: {
@@ -757,11 +787,21 @@ function classifyMessages(msgs) {
   const downtime = [], equipment = [], general = [];
   // 영역 5: 큐레이션 이력 카테고리
   const qualityMsgs = [], processChangeMsgs = [], testMsgs = [], ambiguousMsgs = [];
+  // ★ 영역 12-AU: critical 카테고리 (라인 정지/매니저 직접 개입/주요 부품 교체)
+  const criticalMsgs = [];
 
   // ★ 영역 12-AC2: 안전망용 — 옛 형식 흡수된 sub-message 키워드 분류 헬퍼
   const classifySubMessage = (subText, baseEntry) => {
     if (!subText || subText.trim().length <= 5) return;
     if (subText.includes("미디어 파일 제외됨")) return;
+
+    // ★ 12-AU: critical 우선 검사 (다른 분류보다 상위)
+    const isCritical = CRITICAL_KEYWORDS.some(kw => matchKeyword(subText, kw));
+    if (isCritical) {
+      criticalMsgs.push({ ...baseEntry, text: subText });
+      return;
+    }
+
     const matched = [];
     // ★ 12-AD1: matchKeyword (단어 경계 강제)
     if (QUALITY_KEYWORDS.some(kw => matchKeyword(subText, kw))) matched.push("quality");
@@ -840,6 +880,19 @@ function classifyMessages(msgs) {
     if (m.text.trim().length <= 5) continue;
     if (m.text.includes("미디어 파일 제외됨")) continue;
 
+    // ★ 영역 12-AU: critical 우선 검사 — 매칭 시 criticalMsgs에 추가 + general에서 제거
+    // critical은 다른 분류보다 상위 우선순위 (라인 정지 같은 사건이 흩어지지 않도록)
+    if (CRITICAL_KEYWORDS.some(kw => matchKeyword(m.text, kw))) {
+      criticalMsgs.push({ time: m.time, sender: m.sender, text: m.text, date: m.date, hour: m.hour });
+      // 873줄에서 general에 이미 push됐으면 빼기
+      if (general.length > 0 &&
+          general[general.length - 1].time === m.time &&
+          general[general.length - 1].text === m.text) {
+        general.pop();
+      }
+      continue;
+    }
+
     const matched = [];
     // ★ 12-AD1: matchKeyword (단어 경계 강제) — "ng" 부분문자열 오매칭 차단
     if (QUALITY_KEYWORDS.some(kw => matchKeyword(m.text, kw))) matched.push("quality");
@@ -878,10 +931,20 @@ function classifyMessages(msgs) {
       general.push(entry);
     }
   }
-  // ★ 영역 12-AB4 + 12-AC2: 분류 안 된 일반 메시지 진단 로그
+  // ★ 영역 12-AB4 + 12-AC2 + 12-AU: 분류 안 된 일반 메시지 진단 로그
   if (typeof console !== "undefined") {
     if (absorbedSubCount > 0) {
       console.log(`[메시지 분류] 옛 형식 BM Bot이 흡수한 sub-message ${absorbedSubCount}건도 키워드 분류 별도 실행 (12-AC2)`);
+    }
+    // ★ 12-AU: critical 메시지 진단 출력
+    if (criticalMsgs.length > 0) {
+      console.log(`[★ Critical 분류] ${criticalMsgs.length}건 — 라인 정지/매니저 직접/주요 부품 교체 (6번 인사이트 강제 포함):`);
+      criticalMsgs.slice(0, 8).forEach((c, i) => {
+        const preview = (c.text || "").replace(/\n/g, " ").slice(0, 120);
+        console.log(`  [C${i+1}] ${c.date} ${c.time} ${c.sender || "?"}: ${preview}`);
+      });
+    } else {
+      console.log(`[Critical 분류] 0건 — 이번 윈도우에 라인 정지/매니저 직접 개입 사건 없음`);
     }
     if (general.length > 0) {
       console.log(`[메시지 분류 진단] 분류 안 됨(general) ${general.length}건. 샘플 5건 (3,4번 누락 진단용):`);
@@ -894,7 +957,7 @@ function classifyMessages(msgs) {
       console.warn(`[⚠️ 분류 경고] process_change/test 모두 0건 — 키워드 매칭 부족 가능. 위 general 샘플 확인 필요`);
     }
   }
-  return { downtime, equipment, general, qualityMsgs, processChangeMsgs, testMsgs, ambiguousMsgs };
+  return { downtime, equipment, general, qualityMsgs, processChangeMsgs, testMsgs, ambiguousMsgs, criticalMsgs };
 }
 
 // ─── 영역 5-C: 모호 메시지 AI 분류 (2개 이상 카테고리에 걸친 메시지만 Haiku 호출) ──
@@ -2126,35 +2189,89 @@ ${focus} 다음 이슈를 ${p.role.split(" ")[0]} 관점에서 분석하세요.
   "재발방지책": "장기 재발 방지 방법 (PM 항목 추가, horizontal deployment 등, 80자이내)"
 }`;
 
-  // ★ 영역 12-AM: 진단 코드 — 페르소나 호출 실패 원인 추적용 (Console 출력)
-  let rawForDebug = null;
+  // ★ 영역 12-AT: 페르소나 호출 4단계 retry (Cell_TE 일관 실패 패턴 해결)
+  // 1차 정상 → 1초 retry 정상 → 3초 retry 단순 프롬프트 → 최종 실패 시 명확한 오류 객체
+  const userMsg = `[이슈]\n${issueCtx}${prevText}`;
   const t0 = Date.now();
+  let rawForDebug = null;
+  let attemptLog = [];
+
+  // 1차: 정상 호출
   try {
     await new Promise(r => setTimeout(r, 600));
-    rawForDebug = await callClaudeRaw(sys, `[이슈]\n${issueCtx}${prevText}`, {
+    const tAttempt = Date.now();
+    rawForDebug = await callClaudeRaw(sys, userMsg, {
       model: MODEL_REASONING,
-      max_tokens: 1200,  // 영역 12 Phase 2: say 자유 텍스트 추가로 토큰 ↑
+      max_tokens: 1200,
     });
     const parsed = safeJSON(rawForDebug);
-    // safeJSON이 null/empty/비객체 반환 시 진단 대상
     if (!parsed || typeof parsed !== "object" || Object.keys(parsed).length === 0) {
-      console.error(`[페르소나 ${personaCode}] safeJSON 빈 결과 — raw 길이=${String(rawForDebug || "").length}, raw 첫 300자:`, String(rawForDebug || "").slice(0, 300));
       throw new Error(`safeJSON returned empty (raw length=${String(rawForDebug || "").length})`);
     }
-    return parsed;
-  } catch (e) {
+    return { ...parsed, _attempt: "primary", _elapsedMs: Date.now() - t0 };
+  } catch (e1) {
+    attemptLog.push(`1차: ${e1?.message?.slice(0, 100) || String(e1).slice(0, 100)}`);
+    console.warn(`[페르소나 ${personaCode}] 1차 실패 — 1초 후 retry: ${e1?.message?.slice(0, 100)}`);
+  }
+
+  // retry 1: 1초 대기 후 동일 정상 호출
+  await new Promise(r => setTimeout(r, 1000));
+  try {
+    rawForDebug = await callClaudeRaw(sys, userMsg, {
+      model: MODEL_REASONING,
+      max_tokens: 1200,
+    });
+    const parsed = safeJSON(rawForDebug);
+    if (!parsed || typeof parsed !== "object" || Object.keys(parsed).length === 0) {
+      throw new Error(`safeJSON returned empty (raw length=${String(rawForDebug || "").length})`);
+    }
+    console.log(`[페르소나 ${personaCode}] retry 1 (정상 재시도) 성공 — 1차 일시 실패 회복`);
+    return { ...parsed, _attempt: "retry_primary", _elapsedMs: Date.now() - t0 };
+  } catch (e2) {
+    attemptLog.push(`retry1: ${e2?.message?.slice(0, 100) || String(e2).slice(0, 100)}`);
+    console.warn(`[페르소나 ${personaCode}] retry 1 실패 — 3초 후 retry 2 (단순 프롬프트): ${e2?.message?.slice(0, 100)}`);
+  }
+
+  // retry 2: 3초 대기 후 단순 프롬프트 (max_tokens 800, 4축만 요청)
+  await new Promise(r => setTimeout(r, 3000));
+  try {
+    const sysSimple = `당신은 ${PERSONAS[personaCode]?.label || personaCode} 엔지니어입니다.
+다음 이슈에 대해 간단히 4축으로 분석하세요. JSON만 출력:
+{
+  "stance": "동의/부분동의/반대 중 하나",
+  "say": "한 문장 의견",
+  "근본원인": "root cause (60자)",
+  "조치안_평가": "기존 조치 평가 (40자)",
+  "개선안": "개선 권고 (60자)",
+  "재발방지책": "재발 방지 (60자)"
+}`;
+    rawForDebug = await callClaudeRaw(sysSimple, userMsg.slice(0, 800), {
+      model: MODEL_REASONING,
+      max_tokens: 800,
+    });
+    const parsed = safeJSON(rawForDebug);
+    if (!parsed || typeof parsed !== "object" || Object.keys(parsed).length === 0) {
+      throw new Error(`safeJSON returned empty (raw length=${String(rawForDebug || "").length})`);
+    }
+    console.log(`[페르소나 ${personaCode}] retry 2 (단순 프롬프트) 성공`);
+    return {
+      quote: "",
+      reply_to: "",
+      previous_reference: "",
+      ...parsed,
+      _attempt: "retry_simple",
+      _elapsedMs: Date.now() - t0,
+    };
+  } catch (e3) {
+    attemptLog.push(`retry2: ${e3?.message?.slice(0, 100) || String(e3).slice(0, 100)}`);
     const elapsed = Date.now() - t0;
     const issueShort = String(issueCtx || "").slice(0, 80).replace(/\n/g, " ");
-    console.error(`[페르소나 호출 실패] ${personaCode} (${elapsed}ms) | 이슈: ${issueShort}`);
-    console.error(`  ↳ 에러 타입: ${e?.name || "Unknown"}`);
-    console.error(`  ↳ 에러 메시지: ${e?.message || String(e)}`);
-    if (e?.status) console.error(`  ↳ HTTP 상태: ${e.status}`);
-    if (e?.cause) console.error(`  ↳ 원인:`, e.cause);
+    console.error(`[페르소나 호출 최종 실패] ${personaCode} (${elapsed}ms, 3회 시도) | 이슈: ${issueShort}`);
+    console.error(`  ↳ 시도 로그: ${attemptLog.join(" | ")}`);
     if (rawForDebug) {
-      console.error(`  ↳ raw 응답 길이: ${String(rawForDebug).length}`);
-      console.error(`  ↳ raw 첫 300자: ${String(rawForDebug).slice(0, 300)}`);
+      console.error(`  ↳ 마지막 raw 첫 300자: ${String(rawForDebug).slice(0, 300)}`);
     } else {
-      console.error(`  ↳ raw 응답: 없음 (API 단계 실패 — 네트워크/인증/timeout)`);
+      console.error(`  ↳ 마지막 raw: 없음 (API 단계 실패)`);
     }
     return {
       say: "분석 중 오류 발생",
@@ -2166,9 +2283,10 @@ ${focus} 다음 이슈를 ${p.role.split(" ")[0]} 관점에서 분석하세요.
       "조치안_평가": "-",
       "개선안": "-",
       "재발방지책": "-",
-      _error: `${e?.name || "Error"}: ${e?.message || String(e)}`.slice(0, 200),
+      _error: `Final fail after 3 attempts: ${attemptLog.join(" | ")}`.slice(0, 300),
       _rawSnippet: rawForDebug ? String(rawForDebug).slice(0, 150) : null,
       _elapsedMs: elapsed,
+      _attempt: "final_failure",
     };
   }
 }
@@ -2318,9 +2436,36 @@ JSON만 출력:
 // ─── 6-1. 사회자 폴백 통합 함수 (영역 12-AL: D3-b 2회 retry + D4-b 4축 stitching) ──
 // 단계: 1차 정상 → 1초 대기 → 정상 재시도 → 3초 대기 → 단순 프롬프트 → 코드 stitching
 async function moderateWithFallback(mode, issueCtx, opinions) {
+  // ★ 영역 12-AT: 페르소나 오류 의견 필터링 — 사회자 입력 노이즈 제거
+  // "분석 오류" stance 또는 "분석 중 오류" 근본원인을 가진 페르소나는 사회자 입력에서 제외
+  const totalOpinions = opinions.length;
+  const validOpinions = opinions.filter(o => {
+    const op = o?.opinion || {};
+    const stance = String(op.stance || "");
+    const cause = String(op["근본원인"] || op["원인"] || "");
+    const isError = stance === "분석 오류" || cause === "분석 중 오류" || op._attempt === "final_failure";
+    return !isError;
+  });
+  const excludedCount = totalOpinions - validOpinions.length;
+
+  if (excludedCount > 0) {
+    const excludedPersonas = opinions
+      .filter(o => !validOpinions.includes(o))
+      .map(o => o.persona)
+      .join(", ");
+    console.warn(`[사회자 입력 필터링] ${mode}: ${excludedCount}명 페르소나 오류 제외 (${excludedPersonas}) — ${validOpinions.length}/${totalOpinions}명 의견으로 사회자 호출`);
+  }
+
+  // 모든 페르소나가 오류면 코드 stitching 즉시 수행 (LLM 호출 무의미)
+  if (validOpinions.length === 0 && totalOpinions > 0 && mode !== "LITE") {
+    console.warn(`[사회자] ${mode}: 모든 페르소나 오류 — 코드 stitching 즉시 사용`);
+    const stitched = codeFallbackModerator(mode, opinions);
+    return { ...stitched, _fallback_level: "all_personas_failed" };
+  }
+
   const callPrimary = async () => {
-    if (mode === "DEEP")     return await moderateDeep(issueCtx, opinions);
-    if (mode === "STANDARD") return await moderateStandard(issueCtx, opinions);
+    if (mode === "DEEP")     return await moderateDeep(issueCtx, validOpinions);
+    if (mode === "STANDARD") return await moderateStandard(issueCtx, validOpinions);
     if (mode === "LITE")     return await moderateLite(issueCtx);
     throw new Error(`Unknown mode: ${mode}`);
   };
@@ -2328,7 +2473,7 @@ async function moderateWithFallback(mode, issueCtx, opinions) {
   // 1차: 정상 호출
   try {
     const primary = await callPrimary();
-    return { ...primary, _fallback_level: "primary" };
+    return { ...primary, _fallback_level: "primary", _excluded_personas: excludedCount };
   } catch (e1) {
     console.warn(`[Moderator 1차 실패] ${mode}: ${e1.message} — 1초 후 retry 1`);
 
@@ -2336,21 +2481,21 @@ async function moderateWithFallback(mode, issueCtx, opinions) {
     await new Promise(r => setTimeout(r, 1000));
     try {
       const r1 = await callPrimary();
-      return { ...r1, _fallback_level: "retry_primary" };
+      return { ...r1, _fallback_level: "retry_primary", _excluded_personas: excludedCount };
     } catch (e2) {
       console.warn(`[Moderator retry 1 실패] ${mode}: ${e2.message} — 3초 후 retry 2 (단순)`);
 
-      // retry 2: 3초 대기 후 단순 프롬프트
+      // retry 2: 3초 대기 후 단순 프롬프트 (validOpinions만 전달)
       await new Promise(r => setTimeout(r, 3000));
       try {
-        const r2 = await moderateRetrySimple(mode, issueCtx, opinions);
-        return { ...r2, _fallback_level: "retry_simple" };
+        const r2 = await moderateRetrySimple(mode, issueCtx, validOpinions);
+        return { ...r2, _fallback_level: "retry_simple", _excluded_personas: excludedCount };
       } catch (e3) {
         console.warn(`[Moderator retry 2 실패] ${mode}: ${e3.message} — 코드 stitching 사용`);
 
-        // 최종: 코드 레벨 stitching (4축별 페르소나 의견 모음)
+        // 최종: 코드 레벨 stitching — 원본 opinions로 stitching (오류도 포함하여 누가 무엇을 말했는지 표시)
         const stitched = codeFallbackModerator(mode, opinions);
-        return { ...stitched, _fallback_level: "code_stitching" };
+        return { ...stitched, _fallback_level: "code_stitching", _excluded_personas: excludedCount };
       }
     }
   }
@@ -2739,6 +2884,8 @@ async function generateInsightsAndActions(curation, discussions, taggedResult, k
     text: (m.text || "").slice(0, 350).replace(/\n/g, " | "),
   }));
   const rawEventContext = {
+    // ★ 영역 12-AU: critical 메시지 최우선 표시 (라인 정지/매니저 직접/주요 부품)
+    critical_events_top8: extractKeyEventMsgs(categoryMsgs.critical, 8),
     process_change_top5: extractKeyEventMsgs(categoryMsgs.process_change, 5),
     quality_top3: extractKeyEventMsgs(categoryMsgs.quality, 3),
   };
@@ -2765,6 +2912,22 @@ ${focus}
   - 7번 액션은 사회자 "개선안_합의"와 "재발방지책_합의"에서 직접 도출 (P0/P1/P2 분류)
   - "충돌점"이 있는 이슈는 "가설-검증필요" confidence + "추가 논의 필요" 액션으로 기재
 
+[★★★ 영역 12-AU — Critical Event 최우선 (반드시 6번 인사이트 1번 항목으로) ★★★]
+입력 데이터의 critical_events_top8에 라인 정지/매니저 직접 개입/주요 부품 교체 메시지가 있으면,
+**반드시 6번 인사이트 1번 항목으로 다루세요**. 누락 금지.
+
+Critical event 작성 5요소 (5W1H):
+  1) 시각 (HH:MM)
+  2) 사건 명 ("Sudden Trip", "Main CDA off", "Cathode Shortage" 등)
+  3) 영향 범위 ("전 라인 정지", "Cutter 4개 Stop Empty" 등)
+  4) 인과 ("Sudden Trip 16:11 → STK-2-B3 servo drive 손상" 등)
+  5) 매니저/엔지니어 직접 개입 (있다면 이름/직책 명시: "유강열 주임 직접 개입")
+
+✅ 좋은 예 (Critical event):
+  "1) Critical: Assembly Line Sudden Trip (16:11) — 전 라인 알람 정지 → 유강열 주임 직접 개입 → Main CDA / BCU 점검 → 16:55부터 STK-2-B3 Mandrel Y2(-) servo drive 손상으로 120분 부동 발생. Cable profinet + Servo Drive 모두 교체 (BEDRV0568)"
+
+★ critical_events_top8이 비어있을 때만 통상 인사이트로 시작 가능.
+
 [★★★ 영역 12-AI1 — 사건 단위 디테일 작성 (가장 중요) ★★★]
 6번 인사이트는 **개념적 통계가 아니라 구체적 사건 단위**로 작성하세요.
 
@@ -2777,7 +2940,7 @@ ${focus}
   "STK-3-C4 Heat Press 영역 8분 간격 2회: 04:57 cable loose, 05:38 mechanical interference. 두 이슈가 timing fault로 연관 가능성"
   "STK-3-B2 Overhang — 10개 파라미터 동시 변경 후 Agam 매니저 직접 개입 (Gearbox 교체 deep investigation 지시)"
 
-★ 입력 데이터의 conditionChangeGroups, recurringSameEquipment, raw 메시지를 활용해
+★ 입력 데이터의 critical_events_top8, conditionChangeGroups, recurringSameEquipment, raw 메시지를 활용해
   시각, 호기명, 부품명, 분 수치, 매니저 지시 등 구체적 사실을 포함하세요.
 
 [★ 7번 액션 — P0 우선순위 명시 (가장 중요)]
@@ -2836,9 +2999,10 @@ ${JSON.stringify(briefingSummary, null, 1)}
 [페르소나 논의 결과 — 사회자 4축 합의 (영역 12 방식 나)]
 ${moderatorSummary.length > 0 ? JSON.stringify(moderatorSummary, null, 1) : "(논의된 이슈 없음 — 큐레이션만으로 인사이트 도출)"}
 
-[★ 영역 12-AI1: raw 핵심 메시지 (사건 단위 디테일 추출용)]
+[★ 영역 12-AI1 + 12-AU: raw 핵심 메시지 (사건 단위 디테일 + Critical Event 추출용)]
 ${JSON.stringify(rawEventContext, null, 1)}
-※ 위 process_change_top5에 매니저 지시 ("hadehh, please do investigation deeply ... gearbox change")나
+※ critical_events_top8에 라인 정지/매니저 직접 개입/주요 부품 교체 메시지가 있으면 **반드시 6번 인사이트 1번**으로 다루세요.
+※ process_change_top5에 매니저 지시 ("hadehh, please do investigation deeply ... gearbox change")나
    동일 호기 다중 파라미터 변경 같은 정보가 있을 수 있음. 사건 단위 디테일에 활용.
 
 [5-카테고리 통계]
@@ -2846,6 +3010,7 @@ ${JSON.stringify(rawEventContext, null, 1)}
 
 위 데이터를 바탕으로:
 ★ 6번 "가장 주목할 사항" 5~6건 — **사건 단위** (시각·호기·분·부품·인과 구체 명시)
+   ★ critical_events_top8이 비어있지 않으면 **1번 항목은 반드시 Critical Event** (Sudden Trip, 매니저 직접 개입, 라인 정지 등)
 ★ 7번 "액션 후속 사항" 총 7~10건 — **P0 2~3개 반드시 포함** (매니저 직접 지시, horizontal deployment 등)
 환각 방지를 위해 confidence와 evidence를 반드시 명시하세요.`;
 
@@ -3252,9 +3417,11 @@ export default function App() {
         quality: [...(cl.qualityMsgs || []), ...ambigResult.quality],
         process_change: [...(cl.processChangeMsgs || []), ...ambigResult.process_change],
         test: [...(cl.testMsgs || []), ...ambigResult.test],
+        // ★ 영역 12-AU: critical 카테고리 추가 (라인 정지/매니저 직접 개입/주요 부품 교체)
+        critical: [...(cl.criticalMsgs || [])],
       };
-      // ★ 영역 12-AD2: 최종 카테고리 메시지 분포 로그 (ambiguous 분배 결과 확인용)
-      console.log(`[메시지 최종 분류] quality ${categoryMsgs.quality.length} (직접 ${cl.qualityMsgs?.length || 0} + 모호 ${ambigResult.quality.length}) / process_change ${categoryMsgs.process_change.length} (직접 ${cl.processChangeMsgs?.length || 0} + 모호 ${ambigResult.process_change.length}) / test ${categoryMsgs.test.length} (직접 ${cl.testMsgs?.length || 0} + 모호 ${ambigResult.test.length})`);
+      // ★ 영역 12-AD2 + 12-AU: 최종 카테고리 메시지 분포 로그
+      console.log(`[메시지 최종 분류] critical ${categoryMsgs.critical.length} / quality ${categoryMsgs.quality.length} (직접 ${cl.qualityMsgs?.length || 0} + 모호 ${ambigResult.quality.length}) / process_change ${categoryMsgs.process_change.length} (직접 ${cl.processChangeMsgs?.length || 0} + 모호 ${ambigResult.process_change.length}) / test ${categoryMsgs.test.length} (직접 ${cl.testMsgs?.length || 0} + 모호 ${ambigResult.test.length})`);
       if (ambig.length > 0 && (ambigResult.skip?.length || 0) > 0) {
         console.log(`[모호 분류] skip ${ambigResult.skip.length}건 (어디에도 분류 안 됨)`);
       }
@@ -3412,6 +3579,7 @@ export default function App() {
         quality: classified?.qualityMsgs || [],
         process_change: classified?.processChangeMsgs || [],
         test: classified?.testMsgs || [],
+        critical: classified?.criticalMsgs || [],  // ★ 12-AU
       };
       let curation = preCuration;
       if (curation) {

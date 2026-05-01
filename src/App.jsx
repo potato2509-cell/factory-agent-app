@@ -2883,12 +2883,119 @@ async function generateInsightsAndActions(curation, discussions, taggedResult, k
     time: m.time || "",
     text: (m.text || "").slice(0, 350).replace(/\n/g, " | "),
   }));
+
+  // ★ 영역 12-AV-1: 부품 코드 추출 (BM/BE/BL/BA/BS prefix + 숫자 + 제조사+모델명 패턴)
+  // 정답 보고서에서 발견된 패턴: BEDRV0568 (Servo Drive), BMASO0166 (Absorber), BESEN2368 (Sensor) 등
+  const extractPartCodes = (msgsArr) => {
+    const codes = new Map();  // code -> { code, contexts: [{date, time, text_snippet}, ...] }
+    const codePatterns = [
+      // 회사 내부 부품 코드: BM/BE/BL/BA/BS/BD/BR/BT prefix + 영문 2~4자 + 숫자 3~5자
+      /\b(B[MELASDRT][A-Z]{1,4})(\d{3,5})\b/gi,
+      // SIEMENS 등 제조사 모델 (예: 6SL3210-5HB10-1UF0)
+      /\b\d[A-Z]{2,3}\d{3,5}-\d[A-Z]{2}\d{2}-\d[A-Z]\d[A-Z]\d\b/gi,
+      // OMRON 등 짧은 모델 (예: E3T-FD13)
+      /\b[A-Z]\d{1,2}[A-Z]-[A-Z]{2}\d{2,4}\b/g,
+    ];
+    for (const msg of (msgsArr || [])) {
+      const text = msg.text || "";
+      for (const pattern of codePatterns) {
+        const matches = [...text.matchAll(pattern)];
+        for (const m of matches) {
+          const code = m[0].toUpperCase();
+          if (code.length < 6 || code.length > 25) continue;  // 길이 필터
+          if (!codes.has(code)) codes.set(code, { code, contexts: [] });
+          if (codes.get(code).contexts.length < 3) {
+            // 코드 주변 50자 컨텍스트 추출
+            const idx = m.index || 0;
+            const ctx = text.slice(Math.max(0, idx - 30), Math.min(text.length, idx + 70))
+                            .replace(/\n/g, " ").trim();
+            codes.get(code).contexts.push({
+              date: msg.date || "",
+              time: msg.time || "",
+              snippet: ctx,
+            });
+          }
+        }
+      }
+    }
+    return [...codes.values()].slice(0, 12);  // 최대 12개 코드만
+  };
+
+  // ★ 영역 12-AV-2: 매니저 멘션 + 직책 추출 (정확한 표기 보존)
+  // 정답이 "유강열 주임"으로 표기, 새 출력이 "Agam 매니저"로 — 발신자명만 보고 본문 멘션 누락 방지
+  const extractMentionedPersons = (msgsArr) => {
+    const persons = new Map();  // name -> { name, role, mentions: [...] }
+    const titles = ['주임', '책임', '매니저', '수석', '대리', '과장', '팀장', '엔지니어', 'Manager', 'manager', 'Engineer', 'PIC'];
+    for (const msg of (msgsArr || [])) {
+      const text = msg.text || "";
+      const sender = msg.sender || "";
+
+      // 패턴 1: WhatsApp @ 멘션 (특수 unicode 처리)
+      const mentionRe = /@[\u2068\u2069]?([A-Za-z0-9가-힣_~\s.]{2,30}?)[\u2068\u2069]?(?=[\s,.:?!]|$)/gu;
+      const mentions1 = [...text.matchAll(mentionRe)].map(m => m[1].trim());
+
+      // 패턴 2: 한국어 이름 + 직책 (예: "유강열 주임", "강철 책임")
+      const titleRe = new RegExp(`([\\w가-힣]{2,5})\\s*(${titles.join('|')})`, 'g');
+      const mentions2 = [...text.matchAll(titleRe)].map(m => `${m[1]} ${m[2]}`);
+
+      // 패턴 3: 영어 이름 + Manager/Engineer
+      const enTitleRe = /([A-Z][a-z]+(?:\s+[A-Z][a-z]+){0,2})\s+(Manager|manager|Engineer|engineer|PIC)/g;
+      const mentions3 = [...text.matchAll(enTitleRe)].map(m => `${m[1]} ${m[2]}`);
+
+      // 발신자도 포함 (직책 들어있으면)
+      const senderHasTitle = titles.some(t => sender.includes(t));
+
+      const allMentions = [...mentions1, ...mentions2, ...mentions3];
+      if (senderHasTitle) allMentions.push(sender);
+
+      for (const name of allMentions) {
+        const cleanName = name.trim().replace(/\s+/g, ' ');
+        if (cleanName.length < 2 || cleanName.length > 40) continue;
+        if (!persons.has(cleanName)) persons.set(cleanName, { name: cleanName, mentions: [] });
+        if (persons.get(cleanName).mentions.length < 3) {
+          persons.get(cleanName).mentions.push({
+            date: msg.date || "",
+            time: msg.time || "",
+            sender: sender,
+            text_snippet: text.slice(0, 120).replace(/\n/g, " ").trim(),
+          });
+        }
+      }
+    }
+    // 멘션 횟수 많은 순으로 정렬, 최대 8명
+    return [...persons.values()]
+      .sort((a, b) => b.mentions.length - a.mentions.length)
+      .slice(0, 8);
+  };
+
   const rawEventContext = {
     // ★ 영역 12-AU: critical 메시지 최우선 표시 (라인 정지/매니저 직접/주요 부품)
     critical_events_top8: extractKeyEventMsgs(categoryMsgs.critical, 8),
     process_change_top5: extractKeyEventMsgs(categoryMsgs.process_change, 5),
     quality_top3: extractKeyEventMsgs(categoryMsgs.quality, 3),
+    // ★ 영역 12-AV: 부품 코드 + 매니저 멘션 (정답 격차 축소)
+    part_codes_extracted: extractPartCodes([
+      ...(categoryMsgs.critical || []),
+      ...(categoryMsgs.process_change || []),
+      ...(allIssuesFlat || []).map(it => ({ text: (it.problem || "") + " " + (it.cause || "") + " " + (it.text || ""), date: it.date, time: it.time })),
+    ]),
+    persons_mentioned: extractMentionedPersons([
+      ...(categoryMsgs.critical || []),
+      ...(categoryMsgs.process_change || []),
+    ]),
   };
+
+  // ★ 12-AV 진단 로그
+  if (typeof console !== "undefined") {
+    if (rawEventContext.part_codes_extracted.length > 0) {
+      console.log(`[12-AV 부품 코드] ${rawEventContext.part_codes_extracted.length}개 추출:`,
+        rawEventContext.part_codes_extracted.map(c => c.code).join(", "));
+    }
+    if (rawEventContext.persons_mentioned.length > 0) {
+      console.log(`[12-AV 매니저 멘션] ${rawEventContext.persons_mentioned.length}명:`,
+        rawEventContext.persons_mentioned.map(p => `${p.name}(${p.mentions.length}회)`).join(", "));
+    }
+  }
 
   // ─── 영역 12-AQ: Background Function 통합 호출 (분할 롤백) ────────────────────
   // 12-AP 분할(병렬)은 504 회피에 부족 (37초 timeout 확인) → Background로 근본 해결
@@ -2911,6 +3018,20 @@ ${focus}
   - 6번 인사이트의 근거(evidence)는 "[설비명] 근본원인_합의" 또는 "[설비명] 충돌점" 형태로 명시
   - 7번 액션은 사회자 "개선안_합의"와 "재발방지책_합의"에서 직접 도출 (P0/P1/P2 분류)
   - "충돌점"이 있는 이슈는 "가설-검증필요" confidence + "추가 논의 필요" 액션으로 기재
+
+[★★★ 영역 12-AV — 부품 코드 + 매니저 표기 정확도 (필수) ★★★]
+입력 데이터의 part_codes_extracted, persons_mentioned를 반드시 반영하세요.
+
+(1) 부품 코드 — 코드/모델명이 추출되어 있으면 인사이트/액션에 명시
+   ✅ 좋은 예: "STK-2-B3 Mandrel Y2(-) Servo Drive 손상 — Cable profinet 교체 + Servo Drive 교체 (BEDRV0568, SIEMENS 6SL3210-5HB10-1UF0)"
+   ❌ 나쁜 예: "STK-2-B3 Servo Drive 손상" (부품 코드 누락)
+   → part_codes_extracted에 있는 코드는 인사이트/액션에 그대로 인용
+
+(2) 매니저 표기 — persons_mentioned에 등장한 이름/직책을 정확히 인용
+   ✅ 좋은 예: "유강열 주임 직접 개입 → Agam 매니저 후속 지시"
+   ❌ 나쁜 예: "Agam 매니저"만 (다른 매니저 누락)
+   → 매니저 메시지 발신자뿐 아니라 본문에 멘션된 사람 모두 정확히 표기
+   → persons_mentioned 리스트의 name 필드를 그대로 사용 (한국어/영어 표기 보존)
 
 [★★★ 영역 12-AU — Critical Event 최우선 (반드시 6번 인사이트 1번 항목으로) ★★★]
 입력 데이터의 critical_events_top8에 라인 정지/매니저 직접 개입/주요 부품 교체 메시지가 있으면,
@@ -2999,9 +3120,11 @@ ${JSON.stringify(briefingSummary, null, 1)}
 [페르소나 논의 결과 — 사회자 4축 합의 (영역 12 방식 나)]
 ${moderatorSummary.length > 0 ? JSON.stringify(moderatorSummary, null, 1) : "(논의된 이슈 없음 — 큐레이션만으로 인사이트 도출)"}
 
-[★ 영역 12-AI1 + 12-AU: raw 핵심 메시지 (사건 단위 디테일 + Critical Event 추출용)]
+[★ 영역 12-AI1 + 12-AU + 12-AV: raw 핵심 메시지 (사건 단위 디테일 + Critical Event + 부품 코드/매니저 표기)]
 ${JSON.stringify(rawEventContext, null, 1)}
 ※ critical_events_top8에 라인 정지/매니저 직접 개입/주요 부품 교체 메시지가 있으면 **반드시 6번 인사이트 1번**으로 다루세요.
+※ part_codes_extracted에 부품 코드/모델명이 있으면 인사이트/액션에 **반드시 명시** (예: BEDRV0568, BMASO0166, SIEMENS 6SL3210-...)
+※ persons_mentioned의 매니저/엔지니어 이름은 **정확한 표기 그대로** 인용 (예: "유강열 주임", "Agam 매니저")
 ※ process_change_top5에 매니저 지시 ("hadehh, please do investigation deeply ... gearbox change")나
    동일 호기 다중 파라미터 변경 같은 정보가 있을 수 있음. 사건 단위 디테일에 활용.
 

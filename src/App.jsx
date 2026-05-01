@@ -2977,7 +2977,11 @@ async function generateInsightsAndActions(curation, discussions, taggedResult, k
     part_codes_extracted: extractPartCodes([
       ...(categoryMsgs.critical || []),
       ...(categoryMsgs.process_change || []),
-      ...(allIssuesFlat || []).map(it => ({ text: (it.problem || "") + " " + (it.cause || "") + " " + (it.text || ""), date: it.date, time: it.time })),
+      ...((taggedResult?.issues || [])).map(it => ({
+        text: (it.problem || "") + " " + (it.cause || "") + " " + (it.text || ""),
+        date: it.date,
+        time: it.time,
+      })),
     ]),
     persons_mentioned: extractMentionedPersons([
       ...(categoryMsgs.critical || []),

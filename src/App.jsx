@@ -109,6 +109,20 @@ const CRITICAL_KEYWORDS = [
   "clear errors", "clear alarm", "restart operation",
 ];
 
+// ─── 영역 12-AW: 한국 책임자 명단 (점수 가중치 + escalation timeline 강조용) ───
+// 정답 레포트 격차 분석 결과: 한국 책임자 직접 개입 신호가 점수에 반영되지 않아
+// Magazine Crack 같은 critical 사건이 P1로 떨어지는 문제 해결.
+// 매칭 대상: 본문 메시지 text 필드 (extractCriticalIssues가 본문을 보존함)
+// 추후 보강: config화 / Sheets 동적 로드 등 (현재는 hardcoding)
+const KOREAN_MANAGER_NAMES = [
+  "Heri Bagus", "Heri Bagus Setiawan",
+  "Hafizh",
+  "Bagus",
+  "유강열", "유강열 주임",
+  "Agam", "Agam Kurniawan",
+  "강철", "강철 책임",
+];
+
 // 명세서 §5.2 키워드 가중치 매트릭스 (점수 보너스)
 const SCORE_KEYWORD_MATRIX = {
   safety_env: {
@@ -137,6 +151,36 @@ const SCORE_KEYWORD_MATRIX = {
     bonus: 3,
     keywords: ["no spare", "spare 없음", "spare 부족"],
     fields: ["action"],
+  },
+  // ─── 영역 12-AW: 한국 책임자 escalation 신호 (+12) ───
+  // 매니저 이름이 본문에 등장하면 critical 사건으로 격상
+  // text field 매칭이 핵심 (기존 5종은 problem/cause/alarm 등 BM bot 필드만 봤음)
+  manager_escalation: {
+    bonus: 12,
+    keywords: KOREAN_MANAGER_NAMES,
+    fields: ["text", "problem", "cause"],  // text가 핵심, problem/cause는 보조
+  },
+  // ─── 영역 12-AW: 다중 hold 신호 (+8) ───
+  // "6 EA hold" 같은 다수 hold 패턴 — 정규식 처리 (scoreIssueMatrix에서 분기)
+  // _regex / _minCount 메타 필드는 scoreIssueMatrix가 인식
+  multi_hold: {
+    bonus: 8,
+    keywords: [],  // 정규식 별도 처리
+    fields: ["text"],
+    _regex: /(\d+)\s*(EA|개)\s*hold/i,
+    _minCount: 2,  // N >= 2 일 때만 점수 부여
+  },
+  // ─── 영역 12-AW: 라인 이전 / 운전 변경 신호 (+5) ───
+  // "Line 1B → Line 1C" 같은 운전 이전 신호 = critical 영향도 큼
+  line_transfer: {
+    bonus: 5,
+    keywords: [
+      "Line 이전", "임시 운전", "Line transfer",
+      "→ Line", "->Line",
+      "임시 이전", "임시운전",
+      "운전 이전", "운전이전",
+    ],
+    fields: ["text", "result"],
   },
 };
 
@@ -1082,6 +1126,153 @@ function extractAllIssues(downtime) {
   });
 }
 
+// ─── 영역 12-AW: Critical 메시지 → 가상 issue 변환 ─────────────────────────
+// 정답 레포트 격차 분석에 따라, criticalMsgs (라인 정지/매니저 직접/주요 부품 교체) 를
+// 점수 시스템 / 페르소나 논의 후보에 합류시켜 P0 우선순위로 올라가도록 함.
+//
+// 작동 흐름:
+//   1) 호기명 자동 추출 (STK/MGAD/CUT/Line 정규식)
+//   2) 시간 ±60분 + 호기 매칭으로 그룹화 (호기 못 찾으면 개별 issue)
+//   3) 그룹당 첫 메시지를 대표 issue로 변환
+//   4) durMin 추정: 라인 정지 키워드 → 60, 아니면 30
+//   5) _criticalGroup 멤버 보존 (escalation timeline용)
+//   6) issue.text에 그룹 전체 본문 보존 (scoreIssueMatrix 매니저 매칭용)
+function extractCriticalIssues(criticalMsgs) {
+  if (!criticalMsgs || criticalMsgs.length === 0) return [];
+
+  // 1) 호기명 추출 정규식 (우선순위 순)
+  const EQ_PATTERNS = [
+    /\b(STK-\d-[A-Z]\d+)\b/i,
+    /\b(MGAD[BN]\w*\d{4,})\b/i,
+    /\b(CUT-\d-?[A-Z]?\(?[+-]?\)?)\b/i,
+    /\b(Line\s*\d-?[A-Z]\d?)\b/i,
+    /\b(STK-\d-[A-Z])\b/i,  // STK-1-B 같은 짧은 형식
+  ];
+  const extractEquipment = (text) => {
+    const t = String(text || "");
+    for (const pattern of EQ_PATTERNS) {
+      const m = t.match(pattern);
+      if (m) return m[1].trim();
+    }
+    return null;
+  };
+
+  // 2) 라인 정지 키워드 (있으면 durMin=60, 없으면 30)
+  const LINE_STOP_KEYWORDS = [
+    "Sudden Trip", "sudden trip",
+    "All Line", "all line", "전 라인", "전라인",
+    "all machine stop", "All machine stop",
+    "All Stop", "all stop",
+    "Main CDA", "BCU", "Main Power",
+    "Line 정지", "라인 정지",
+    "Stop Empty", "stop empty",
+  ];
+  const isLineStop = (text) => {
+    const t = String(text || "").toLowerCase();
+    return LINE_STOP_KEYWORDS.some(kw => t.includes(kw.toLowerCase()));
+  };
+
+  // 3) 시간 비교 헬퍼 (date + time을 분 단위 정수로)
+  const toMinuteKey = (msg) => {
+    const dateParts = String(msg.date || "0/0/0").split("/").map(Number);
+    const timeParts = String(msg.time || "0:0").split(":").map(Number);
+    const dateNum = (dateParts[0] || 0) * 10000 + (dateParts[1] || 0) * 100 + (dateParts[2] || 0);
+    const minNum = (timeParts[0] || 0) * 60 + (timeParts[1] || 0);
+    return dateNum * 1440 + minNum;
+  };
+
+  // 4) 그룹화: 시간 ±60분 + 호기 매칭 (호기 못 찾으면 개별)
+  const sorted = [...criticalMsgs].sort((a, b) => toMinuteKey(a) - toMinuteKey(b));
+  const groups = [];
+
+  for (const msg of sorted) {
+    const eq = extractEquipment(msg.text);
+    const minKey = toMinuteKey(msg);
+
+    if (!eq) {
+      // 호기 못 찾음 → 개별 그룹 (그룹화 안 함, 안전)
+      groups.push({
+        equipment: null,
+        representative: msg,
+        members: [msg],
+        startMin: minKey,
+        endMin: minKey,
+      });
+      continue;
+    }
+
+    // 기존 그룹 중 매칭 시도 (같은 호기 + 60분 이내)
+    const matchedGroup = groups.find(g =>
+      g.equipment === eq &&
+      Math.abs(minKey - g.endMin) <= 60
+    );
+
+    if (matchedGroup) {
+      matchedGroup.members.push(msg);
+      matchedGroup.endMin = Math.max(matchedGroup.endMin, minKey);
+    } else {
+      groups.push({
+        equipment: eq,
+        representative: msg,
+        members: [msg],
+        startMin: minKey,
+        endMin: minKey,
+      });
+    }
+  }
+
+  // 5) 그룹 → 가상 issue 변환
+  const virtualIssues = groups.map((g, idx) => {
+    const rep = g.representative;
+    const allText = g.members.map(m => m.text || "").join(" | ");  // 그룹 전체 텍스트 (점수 계산용)
+    const eq = g.equipment;
+    const durMin = isLineStop(allText) ? 60 : 30;
+    const probText = (rep.text || "").slice(0, 200).replace(/\n/g, " ");
+
+    // 호기 못 찾고 매니저 멘션 있으면 prob에 표시
+    const hasManager = KOREAN_MANAGER_NAMES.some(n => allText.includes(n));
+    const probFinal = eq
+      ? probText
+      : (hasManager ? `매니저 개입 (호기 미특정) — ${probText.slice(0, 150)}` : probText);
+
+    return {
+      // BM bot issue 호환 필드
+      date: rep.date || "",
+      time: rep.time || "",
+      hour: rep.hour || 0,
+      eq: eq || "(critical)",
+      prob: probFinal,
+      cause: "",
+      result: "",
+      action: "",
+      pic: rep.sender || "",
+      durMin,
+      stopStatus: isLineStop(allText) ? "full_stop" : "",
+      repeatCount: g.members.length,
+      _alarm: "",
+      reasons: [],
+      // ★ 12-AW: 신규 메타 필드
+      text: allText,                    // 점수 계산용 본문 (모든 멤버 합침)
+      _criticalGroup: g.members,        // timeline 용 멤버 보존
+      _isCritical: true,                // 분기용 플래그
+      _criticalIdx: idx,                // 그룹 ID (디버깅용)
+      // 메시지 호환
+      sender: rep.sender || "",
+    };
+  });
+
+  // 진단 로그
+  if (typeof console !== "undefined" && virtualIssues.length > 0) {
+    console.log(`[★ Critical → 가상 issue] ${criticalMsgs.length}건 → ${virtualIssues.length}개 그룹`);
+    virtualIssues.slice(0, 5).forEach((vi, i) => {
+      const probPreview = (vi.prob || "").slice(0, 80);
+      console.log(`  [V${i+1}] ${vi.date} ${vi.time} ${vi.eq} (${vi._criticalGroup.length}명, ${vi.durMin}분): ${probPreview}`);
+    });
+  }
+
+  return virtualIssues;
+}
+
 // 점수 계산 (영역 11 기본 점수 함수 — 기존 scoreIssue 대체)
 // scoreIssueMatrix는 그대로 활용 (영역 9-C에 이미 정의됨).
 // 자동 선정 시 점수 내림차순으로 정렬 후 TOP MAX_ISSUES.
@@ -1201,7 +1392,7 @@ function classifyIssues5Category(input, options = {}) {
 }
 
 // ─── 9-C: 명세서 §5.2 매트릭스 기반 점수 (기존 scoreIssue 대체) ─────────────────
-// 기존 scoreIssue와 호환되는 시그니처. 명세서 키워드 매트릭스 5종 적용.
+// 영역 12-AW: text field + 정규식 처리 추가 (manager_escalation/multi_hold/line_transfer)
 function scoreIssueMatrix(issue) {
   const dur = issue.durMin || 0;
   const breakdown = {
@@ -1212,7 +1403,7 @@ function scoreIssueMatrix(issue) {
     very_long_downtime_bonus: dur >= 120 ? 5 : 0,
   };
 
-  // 매트릭스 5종 적용
+  // ★ 영역 12-AW: text 필드 추가 — critical 가상 issue + manager 이름 매칭용
   const fieldMap = {
     problem: issue.prob || "",
     cause: issue.cause || "",
@@ -1222,11 +1413,29 @@ function scoreIssueMatrix(issue) {
     status: issue.result || "",
     result: issue.result || "",
     action: issue.action || "",
+    text: issue.text || "",  // ★ 신규: 본문 (critical 가상 issue가 본문 보존)
   };
 
+  // 매트릭스 8종 적용 (기존 5종 + 12-AW 신규 3종)
   for (const [key, def] of Object.entries(SCORE_KEYWORD_MATRIX)) {
-    const text = (def.fields || []).map(f => fieldMap[f] || "").join(" ").toLowerCase();
-    if (def.keywords.some(kw => text.includes(kw.toLowerCase()))) {
+    const text = (def.fields || []).map(f => fieldMap[f] || "").join(" ");
+    const textLower = text.toLowerCase();
+
+    // ★ 영역 12-AW: 정규식 처리 분기 (multi_hold 같은 패턴 매칭)
+    if (def._regex) {
+      const match = text.match(def._regex);
+      if (match) {
+        const count = parseInt(match[1] || "0", 10);
+        const minCount = def._minCount || 1;
+        breakdown[key] = count >= minCount ? def.bonus : 0;
+      } else {
+        breakdown[key] = 0;
+      }
+      continue;
+    }
+
+    // 기존 키워드 매칭 (5종 + manager_escalation/line_transfer)
+    if ((def.keywords || []).some(kw => textLower.includes(String(kw).toLowerCase()))) {
       breakdown[key] = def.bonus;
     } else {
       breakdown[key] = 0;
@@ -3500,15 +3709,28 @@ export default function App() {
     setError("");
     const dayMsgs = filterByDates(allMsgs, selDates);
     const cl = classifyMessages(dayMsgs);
-    const allIssuesFlat = extractAllIssues(cl.downtime);  // 영역 11-A: priority 객체 대신 평면 배열
+    const bmIssues = extractAllIssues(cl.downtime);
+    // ★ 영역 12-AW: Critical 메시지를 가상 issue로 변환 → 본문 논의 후보 통합
+    const criticalIssues = extractCriticalIssues(cl.criticalMsgs || []);
+    const allIssuesFlat = [...bmIssues, ...criticalIssues];
     setClassified(cl);
     setPriority(allIssuesFlat);  // priority state는 이제 평면 배열을 보유
+
+    // ★ 영역 12-AW: Critical 통합 진단
+    console.log(`[★ 12-AW Critical 통합] BM bot ${bmIssues.length}건 + Critical 가상 ${criticalIssues.length}건 = 총 ${allIssuesFlat.length}건`);
+    if (criticalIssues.length > 0) {
+      console.log(`  ↳ Critical 가상 issue 샘플:`);
+      criticalIssues.slice(0, 3).forEach((ci, i) => {
+        const probPreview = (ci.prob || "").slice(0, 100);
+        console.log(`    [C${i+1}] ${ci.date} ${ci.time} ${ci.eq} (${ci.durMin}분): ${probPreview}`);
+      });
+    }
 
     // ★ 영역 12-AA: Duration 파싱 진단 로그
     const dur30plus = allIssuesFlat.filter(i => (i.durMin || 0) >= 30).length;
     const dur60plus = allIssuesFlat.filter(i => (i.durMin || 0) >= 60).length;
     const dur0 = allIssuesFlat.filter(i => (i.durMin || 0) === 0).length;
-    console.log(`[Duration 파싱 진단] BM Bot 전체 ${allIssuesFlat.length}건 / 30분+ ${dur30plus}건 / 60분+ ${dur60plus}건 / durMin=0 ${dur0}건`);
+    console.log(`[Duration 파싱 진단] 전체 ${allIssuesFlat.length}건 / 30분+ ${dur30plus}건 / 60분+ ${dur60plus}건 / durMin=0 ${dur0}건`);
     if (allIssuesFlat.length > 0) {
       console.log(`[Duration 샘플]`, allIssuesFlat.slice(0, 3).map(i => ({
         eq: i.eq, durMin: i.durMin, prob: (i.prob || "").slice(0, 50)
@@ -4235,6 +4457,60 @@ export default function App() {
         </div>
       ` : "";
 
+      // ★ 영역 12-AW: Escalation Timeline (점수 상위 1건 = isTop에만)
+      // 매칭 critical 가상 issue의 _criticalGroup 멤버를 시간순 sub-table로 표시
+      // 매니저 발신자 → bold + 빨강 강조 (정답 형식)
+      let escalationTimelineHtml = "";
+      if (d.isTop) {
+        const matchedForTimeline = matchedDisc?.issue || null;
+        const groupMembers = (matchedForTimeline && matchedForTimeline._criticalGroup) || [];
+
+        if (groupMembers.length > 0) {
+          // 시간순 정렬
+          const sortedMembers = [...groupMembers].sort((a, b) => {
+            const aH = parseInt((a.time || "0:0").split(":")[0], 10) || 0;
+            const aMin = parseInt((a.time || "0:0").split(":")[1], 10) || 0;
+            const bH = parseInt((b.time || "0:0").split(":")[0], 10) || 0;
+            const bMin = parseInt((b.time || "0:0").split(":")[1], 10) || 0;
+            return (aH * 60 + aMin) - (bH * 60 + bMin);
+          });
+
+          // 매니저 발신자/멘션 강조 헬퍼
+          const isManagerSender = (sender) => {
+            const s = String(sender || "");
+            return KOREAN_MANAGER_NAMES.some(n => s.includes(n));
+          };
+          const isManagerInText = (text) => {
+            const t = String(text || "");
+            return KOREAN_MANAGER_NAMES.some(n => t.includes(n));
+          };
+
+          const rows = sortedMembers.map(m => {
+            const sender = m.sender || "?";
+            const isMgrSender = isManagerSender(sender);
+            const isMgrInText = isManagerInText(m.text);
+            const senderStyle = (isMgrSender || isMgrInText)
+              ? `font-weight:700;color:#c0392b;`
+              : ``;
+            const senderLabel = isMgrSender ? `<b>${esc(sender)}</b>` : esc(sender);
+            const contentText = (m.text || "").replace(/\n/g, " ").slice(0, 120);
+            return `
+              <tr>
+                <td style="white-space:nowrap;">${esc(m.time || "")}</td>
+                <td style="${senderStyle}">${senderLabel}</td>
+                <td>${esc(contentText)}${m.text && m.text.length > 120 ? "..." : ""}</td>
+              </tr>`;
+          }).join("");
+
+          escalationTimelineHtml = `
+            <h4 style="margin-top:12px;">Timeline & 한국 책임 직접 개입</h4>
+            <table>
+              <thead><tr><th style="width:14%;">시간</th><th style="width:24%;">발신</th><th>내용</th></tr></thead>
+              <tbody>${rows}</tbody>
+            </table>`;
+        }
+      }
+
       return `
       <div class="${d.isTop ? "critical" : "warning"}">
         <h3 style="margin-top:0;">${d.isTop ? "🔴 [TOP] " : "🔴 "}${esc(d.title || `${d.equipment} ${d.durationMin}분`)}</h3>
@@ -4257,6 +4533,7 @@ export default function App() {
         <h4>적용 조치 (${d.actionSequence.length}단계)</h4>
         <ol>${d.actionSequence.map(s => `<li>${esc(s)}</li>`).join("")}</ol>` : ""}
         ${actionAnalysisHtml}
+        ${escalationTimelineHtml}
         ${personaConvHtml}
       </div>
     `;

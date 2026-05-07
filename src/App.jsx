@@ -2,6 +2,9 @@ import { useState, useRef, useEffect } from "react";
 
 // ─── 설정 ─────────────────────────────────────────────────────────────────────
 const APPS_SCRIPT_URL = "https://script.google.com/macros/s/AKfycbwE9ZyopUTxEEXpt3UjWjfgDljEiGodgbunj_UnXYc-1RlrXgNiDzAiikXoEP4g9_E/exec";
+// ★ 영역 12-AZ: AZS_WhatsApp_Webhook 프로젝트 URL (messages 탭 자동연동 데이터 조회용)
+// 위 APPS_SCRIPT_URL과는 별도 프로젝트 (역할 분리: KB/큐레이션 vs Whapi/messages)
+const WHAPI_APPS_SCRIPT_URL = "https://script.google.com/macros/s/AKfycbxx_VojUcIZCyNlk6hfsaJf0IBmli2JJ4NF5jBHvBqpM0pIqNmN3dx4X4PDXW_pQNsfHA/exec";
 const MAX_ISSUES = 10;
 
 // ─── 보고서 종류 ───────────────────────────────────────────────────────────────
@@ -767,7 +770,7 @@ async function fetchMessagesFromTab(startDate, endDate, chatName) {
   });
   if (chatName) params.set("chatName", chatName);
 
-  const url = `${APPS_SCRIPT_URL}?${params.toString()}`;
+  const url = `${WHAPI_APPS_SCRIPT_URL}?${params.toString()}`;
   console.log(`[12-AZ] messages 탭 조회 시작: ${startDate} ~ ${endDate} (${chatName || "전체"})`);
 
   const res = await fetch(url);

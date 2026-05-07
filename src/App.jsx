@@ -3885,7 +3885,8 @@ export default function App() {
   // ★ 영역 12-AZ: messages 탭 가져오기 모달 state
   const [tabModalOpen, setTabModalOpen] = useState(false);
   const [tabFetchLoading, setTabFetchLoading] = useState(false);
-  // 디폴트: 최근 7일 (인니 시간 기준)
+  // 디폴트: 직전 1일치 (어제~오늘, 인니 시간 기준)
+  // 06:00 생산일 룰 고려 — endDate=오늘로 두면 오늘 새벽 마감 메시지(어제 생산분)까지 포함됨
   const _today = new Date();
   const _wibToday = new Date(_today.getTime() + (7 * 60 - _today.getTimezoneOffset()) * 60 * 1000);
   const _toYMD = (d) => {
@@ -3895,10 +3896,10 @@ export default function App() {
     return `${y}-${m}-${dd}`;
   };
   const [tabStartDate, setTabStartDate] = useState(() => {
-    const d = new Date(_wibToday.getTime() - 6 * 24 * 3600 * 1000);
+    const d = new Date(_wibToday.getTime() - 1 * 24 * 3600 * 1000);  // 어제
     return _toYMD(d);
   });
-  const [tabEndDate, setTabEndDate] = useState(() => _toYMD(_wibToday));
+  const [tabEndDate, setTabEndDate] = useState(() => _toYMD(_wibToday));  // 오늘
   // ★ 영역 5: 선정 기준 드롭다운 (평소 숨김)
   const [showCriteriaBox, setShowCriteriaBox] = useState(false);
   // ★ 영역 6: PE 사전 큐레이션 결과 캐싱 + 사용자 선택 이슈 관리
@@ -4002,8 +4003,11 @@ export default function App() {
       const ds = getUniqueDates(msgs);
       setAllMsgs(msgs);
       setDates(ds);
+      // ★ 영역 12-AZ: 가장 최근 생산일 자동 선택 + STEP 1 패스
+      // messages 탭에서 가져올 때는 사용자가 이미 일자 범위를 모달에서 선택했으므로
+      // STEP 1 (날짜 선택) 건너뛰고 STEP 2 (이슈 분류)로 직접 진입
       setSelDates([ds[ds.length - 1]]);
-      setStep(1);
+      setStep(2);
       setTabModalOpen(false);
     } catch (err) {
       console.error("[12-AZ] messages 탭 조회 실패:", err);

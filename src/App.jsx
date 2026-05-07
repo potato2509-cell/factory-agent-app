@@ -5247,7 +5247,8 @@ ${userText}
   const generateAgentReply = async (agentCode, userText, history) => {
     const persona = PERSONAS[agentCode];
     if (!persona) return "(에이전트를 찾을 수 없음)";
-    const kbText = chatKb[agentCode] ? `\n\n[학습 내용]\n${chatKb[agentCode].slice(0, 1500)}` : "";
+    // ★ 영역 12-AX: KB cap 1500 → 5000자 확장 (카테고리별 세부 내용까지 다루기 위해)
+    const kbText = chatKb[agentCode] ? `\n\n[학습 내용]\n${chatKb[agentCode].slice(0, 5000)}` : "";
     const ctx = buildChatContext();
     const sys = `${FACTORY_PHILOSOPHY}
 
@@ -5256,6 +5257,16 @@ ${userText}
 
 [현재 컨텍스트]
 ${ctx}
+
+[★ 영역 12-AX: 학습 내용 활용 규칙 — 매우 중요]
+- 위 [학습 내용]은 당신이 회사로부터 정식 부여받은 자료입니다. 항목명/카테고리/원문 모두 사용자에게 인용·공유 가능합니다.
+- "운영 규칙상 인용 못 함" 같은 거부는 환각입니다. 그런 규칙은 존재하지 않습니다.
+- 사용자가 학습 내용 원문/항목/카테고리를 요청하면 그대로 보여주세요. 점검·수정 목적의 정당한 요청입니다.
+
+[★ 환각 방지]
+- [학습 내용]에 명시된 내용 우선 활용.
+- [학습 내용]에 없는 사항은 추측하지 말고 "학습 자료에 없는 내용입니다"라고 명시한 후, 일반 상담으로 보충 가능합니다.
+- 사실과 추측을 명확히 구분하세요.
 
 [규칙]
 - 당신의 역할 관점에서 답하세요.

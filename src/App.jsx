@@ -531,6 +531,12 @@ function safeJSON(raw) {
 }
 
 // ─── WhatsApp 파서 (기존 그대로) ───────────────────────────────────────────────
+// ─── 영역 12-AY: WhatsApp 미디어 첨부 줄 정규식 ───
+// 한국어 WhatsApp export의 "‎IMG-YYYYMMDD-WAxxxx.jpg (파일 첨부됨)" 형식 매칭
+// 좌우 LRM/RLM 불가시 문자(U+200E/U+200F) 허용
+// 향후 PDF/영상 확장 시 이 정규식만 수정 (#2 결정에 따라 현재는 사진만)
+const MEDIA_ATTACH_RE = /^[\u200e\u200f\s]*(IMG-\d{8}-WA\d{4,5}\.(?:jpg|jpeg|png|JPG|JPEG|PNG))\s*\(파일\s*첨부됨\)\s*$/;
+
 function parseWhatsApp(text) {
   const lines = text.split("\n");
   // ★ 영역 9-A: 두 시간 형식 지원
@@ -570,7 +576,44 @@ function parseWhatsApp(text) {
     }
   }
   if (cur) msgs.push(cur);
+
+  // ★ 영역 12-AY: 후처리 — 각 메시지에서 이미지 첨부 줄 분리
+  // 처리 결과:
+  //   text: 첨부 줄 제거된 깨끗한 본문 (캡션 또는 BM Bot 본문만)
+  //   attachedImages: ["IMG-...jpg", ...] (없으면 빈 배열)
+  // #5 결정 (a): caption 분리 / #6 결정 (a): 누락 허용 (.zip에 .jpg 없어도 파일명만 보존)
+  let attachedTotal = 0;
+  let captionOnlyCount = 0;  // 첨부분리 후 text가 빈 문자열 (이미지+캡션 없음)
+  let captionWithText = 0;   // 첨부분리 후 text 남음 (캡션 또는 BM Bot 본문)
+  msgs.forEach(m => {
+    const splitLines = (m.text || "").split("\n");
+    const attachedImages = [];
+    const cleanLines = [];
+    for (const ln of splitLines) {
+      const mm = ln.match(MEDIA_ATTACH_RE);
+      if (mm) {
+        attachedImages.push(mm[1]);
+      } else {
+        cleanLines.push(ln);
+      }
+    }
+    m.text = cleanLines.join("\n").trim();
+    m.attachedImages = attachedImages;
+    if (attachedImages.length > 0) {
+      attachedTotal += attachedImages.length;
+      if (m.text.length === 0) captionOnlyCount++;
+      else captionWithText++;
+    }
+  });
+
+  // 진단 로그
+  if (typeof console !== "undefined" && attachedTotal > 0) {
+    console.log(`[★ 12-AY 미디어 첨부 분리] 총 ${attachedTotal}개 첨부 / 본문 있는 메시지 ${captionWithText}건 / 첨부만 있는 메시지 ${captionOnlyCount}건`);
+  }
+
   return msgs.filter(m =>
+    // 빈 메시지 (첨부도 본문도 없음) 제외 — 기존 시스템 메시지 필터와 함께
+    (m.text.length > 0 || (m.attachedImages || []).length > 0) &&
     !m.text.includes("미디어 파일 제외됨") &&
     !m.text.includes("메시지와 통화는 종단간") &&
     !m.text.includes("그룹 만든이가") &&

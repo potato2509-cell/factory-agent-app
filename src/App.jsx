@@ -622,6 +622,126 @@ function parseWhatsApp(text) {
   );
 }
 
+// ─── 영역 12-AY-2: JSZip CDN 동적 로드 (pdf.js 패턴과 동일) ─────────────────
+// .zip 처리 시점에만 로드하여 평소 빌드 무게 0
+let _jszipPromise = null;
+function loadJSZip() {
+  if (_jszipPromise) return _jszipPromise;
+  if (typeof window !== "undefined" && window.JSZip) {
+    _jszipPromise = Promise.resolve(window.JSZip);
+    return _jszipPromise;
+  }
+  _jszipPromise = new Promise((resolve, reject) => {
+    const script = document.createElement("script");
+    script.src = "https://cdnjs.cloudflare.com/ajax/libs/jszip/3.10.1/jszip.min.js";
+    script.onload = () => {
+      if (window.JSZip) {
+        console.log("[12-AY-2] JSZip CDN 로드 완료");
+        resolve(window.JSZip);
+      } else {
+        reject(new Error("JSZip 로드 후에도 window.JSZip 없음"));
+      }
+    };
+    script.onerror = () => reject(new Error("JSZip CDN 로드 실패 (네트워크/CSP 확인)"));
+    document.head.appendChild(script);
+  });
+  return _jszipPromise;
+}
+
+// ─── 영역 12-AY-2: .zip 백업 풀어 메시지 + 이미지 추출 ────────────────────────
+// 입력: File 객체 (.zip)
+// 처리:
+//   1. JSZip으로 .zip 풀기
+//   2. .txt 파일 자동 감지 → parseWhatsApp으로 파싱
+//   3. .jpg/.jpeg/.png 파일을 base64로 변환 → 파일명 매핑 (별도 객체, 메모리 효율)
+//   4. 메시지의 attachedImages 파일명과 실제 이미지 매칭 통계 산출
+// 출력: { messages: [...], images: { "IMG-...jpg": "base64..." }, stats: {...} }
+//   - messages: parseWhatsApp 결과 (attachedImages 포함)
+//   - images: 파일명 → base64 매핑 (3단계에서 Apps Script 호출 시 메시지 단위로 잘라서 전송)
+//   - stats: 진단용 통계
+async function extractZipBundle(file) {
+  const t0 = Date.now();
+  console.log(`[12-AY-2] .zip 처리 시작: ${file.name} (${(file.size / 1024 / 1024).toFixed(2)} MB)`);
+
+  // 1) JSZip 로드 + .zip 풀기
+  const JSZip = await loadJSZip();
+  const zip = await JSZip.loadAsync(file);
+
+  // 2) 파일 분류
+  const fileEntries = Object.entries(zip.files);
+  const txtFiles = fileEntries.filter(([name, entry]) => !entry.dir && /\.txt$/i.test(name));
+  const imageFiles = fileEntries.filter(([name, entry]) =>
+    !entry.dir && /\.(jpe?g|png)$/i.test(name)
+  );
+
+  console.log(`[12-AY-2] .zip 내용: 파일 ${fileEntries.length}개 (txt ${txtFiles.length}, 이미지 ${imageFiles.length})`);
+
+  if (txtFiles.length === 0) {
+    throw new Error(".zip 안에 .txt 파일이 없습니다. WhatsApp 채팅 내보내기 형식인지 확인해주세요.");
+  }
+
+  // 3) .txt 파싱 (여러 개면 모두 합침)
+  let allMessages = [];
+  for (const [txtName, entry] of txtFiles) {
+    const txtContent = await entry.async("string");
+    const parsed = parseWhatsApp(txtContent);
+    allMessages = allMessages.concat(parsed);
+    console.log(`[12-AY-2] ${txtName}: ${parsed.length} 메시지 파싱`);
+  }
+
+  // 4) 이미지를 base64로 변환 + 파일명 매핑 (#3 결정 b: 별도 객체)
+  // 파일명은 폴더 경로 제거 (예: "WhatsApp Chat/IMG-...jpg" → "IMG-...jpg")
+  const images = {};
+  for (const [imgPath, entry] of imageFiles) {
+    const baseName = imgPath.split("/").pop();
+    const base64 = await entry.async("base64");
+    images[baseName] = base64;
+  }
+  console.log(`[12-AY-2] 이미지 base64 변환 완료: ${Object.keys(images).length}개`);
+
+  // 5) 통계: 매칭/누락 분석
+  const allAttachedFilenames = new Set();
+  allMessages.forEach(m => (m.attachedImages || []).forEach(fn => allAttachedFilenames.add(fn)));
+  const matchedCount = [...allAttachedFilenames].filter(fn => images[fn]).length;
+  const missingFromZip = [...allAttachedFilenames].filter(fn => !images[fn]);
+  const orphanImages = Object.keys(images).filter(fn => !allAttachedFilenames.has(fn));
+
+  const elapsedSec = ((Date.now() - t0) / 1000).toFixed(1);
+  const stats = {
+    elapsedSec,
+    fileSizeMB: (file.size / 1024 / 1024).toFixed(2),
+    txtCount: txtFiles.length,
+    imageFileCount: imageFiles.length,
+    messageCount: allMessages.length,
+    attachedFilenameCount: allAttachedFilenames.size,
+    matchedCount,
+    missingFromZipCount: missingFromZip.length,
+    orphanImageCount: orphanImages.length,
+  };
+
+  // 진단 로그 (#3 결정 b: 통계 + 미리보기)
+  console.log(`[12-AY-2] ✅ 추출 완료 (${elapsedSec}초)`, stats);
+  console.log(`[12-AY-2] 첫 5개 메시지 미리보기:`);
+  allMessages.slice(0, 5).forEach((m, i) => {
+    const txtPrev = (m.text || "").slice(0, 80).replace(/\n/g, " | ");
+    const attached = (m.attachedImages || []).join(", ") || "(없음)";
+    console.log(`  [${i+1}] ${m.date} ${m.time} ${m.sender}: text="${txtPrev}" attached=[${attached}]`);
+  });
+  console.log(`[12-AY-2] 첫 3개 이미지 base64 길이:`);
+  Object.entries(images).slice(0, 3).forEach(([fn, b64]) => {
+    console.log(`  ${fn}: ${b64.length} 글자 (${(b64.length * 0.75 / 1024).toFixed(1)} KB 디코딩 추정)`);
+  });
+  if (missingFromZip.length > 0) {
+    console.warn(`[12-AY-2] ⚠️ .txt에 첨부 줄 있는데 .zip에 없는 이미지 ${missingFromZip.length}건 (#6 결정 a: 누락 허용)`);
+    console.warn(`  샘플: ${missingFromZip.slice(0, 5).join(", ")}`);
+  }
+  if (orphanImages.length > 0) {
+    console.warn(`[12-AY-2] ℹ️ .zip에 있는데 .txt 첨부 줄에 없는 이미지 ${orphanImages.length}건 (참조 안 됨, 무시)`);
+  }
+
+  return { messages: allMessages, images, stats };
+}
+
 function getProductionDate(date, hour) {
   if (hour < 6) {
     const parts = date.split("/").map(Number);
@@ -3730,14 +3850,42 @@ export default function App() {
   const handleFile = async (e) => {
     const f = e.target.files[0];
     if (!f) return;
-    const text = await f.text();
-    const msgs = parseWhatsApp(text);
-    const ds = getUniqueDates(msgs);
-    setAllMsgs(msgs);
-    setDates(ds);
-    setSelDates([ds[ds.length-1]]);
-    setStep(1);
-    setError("");
+
+    // ★ 영역 12-AY-2: .zip vs .txt 분기
+    const isZip = /\.zip$/i.test(f.name);
+
+    try {
+      if (isZip) {
+        // .zip 처리: extractZipBundle → 메시지 + 이미지 base64
+        // (3단계에서 Apps Script bulkImport 호출 연결 예정. 현재는 console에 통계만 출력)
+        const result = await extractZipBundle(f);
+        // 일단 메시지만 기존 흐름에 적재 (이미지는 window에 임시 보관 → 3단계에서 활용)
+        if (typeof window !== "undefined") {
+          window.__zipImagesBuffer = result.images;
+          window.__zipExtractStats = result.stats;
+        }
+        const msgs = result.messages;
+        const ds = getUniqueDates(msgs);
+        setAllMsgs(msgs);
+        setDates(ds);
+        setSelDates([ds[ds.length-1]]);
+        setStep(1);
+        setError("");
+      } else {
+        // .txt 처리: 기존 흐름 그대로
+        const text = await f.text();
+        const msgs = parseWhatsApp(text);
+        const ds = getUniqueDates(msgs);
+        setAllMsgs(msgs);
+        setDates(ds);
+        setSelDates([ds[ds.length-1]]);
+        setStep(1);
+        setError("");
+      }
+    } catch (err) {
+      console.error("[12-AY-2] 파일 처리 실패:", err);
+      setError(`파일 처리 실패: ${err?.message || err}`);
+    }
   };
 
   const handleDateConfirm = () => {
@@ -5504,17 +5652,17 @@ ${userText}
           <div>
             <div style={{marginBottom:20}}>
               <div style={{fontSize:17,fontWeight:800,color:"#f1f5f9",marginBottom:4}}>WhatsApp 채팅 파일 업로드</div>
-              <div style={{fontSize:12,color:"#475569"}}>WhatsApp → 채팅 내보내기 → txt 파일</div>
+              <div style={{fontSize:12,color:"#475569"}}>WhatsApp → 채팅 내보내기 → .txt 또는 .zip (이미지 포함)</div>
             </div>
             <div onClick={()=>fileRef.current?.click()} style={{
               border:"2px dashed rgba(34,211,238,0.3)", borderRadius:12,
               padding:"48px 20px", textAlign:"center", cursor:"pointer",
               background:"rgba(34,211,238,0.03)", marginBottom:20,
             }}>
-              <input ref={fileRef} type="file" accept=".txt" onChange={handleFile} style={{display:"none"}}/>
+              <input ref={fileRef} type="file" accept=".txt,.zip" onChange={handleFile} style={{display:"none"}}/>
               <div style={{fontSize:40,marginBottom:12}}>📂</div>
-              <div style={{fontSize:14,color:"#22d3ee",fontWeight:700}}>클릭하여 txt 파일 선택</div>
-              <div style={{fontSize:11,color:"#374151",marginTop:4}}>WhatsApp 채팅 내보내기 (.txt)</div>
+              <div style={{fontSize:14,color:"#22d3ee",fontWeight:700}}>클릭하여 .txt 또는 .zip 파일 선택</div>
+              <div style={{fontSize:11,color:"#374151",marginTop:4}}>WhatsApp 채팅 내보내기 (.txt: 텍스트만 / .zip: 이미지 포함)</div>
             </div>
             <div style={{
               padding:"10px 14px", background:"rgba(34,211,238,0.05)",
@@ -5522,7 +5670,8 @@ ${userText}
               fontSize:11, color:"#22d3ee", lineHeight:1.7,
             }}>
               💡 날짜 기준: 06:00 이전 메시지는 전날 생산분으로 처리됩니다<br/>
-              🆕 v3.1: PE 사전 큐레이션 + 대화체 논의 + 사회자 3단계 폴백 + 이슈 상세 카드 + 기조치 평가
+              🆕 v3.1: PE 사전 큐레이션 + 대화체 논의 + 사회자 3단계 폴백 + 이슈 상세 카드 + 기조치 평가<br/>
+              🆕 12-AY: .zip 백업 지원 (이미지 첨부 자동 분리, 콘솔에 통계 출력)
             </div>
           </div>
         )}

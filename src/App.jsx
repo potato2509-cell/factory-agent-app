@@ -742,6 +742,71 @@ async function extractZipBundle(file) {
   return { messages: allMessages, images, stats };
 }
 
+// ─── 영역 12-AZ: messages 탭에서 자동연동 데이터 가져오기 ────────────────────
+// Whapi → Apps Script → messages 탭에 자동 적재된 데이터를 직접 조회.
+// 5/4 이후 자동연동 데이터 + 5/3 이전 .zip 일괄 import 데이터 모두 같은 탭에서 조회.
+//
+// 입력:
+//   startDate: "YYYY-MM-DD" (인니 시간 기준, 예: "2026-05-04")
+//   endDate:   "YYYY-MM-DD" (인니 시간 기준)
+//   chatName:  필터할 그룹명 (디폴트: "[Official] AZS Status Reports")
+//
+// 출력: parseWhatsApp과 호환되는 메시지 배열
+//   [{ date, time, hour, sender, text, attachedImages, ... }, ...]
+//
+// 매핑:
+//   timestamp(UTC) → +7시간(인니) → date/time/hour
+//   sender_name → sender (없으면 sender_phone)
+//   message_type=image → attachedImages = [drive_file_id] (Drive 파일 ID 그대로)
+async function fetchMessagesFromTab(startDate, endDate, chatName) {
+  const t0 = Date.now();
+  const params = new URLSearchParams({
+    action: "get_messages",
+    startDate,
+    endDate,
+  });
+  if (chatName) params.set("chatName", chatName);
+
+  const url = `${APPS_SCRIPT_URL}?${params.toString()}`;
+  console.log(`[12-AZ] messages 탭 조회 시작: ${startDate} ~ ${endDate} (${chatName || "전체"})`);
+
+  const res = await fetch(url);
+  if (!res.ok) {
+    throw new Error(`HTTP ${res.status}: ${res.statusText}`);
+  }
+  const json = await res.json();
+  if (!json.ok) {
+    throw new Error(json.error || "Apps Script 응답 오류");
+  }
+
+  const elapsedSec = ((Date.now() - t0) / 1000).toFixed(1);
+  const messages = json.messages || [];
+  console.log(`[12-AZ] ✅ messages 탭 조회 완료 (${elapsedSec}초): ${messages.length}건`);
+
+  // 통계
+  const withAttached = messages.filter(m => (m.attachedImages || []).length > 0).length;
+  const imageMsgs = messages.filter(m => m._messageType === "image").length;
+  console.log(`[12-AZ] 통계: 첨부 있는 메시지 ${withAttached}건 / image 타입 ${imageMsgs}건`);
+
+  if (messages.length > 0) {
+    console.log(`[12-AZ] 첫 3개 메시지 미리보기:`);
+    messages.slice(0, 3).forEach((m, i) => {
+      const txtPrev = (m.text || "").slice(0, 80).replace(/\n/g, " | ");
+      console.log(`  [${i+1}] ${m.date} ${m.time} ${m.sender}: "${txtPrev}" attached=${(m.attachedImages || []).length}`);
+    });
+  }
+
+  return messages;
+}
+
+// ─── 영역 12-AZ: drive_file_id → Drive 미리보기 URL 생성 (필요 시 사용) ─────
+// attachedImages 안의 값이 drive_file_id 형식이면 이 함수로 URL 생성.
+// .txt에서 온 IMG-...jpg 파일명은 변환 안 됨 (현재 분석 흐름엔 미사용).
+function driveFileIdToUrl(fileId) {
+  if (!fileId || fileId.startsWith("IMG-")) return null;  // 파일명 형식이면 패스
+  return `https://drive.google.com/uc?id=${fileId}`;
+}
+
 function getProductionDate(date, hour) {
   if (hour < 6) {
     const parts = date.split("/").map(Number);
@@ -3814,6 +3879,23 @@ export default function App() {
   // ★ 공정/추가 에이전트 선택 state
   const [selectedProcess, setSelectedProcess] = useState("Cell");
   const [extraAgents, setExtraAgents] = useState([]);
+  // ★ 영역 12-AZ: messages 탭 가져오기 모달 state
+  const [tabModalOpen, setTabModalOpen] = useState(false);
+  const [tabFetchLoading, setTabFetchLoading] = useState(false);
+  // 디폴트: 최근 7일 (인니 시간 기준)
+  const _today = new Date();
+  const _wibToday = new Date(_today.getTime() + (7 * 60 - _today.getTimezoneOffset()) * 60 * 1000);
+  const _toYMD = (d) => {
+    const y = d.getUTCFullYear();
+    const m = String(d.getUTCMonth() + 1).padStart(2, "0");
+    const dd = String(d.getUTCDate()).padStart(2, "0");
+    return `${y}-${m}-${dd}`;
+  };
+  const [tabStartDate, setTabStartDate] = useState(() => {
+    const d = new Date(_wibToday.getTime() - 6 * 24 * 3600 * 1000);
+    return _toYMD(d);
+  });
+  const [tabEndDate, setTabEndDate] = useState(() => _toYMD(_wibToday));
   // ★ 영역 5: 선정 기준 드롭다운 (평소 숨김)
   const [showCriteriaBox, setShowCriteriaBox] = useState(false);
   // ★ 영역 6: PE 사전 큐레이션 결과 캐싱 + 사용자 선택 이슈 관리
@@ -3885,6 +3967,46 @@ export default function App() {
     } catch (err) {
       console.error("[12-AY-2] 파일 처리 실패:", err);
       setError(`파일 처리 실패: ${err?.message || err}`);
+    }
+  };
+
+  // ★ 영역 12-AZ: messages 탭에서 자동연동 데이터 가져오기
+  const handleFetchFromTab = async () => {
+    if (!tabStartDate || !tabEndDate) {
+      setError("일자 범위를 선택해주세요");
+      return;
+    }
+    if (tabStartDate > tabEndDate) {
+      setError("시작일이 종료일보다 늦습니다");
+      return;
+    }
+
+    setTabFetchLoading(true);
+    setError("");
+    try {
+      const msgs = await fetchMessagesFromTab(
+        tabStartDate,
+        tabEndDate,
+        "[Official] AZS Status Reports"
+      );
+
+      if (msgs.length === 0) {
+        setError(`해당 기간(${tabStartDate} ~ ${tabEndDate})에 메시지가 없습니다`);
+        setTabFetchLoading(false);
+        return;
+      }
+
+      const ds = getUniqueDates(msgs);
+      setAllMsgs(msgs);
+      setDates(ds);
+      setSelDates([ds[ds.length - 1]]);
+      setStep(1);
+      setTabModalOpen(false);
+    } catch (err) {
+      console.error("[12-AZ] messages 탭 조회 실패:", err);
+      setError(`조회 실패: ${err?.message || err}`);
+    } finally {
+      setTabFetchLoading(false);
     }
   };
 
@@ -5647,23 +5769,37 @@ ${userText}
 
       <div style={{maxWidth:720, margin:"0 auto", padding:"24px 18px 60px"}}>
 
-        {/* STEP 0: 파일 업로드 */}
+        {/* STEP 0: 데이터 소스 선택 (영역 12-AZ) */}
         {step===0 && (
           <div>
             <div style={{marginBottom:20}}>
-              <div style={{fontSize:17,fontWeight:800,color:"#f1f5f9",marginBottom:4}}>WhatsApp 채팅 파일 업로드</div>
-              <div style={{fontSize:12,color:"#475569"}}>WhatsApp → 채팅 내보내기 → .txt 또는 .zip (이미지 포함)</div>
+              <div style={{fontSize:17,fontWeight:800,color:"#f1f5f9",marginBottom:4}}>데이터 소스 선택</div>
+              <div style={{fontSize:12,color:"#475569"}}>분석할 WhatsApp 메시지를 어디서 가져올지 선택</div>
             </div>
+
+            {/* 옵션 1: 파일 업로드 (.txt / .zip) */}
             <div onClick={()=>fileRef.current?.click()} style={{
               border:"2px dashed rgba(34,211,238,0.3)", borderRadius:12,
-              padding:"48px 20px", textAlign:"center", cursor:"pointer",
-              background:"rgba(34,211,238,0.03)", marginBottom:20,
+              padding:"32px 20px", textAlign:"center", cursor:"pointer",
+              background:"rgba(34,211,238,0.03)", marginBottom:14,
             }}>
               <input ref={fileRef} type="file" accept=".txt,.zip" onChange={handleFile} style={{display:"none"}}/>
-              <div style={{fontSize:40,marginBottom:12}}>📂</div>
-              <div style={{fontSize:14,color:"#22d3ee",fontWeight:700}}>클릭하여 .txt 또는 .zip 파일 선택</div>
-              <div style={{fontSize:11,color:"#374151",marginTop:4}}>WhatsApp 채팅 내보내기 (.txt: 텍스트만 / .zip: 이미지 포함)</div>
+              <div style={{fontSize:36,marginBottom:8}}>📂</div>
+              <div style={{fontSize:15,color:"#22d3ee",fontWeight:700,marginBottom:4}}>.txt / .zip 파일 업로드</div>
+              <div style={{fontSize:11,color:"#374151"}}>WhatsApp 채팅 내보내기 (수동)</div>
             </div>
+
+            {/* 옵션 2: messages 탭에서 가져오기 (12-AZ) */}
+            <div onClick={()=>setTabModalOpen(true)} style={{
+              border:"2px dashed rgba(168,85,247,0.4)", borderRadius:12,
+              padding:"32px 20px", textAlign:"center", cursor:"pointer",
+              background:"rgba(168,85,247,0.05)", marginBottom:20,
+            }}>
+              <div style={{fontSize:36,marginBottom:8}}>📡</div>
+              <div style={{fontSize:15,color:"#a855f7",fontWeight:700,marginBottom:4}}>messages 탭에서 가져오기</div>
+              <div style={{fontSize:11,color:"#374151"}}>Whapi 자동연동 데이터 (실시간) — 5/4 이후</div>
+            </div>
+
             <div style={{
               padding:"10px 14px", background:"rgba(34,211,238,0.05)",
               border:"1px solid rgba(34,211,238,0.2)", borderRadius:8,
@@ -5671,7 +5807,67 @@ ${userText}
             }}>
               💡 날짜 기준: 06:00 이전 메시지는 전날 생산분으로 처리됩니다<br/>
               🆕 v3.1: PE 사전 큐레이션 + 대화체 논의 + 사회자 3단계 폴백 + 이슈 상세 카드 + 기조치 평가<br/>
-              🆕 12-AY: .zip 백업 지원 (이미지 첨부 자동 분리, 콘솔에 통계 출력)
+              🆕 12-AY: .zip 백업 지원 / 12-AZ: messages 탭 자동연동 직접 조회
+            </div>
+          </div>
+        )}
+
+        {/* ★ 영역 12-AZ: messages 탭 가져오기 모달 */}
+        {tabModalOpen && (
+          <div style={{
+            position:"fixed", top:0, left:0, right:0, bottom:0,
+            background:"rgba(0,0,0,0.7)", zIndex:1000,
+            display:"flex", alignItems:"center", justifyContent:"center",
+            padding:20,
+          }} onClick={(e)=>{ if(e.target===e.currentTarget) setTabModalOpen(false); }}>
+            <div style={{
+              background:"#0f172a", border:"1px solid rgba(168,85,247,0.4)",
+              borderRadius:12, padding:24, maxWidth:420, width:"100%",
+            }}>
+              <div style={{fontSize:17,fontWeight:800,color:"#a855f7",marginBottom:16}}>📡 messages 탭에서 가져오기</div>
+              <div style={{fontSize:12,color:"#94a3b8",marginBottom:16,lineHeight:1.6}}>
+                Whapi 자동연동된 메시지를 인니 시간 기준으로 조회합니다.<br/>
+                기본값은 최근 7일입니다.
+              </div>
+
+              <div style={{marginBottom:14}}>
+                <div style={{fontSize:12,color:"#cbd5e1",marginBottom:6}}>시작일 (인니 시간)</div>
+                <input type="date" value={tabStartDate} onChange={(e)=>setTabStartDate(e.target.value)} style={{
+                  width:"100%", padding:"10px 12px", borderRadius:8,
+                  border:"1px solid rgba(168,85,247,0.3)", background:"#1e293b", color:"#f1f5f9",
+                  fontSize:14,
+                }}/>
+              </div>
+
+              <div style={{marginBottom:18}}>
+                <div style={{fontSize:12,color:"#cbd5e1",marginBottom:6}}>종료일 (인니 시간)</div>
+                <input type="date" value={tabEndDate} onChange={(e)=>setTabEndDate(e.target.value)} style={{
+                  width:"100%", padding:"10px 12px", borderRadius:8,
+                  border:"1px solid rgba(168,85,247,0.3)", background:"#1e293b", color:"#f1f5f9",
+                  fontSize:14,
+                }}/>
+              </div>
+
+              <div style={{display:"flex", gap:10}}>
+                <button onClick={()=>setTabModalOpen(false)} disabled={tabFetchLoading} style={{
+                  flex:1, padding:"12px", borderRadius:8,
+                  border:"1px solid rgba(148,163,184,0.3)", background:"transparent", color:"#94a3b8",
+                  fontSize:14, fontWeight:600, cursor: tabFetchLoading ? "not-allowed" : "pointer",
+                }}>취소</button>
+                <button onClick={handleFetchFromTab} disabled={tabFetchLoading} style={{
+                  flex:2, padding:"12px", borderRadius:8,
+                  border:"none", background: tabFetchLoading ? "#475569" : "#a855f7", color:"#fff",
+                  fontSize:14, fontWeight:700, cursor: tabFetchLoading ? "wait" : "pointer",
+                }}>{tabFetchLoading ? "조회 중..." : "가져오기"}</button>
+              </div>
+
+              {error && (
+                <div style={{
+                  marginTop:14, padding:"8px 12px", borderRadius:6,
+                  background:"rgba(239,68,68,0.1)", border:"1px solid rgba(239,68,68,0.3)",
+                  color:"#f87171", fontSize:12,
+                }}>⚠️ {error}</div>
+              )}
             </div>
           </div>
         )}

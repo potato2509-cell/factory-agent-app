@@ -2156,7 +2156,9 @@ ${focus}
       "actionSequence": ["1. 조치", "2. 조치"],
 
       "splitNote": "(옵셔널) 분할 보고 통합 시만 작성, 단일 보고면 빈 문자열 ''",
-      "splitDetail": [],
+      "splitDetail": [
+        {"order": 1, "duration": 65, "time": "15:55", "description": "(옵셔널 짧은 설명)", "gapMin": 0}
+      ],
       "recurrenceGap": "(옵셔널) 단발이면 빈 문자열 ''",
       "collateralDamage": "(옵셔널) 부수 피해 있을 때만, 없으면 ''",
       "historyPattern": "(옵셔널) KB에 단서 있을 때만, 없으면 ''",
@@ -4730,11 +4732,24 @@ export default function App() {
         setTimeout(() => setTeamsResult(null), 5000);
         return;
       }
+
+      // ★ 12-BE: HTML 문자열 생성 (Drive 적재용)
+      let htmlString = null;
+      try {
+        htmlString = downloadHtml(true);  // returnOnly 모드
+      } catch (htmlErr) {
+        console.error("[12-BE] HTML 생성 실패:", htmlErr);
+        // HTML 생성 실패해도 발송은 진행 (단순 카드만 발송, Drive 적재 스킵)
+      }
+
       const payload = {
         action: "send_report",
         secret: SHARED_SECRET,
         version: "v3",  // ★ 12-AS: 구조화 payload 버전 (Apps Script가 v3 인식 시 풀 디자인 사용)
         report: reportData,
+        // ★ 12-BE (γ 단계1): HTML 문자열 + 보고서 종류 — Apps Script가 Drive 적재 후 카드에 링크 추가
+        html: htmlString,
+        reportType: minutes.reportType || "daily",
         // 옛 호환 필드 (Apps Script가 v3 미인식 시 fallback)
         title: reportData.title,
         date: reportData.date,
@@ -4753,7 +4768,11 @@ export default function App() {
       });
       const data = await res.json().catch(() => ({}));
       if (res.ok && data.ok) {
-        setTeamsResult({ ok: true, msg: "✅ Teams 채널에 발송 완료" });
+        // ★ 12-BE: Drive URL 받으면 토스트에 포함
+        const driveMsg = data.driveUrl
+          ? `✅ Drive 저장 + Teams 발송 완료`
+          : `✅ Teams 채널에 발송 완료${htmlString ? " (Drive 저장 실패)" : ""}`;
+        setTeamsResult({ ok: true, msg: driveMsg, driveUrl: data.driveUrl || null });
       } else {
         setTeamsResult({ ok: false, msg: `❌ 발송 실패: ${data.error || res.status}` });
       }
@@ -4761,7 +4780,7 @@ export default function App() {
       setTeamsResult({ ok: false, msg: `❌ 네트워크 오류: ${e?.message || e}` });
     } finally {
       setTeamsSending(false);
-      setTimeout(() => setTeamsResult(null), 6000);
+      setTimeout(() => setTeamsResult(null), 8000);  // Drive URL 확인 시간 위해 6 → 8초
     }
   };
 
@@ -4809,8 +4828,10 @@ export default function App() {
   };
 
   // ─── ★ 영역 11-H: HTML 다운로드 (메인 1~7번) ──────────────────────────────────
-  const downloadHtml = () => {
-    if (!minutes) return;
+  // ★ 12-BE: returnOnly=true 면 HTML 문자열만 반환 (다운로드 X)
+  // sendToTeams에서 html을 payload에 포함시키기 위함
+  const downloadHtml = (returnOnly = false) => {
+    if (!minutes) return null;
     const title = minutes.title || "AZS Factory 일일 이슈 레포트";
     const cur = minutes.curation || {};
     const insights = minutes.insights || [];
@@ -4951,16 +4972,26 @@ export default function App() {
       const personaConvHtml = buildPersonaConvHtml(matchedDisc);
 
       // 분할 보고 정밀 분석
+      // ★ 12-BB2: 방어 코드 — LLM이 다른 필드명(차수/분/시간 등)으로 응답해도 자동 매핑
+      const _normalizeSplit = (sd) => ({
+        order: sd.order ?? sd.차수 ?? sd.idx ?? sd.no ?? sd.seq ?? "?",
+        duration: sd.duration ?? sd.분 ?? sd.durationMin ?? sd.dur ?? sd.minutes ?? "?",
+        time: sd.time ?? sd.시간 ?? sd.timeRange ?? sd.startTime ?? "",
+        gapMin: sd.gapMin ?? sd.gap ?? sd.간격 ?? null,
+        description: sd.description ?? sd.desc ?? sd.설명 ?? sd.note ?? "",
+      });
       const splitDetailHtml = (d.splitDetail || []).length > 0 ? `
         <div style="margin-top:8px;padding:8px 12px;background:#fffbe6;border-left:3px solid #fbbf24;border-radius:4px;">
           <div style="font-weight:700;color:#d97706;margin-bottom:4px;">📊 분할 보고 분석</div>
-          ${d.splitDetail.map(sd => `
+          ${d.splitDetail.map(rawSd => {
+            const sd = _normalizeSplit(rawSd);
+            return `
             <div style="font-size:0.92em;margin-bottom:3px;padding-left:8px;">
-              <b style="color:#e67e22;">${sd.order}차</b> — <b>${sd.duration}분</b> (${esc(sd.time)})
+              <b style="color:#e67e22;">${sd.order}차</b> — <b>${sd.duration}분</b> (${esc(String(sd.time))})
               ${sd.gapMin ? `<span style="color:#c0392b;margin-left:6px;font-weight:700;">· 1차 후 ${sd.gapMin}분만에 재발</span>` : ""}
-              ${sd.description ? `<div style="margin-top:1px;color:#666;">→ ${esc(sd.description)}</div>` : ""}
+              ${sd.description ? `<div style="margin-top:1px;color:#666;">→ ${esc(String(sd.description))}</div>` : ""}
             </div>
-          `).join("")}
+          `;}).join("")}
         </div>
       ` : "";
 
@@ -5429,6 +5460,9 @@ AZS Status Reports WhatsApp 데이터 기반 · ${new Date().toLocaleString("ko-
 
 </body>
 </html>`;
+
+    // ★ 12-BE: HTML 문자열만 반환 (sendToTeams에서 호출 시)
+    if (returnOnly) return html;
 
     const blob = new Blob([html], { type: "text/html;charset=utf-8" });
     const url = URL.createObjectURL(blob);
@@ -7493,17 +7527,26 @@ function BriefingDisplay({ curation, allIssues = [], selectedIds = [], autoSelec
                       {d.result && <tr><th style={thStyle}>결과</th><td style={{...tdStyle,color:d.result.toLowerCase().includes("solved")?"#34d399":"#fbbf24"}}>{d.result}</td></tr>}
                     </tbody>
                   </table>
-                  {/* ★ 12-Y1: 분할 보고 정밀 분석 */}
+                  {/* ★ 12-Y1 → 12-BB2: 분할 보고 정밀 분석 (방어 코드 — 다양한 필드명 자동 매핑) */}
                   {d.splitDetail?.length > 0 && (
                     <div style={{marginTop:8, padding:"8px 10px", background:"rgba(252,211,77,0.06)", borderLeft:"3px solid #fcd34d", borderRadius:4}}>
                       <div style={{fontSize:10.5,fontWeight:700,color:"#fcd34d",marginBottom:4}}>📊 분할 보고 분석</div>
-                      {d.splitDetail.map((sd, sdi) => (
-                        <div key={sdi} style={{fontSize:10,color:"#cbd5e1",marginBottom:3,paddingLeft:8}}>
-                          <span style={{fontWeight:700,color:"#fbbf24"}}>{sd.order}차</span> — <b>{sd.duration}분</b> ({sd.time})
-                          {sd.gapMin && <span style={{color:"#fca5a5",marginLeft:6,fontWeight:700}}>· 1차 후 {sd.gapMin}분만에 재발</span>}
-                          {sd.description && <div style={{marginTop:1,color:"#94a3b8"}}>→ {sd.description}</div>}
-                        </div>
-                      ))}
+                      {d.splitDetail.map((rawSd, sdi) => {
+                        const sd = {
+                          order: rawSd.order ?? rawSd.차수 ?? rawSd.idx ?? rawSd.no ?? rawSd.seq ?? "?",
+                          duration: rawSd.duration ?? rawSd.분 ?? rawSd.durationMin ?? rawSd.dur ?? rawSd.minutes ?? "?",
+                          time: rawSd.time ?? rawSd.시간 ?? rawSd.timeRange ?? rawSd.startTime ?? "",
+                          gapMin: rawSd.gapMin ?? rawSd.gap ?? rawSd.간격 ?? null,
+                          description: rawSd.description ?? rawSd.desc ?? rawSd.설명 ?? rawSd.note ?? "",
+                        };
+                        return (
+                          <div key={sdi} style={{fontSize:10,color:"#cbd5e1",marginBottom:3,paddingLeft:8}}>
+                            <span style={{fontWeight:700,color:"#fbbf24"}}>{sd.order}차</span> — <b>{sd.duration}분</b> ({sd.time})
+                            {sd.gapMin && <span style={{color:"#fca5a5",marginLeft:6,fontWeight:700}}>· 1차 후 {sd.gapMin}분만에 재발</span>}
+                            {sd.description && <div style={{marginTop:1,color:"#94a3b8"}}>→ {sd.description}</div>}
+                          </div>
+                        );
+                      })}
                     </div>
                   )}
                   {/* ★ 12-Y1: 재발 간격 (splitDetail 없는 경우 단독 표시) */}

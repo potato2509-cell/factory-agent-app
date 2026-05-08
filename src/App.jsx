@@ -1731,6 +1731,117 @@ function selectKeyIssuesFromTags(taggedIssues, maxIssues = MAX_ISSUES) {
 // ★ 새로운 논의 시스템 ★
 // ═════════════════════════════════════════════════════════════════════════════
 
+// ─── 영역 12-BD: 그룹 종합 (카테고리/호기) ─────────────────────────────────
+// 발생빈도 섹션의 빈 안내("...상위 섹션에 표시되었습니다")를 의미 있는 정보로 교체
+// 입력: 그룹 이슈 배열 (이슈는 eq, time, prob, cause, durMin 필드)
+// 출력: { pattern, implication } — 공통 패턴 1줄 + 시사점 1줄
+// 모델: Haiku (단순 패턴 추출, 비용 절약)
+// 룰 백업: LLM 실패 시 카운트 + 대표 호기로 단순 종합
+async function runOneGroupSynthesis(items, groupKey, groupValue) {
+  if (!items || items.length < 2) {
+    return null;  // 2건 미만은 종합 안 함
+  }
+
+  // 입력 압축: 이슈당 핵심 5필드만
+  const compactItems = items.map(i => ({
+    eq: i.eq || i.equipment || "?",
+    time: `${i.date || ""} ${i.time || ""}`.trim(),
+    prob: (i.prob || i.problem || "").slice(0, 80),
+    cause: (i.cause || i.rootCause || "").slice(0, 80),
+    dur: i.durMin || i.durationMin || 0,
+  }));
+
+  const sys = `너는 AZS 배터리 공장의 시니어 엔지니어다. 같은 ${groupKey === "category" ? "카테고리" : "호기"}에 속하는 이슈 ${items.length}건을 보고 공통 패턴과 시사점을 한국어로 요약한다.
+
+출력 형식 (JSON만, 다른 텍스트 금지):
+{
+  "pattern": "공통 패턴 1줄 (50자 내외, 핵심만)",
+  "implication": "시사점 또는 추가 액션 1줄 (50자 내외, 구체적으로)"
+}
+
+규칙:
+- pattern: 호기/시간/원인의 공통점 또는 반복 양상 (예: "STK-1-B4 Belt Mandrel loose 5회 반복, 야간대 집중")
+- implication: 시사점 또는 액션 (예: "Vision 팀 SLA 단축 + 1차 조치 강화 필요")
+- 데이터에 명확히 보이는 패턴만 작성 — 추측·과장 금지
+- 50자 초과 금지`;
+
+  const userMsg = `[${groupKey === "category" ? "카테고리" : "호기"}: ${groupValue}] 이슈 ${items.length}건:
+${JSON.stringify(compactItems, null, 0)}
+
+위 이슈들의 공통 패턴과 시사점을 JSON으로 반환.`;
+
+  const t0 = Date.now();
+  try {
+    const raw = await callClaudeRaw(sys, userMsg, {
+      model: MODEL_FAST,
+      max_tokens: 300,
+    });
+    const parsed = safeJSON(raw);
+    if (!parsed || typeof parsed !== "object") throw new Error("JSON 파싱 실패");
+    const pattern = String(parsed.pattern || "").trim();
+    const implication = String(parsed.implication || "").trim();
+    if (!pattern && !implication) throw new Error("빈 응답");
+    const elapsed = ((Date.now() - t0) / 1000).toFixed(1);
+    console.log(`[그룹 종합 ${groupKey}=${groupValue}] ${elapsed}초 — pattern: "${pattern.slice(0, 30)}..."`);
+    return { pattern: pattern.slice(0, 80), implication: implication.slice(0, 80) };
+  } catch (e) {
+    console.error(`[그룹 종합 ${groupKey}=${groupValue}] 실패 → 룰 백업:`, e?.message?.slice(0, 100));
+    // 룰 백업: 단순 카운트 + 대표 호기
+    const eqCount = {};
+    items.forEach(i => {
+      const eq = i.eq || i.equipment || "?";
+      eqCount[eq] = (eqCount[eq] || 0) + 1;
+    });
+    const topEq = Object.entries(eqCount).sort((a, b) => b[1] - a[1])[0];
+    return {
+      pattern: `${items.length}건 발생, 주요 호기: ${topEq[0]} (${topEq[1]}회)`,
+      implication: "추가 분석 필요 — 원본 데이터 확인 권장",
+      _ruleBackup: true,
+    };
+  }
+}
+
+// 그룹 배열 → 모두 병렬 호출, { groupValue: synthesis } 객체 반환
+async function runGroupSyntheses(groups, groupKey, allIssues) {
+  if (!groups || groups.length === 0) return {};
+
+  // 각 그룹의 이슈 배열 매핑
+  const tasks = groups.map(g => {
+    const groupValue = groupKey === "category" ? g.category : g.equipment;
+    let items = [];
+    if (groupKey === "category") {
+      // 카테고리에 속하는 모든 이슈 (cat에 매칭되는 것)
+      const eqSet = new Set((g.equipments || []).map(e =>
+        String(e || "").replace(/\s*\(×\d+\)/g, "").trim()
+      ).filter(Boolean));
+      items = allIssues.filter(i => eqSet.has(i.eq || ""));
+    } else {
+      // 호기에 속하는 모든 이슈
+      items = allIssues.filter(i => i.eq === groupValue);
+    }
+    return { groupValue, items };
+  });
+
+  // 2건 이상만 필터 후 병렬 호출
+  const eligibleTasks = tasks.filter(t => t.items.length >= 2);
+  if (eligibleTasks.length === 0) return {};
+
+  console.log(`[그룹 종합] ${groupKey} ${eligibleTasks.length}개 그룹 병렬 호출 시작`);
+  const t0 = Date.now();
+  const results = await Promise.all(
+    eligibleTasks.map(t => runOneGroupSynthesis(t.items, groupKey, t.groupValue))
+  );
+  const elapsed = ((Date.now() - t0) / 1000).toFixed(1);
+  console.log(`[그룹 종합] ${groupKey} ${eligibleTasks.length}개 완료 (${elapsed}초)`);
+
+  // { groupValue: synthesis } 객체로 변환
+  const map = {};
+  eligibleTasks.forEach((t, i) => {
+    if (results[i]) map[t.groupValue] = results[i];
+  });
+  return map;
+}
+
 // ─── 0. PE 사전 큐레이션 — 영역 12-X3 (7): Sonnet 3분할 병렬 호출 ─────────────
 // 각 호출 max_tokens 2000 / Sonnet (MODEL_REASONING) / 504 시 Haiku fallback
 // Promise.all로 동시 실행 → 전체 시간 = 가장 느린 1건 (~8~10초)
@@ -1907,6 +2018,16 @@ async function runPreCuration(allIssues, kbPE, reportType, categoryMsgs = {}) {
     ];
   }
 
+  // ★ 영역 12-BD: 그룹 종합 병렬 호출 (카테고리/호기 각각 ≥2건 그룹만)
+  const [bySyntheses_cat, bySyntheses_eq] = await Promise.all([
+    runGroupSyntheses(part2.recurringByCategory || [], "category", allIssues),
+    runGroupSyntheses(part2.recurringSameEquipment || [], "equipment", allIssues),
+  ]);
+  const groupSyntheses = {
+    byCategory: bySyntheses_cat,
+    byEquipment: bySyntheses_eq,
+  };
+
   // 결과 병합 — 영역 12-Y: 새 필드 (recordBreakdown, chronicIssues, conditionChangeGroups, chronic1AB, line3DCutterCpc) 보존
   return normalizeBriefing({
     summary_text: part1.summary_text || (backupLongDowntime.length > 0
@@ -1924,6 +2045,7 @@ async function runPreCuration(allIssues, kbPE, reportType, categoryMsgs = {}) {
     chronic1AB: part3.chronic1AB || null,  // ★ 12-Y3 1AB 만성 라인
     line3DCutterCpc: part3.line3DCutterCpc || null,  // ★ 12-Y3 Line 3D CPC
     qualityNg: part3.qualityNg || { table: [], trend: "데이터 없음" },
+    groupSyntheses,  // ★ 12-BD 그룹 종합
   });
 }
 
@@ -2386,6 +2508,13 @@ function normalizeBriefing(parsed) {
       table: arr(obj(parsed.qualityNg).table),
       trend: obj(parsed.qualityNg).trend || "데이터 없음",
     },
+    // ★ 영역 12-BD 그룹 종합 (카테고리/호기별 LLM 종합)
+    groupSyntheses: parsed.groupSyntheses && typeof parsed.groupSyntheses === "object"
+      ? {
+          byCategory: parsed.groupSyntheses.byCategory || {},
+          byEquipment: parsed.groupSyntheses.byEquipment || {},
+        }
+      : { byCategory: {}, byEquipment: {} },
   };
 
   // 하위호환: 일부 코드가 옛 필드명으로 참조 (long_downtime, recurring 등)
@@ -5013,18 +5142,27 @@ export default function App() {
       return ds.filter(d => d.issue?.eq === equipment);
     };
 
-    // ★ 12-AL D2-c: 그룹 단위 표시 — 미표시 멤버 중 가장 부동시간 긴 1개를 대표로 표시
+    // ★ 12-AL D2-c → 12-BD: 그룹 단위 표시 — 미표시 멤버 중 가장 부동시간 긴 1개를 대표로 표시
     // + 그룹의 다른 멤버는 "이 그룹의 다른 N건은 [위치] 참조" 안내만 추가
-    const buildGroupRepresentativeConv = (matches, groupLabel = "이 그룹") => {
+    // ★ 12-BD: synthesis 매개변수 추가 — LLM 그룹 종합 결과(pattern + implication) 표시
+    const buildGroupRepresentativeConv = (matches, groupLabel = "이 그룹", synthesis = null) => {
       if (!matches?.length) return "";
       // 미표시 멤버만 필터
       const unprinted = matches.filter(m => !isAlreadyPrinted(m));
       // 이미 표시된 멤버 수
       const alreadyShown = matches.length - unprinted.length;
 
+      // ★ 12-BD: synthesis 결과 HTML (있으면 항상 표시 — 빈 안내 대체)
+      const synthHtml = (synthesis && (synthesis.pattern || synthesis.implication))
+        ? `<div style="margin-top:8px;padding:10px 14px;background:#fef3c7;border-left:3px solid #f59e0b;border-radius:4px;font-size:0.88em;color:#78350f;line-height:1.6;">
+            ${synthesis.pattern ? `<div><b>🔍 공통 패턴:</b> ${esc(synthesis.pattern)}</div>` : ""}
+            ${synthesis.implication ? `<div style="margin-top:4px;"><b>💡 시사점:</b> ${esc(synthesis.implication)}</div>` : ""}
+          </div>`
+        : "";
+
       if (unprinted.length === 0) {
-        // 전부 다른 섹션에서 표시됨 → 안내만
-        return `<div style="margin-top:8px;padding:8px 12px;background:#f5f5f5;border-left:3px solid #94a3b8;border-radius:4px;font-size:0.88em;color:#64748b;">📌 ${esc(groupLabel)}의 페르소나 논의 ${matches.length}건은 모두 1번 장기부동 또는 상위 섹션에 표시되었습니다.</div>`;
+        // 전부 다른 섹션에서 표시됨 → synthesis만 표시 (빈 안내 제거 — 12-BD)
+        return synthHtml;
       }
 
       // 대표 1개: 미표시 중 가장 부동시간 긴 것
@@ -5052,7 +5190,7 @@ export default function App() {
         ? `<div style="margin-bottom:8px;padding:6px 10px;background:#fffbe6;border-left:3px solid #fbbf24;border-radius:4px;font-size:0.87em;color:#92400e;">📋 ${noticeParts.join(" · ")}</div>`
         : "";
 
-      return noticeHtml + buildPersonaConvHtml(rep);
+      return synthHtml + noticeHtml + buildPersonaConvHtml(rep);
     };
 
     // 옛 호환 (단일 표시 — 1번 장기부동에서만 사용)
@@ -5074,6 +5212,9 @@ export default function App() {
       .map(e => ({ ...e, _matches: findDiscussionsByEquipment(e.equipment) }))
       .sort((a, b) => (b._matches?.length || 0) - (a._matches?.length || 0));
 
+    // ★ 12-BD: 그룹 종합 데이터
+    const groupSyntheses = cur.groupSyntheses || { byCategory: {}, byEquipment: {} };
+
     // 2번 발생빈도 — 카테고리별 그룹 단위 표시
     const recurringCatHtml = (cur.recurringByCategory || []).length > 0 ? `
       <h3>카테고리별</h3>
@@ -5086,8 +5227,12 @@ export default function App() {
       ${recurringByCategorySorted.map(c => {
         const matches = c._matches || [];
         if (!matches.length) return "";
+        // ★ 12-BD: 1건 카테고리는 발생빈도 섹션에 표시 안 함 (가 옵션)
+        if ((c.count || 0) < 2 && matches.length < 2) return "";
         const groupLabel = `[${c.category}] 카테고리`;
-        const groupConv = buildGroupRepresentativeConv(matches, groupLabel);
+        const synthesis = groupSyntheses.byCategory[c.category] || null;
+        const groupConv = buildGroupRepresentativeConv(matches, groupLabel, synthesis);
+        if (!groupConv) return "";  // 빈 결과면 헤더도 표시 안 함
         return `<div style="margin-top:8px;padding-left:10px;border-left:3px solid #ddd;"><div style="font-size:0.88em;color:#666;margin-bottom:6px;"><b>📌 ${esc(groupLabel)}</b> 그룹 종합 (대표 1건):</div>${groupConv}</div>`;
       }).join("")}` : "";
 
@@ -5097,8 +5242,12 @@ export default function App() {
       ${recurringSameEquipmentSorted.map(e => {
         const matches = e._matches || [];
         if (!matches.length) return "";
+        // ★ 12-BD: 1건 호기는 발생빈도 섹션에 표시 안 함
+        if ((e.count || 0) < 2 && matches.length < 2) return "";
         const groupLabel = `[${e.equipment}] 호기`;
-        const groupConv = buildGroupRepresentativeConv(matches, groupLabel);
+        const synthesis = groupSyntheses.byEquipment[e.equipment] || null;
+        const groupConv = buildGroupRepresentativeConv(matches, groupLabel, synthesis);
+        if (!groupConv) return "";  // 빈 결과면 헤더도 표시 안 함
         return `<div style="margin-top:8px;padding-left:10px;border-left:3px solid #ddd;"><div style="font-size:0.88em;color:#666;margin-bottom:6px;"><b>📌 ${esc(groupLabel)}</b> 그룹 종합 (대표 1건):</div>${groupConv}</div>`;
       }).join("")}` : "";
 

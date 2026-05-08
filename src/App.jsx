@@ -4127,40 +4127,28 @@ export default function App() {
   };
 
   // ★ 영역 12-AZ-3: messages 탭 모드로 STEP 1 진입
-  // dates를 임의 60일치로 채워서 DateRangePicker가 그 안에서 자유 선택 가능
+  // dates를 250일치(~8개월)로 채워서 DateRangePicker가 그 안에서 자유 선택 가능
   // 실제 API 호출은 handleDateConfirm에서 (사용자가 선택 완료 후)
-  // ★ 영역 12-AZ-4: 5/4 이전 일자는 dummyDates에서 제외 → DateRangePicker가 자동으로 클릭 막음
-  // (5/3 이전 데이터는 .zip 업로드로 적재해야 함. 적재 후엔 자동연동과 같이 사용)
+  // ★ 영역 12-AZ-5: zip 일회성 적재(25/10/1~5/3) 후 5/4 이전 제한 제거
+  //   - 자동연동(whapi_webhook)과 zip 적재(zip_import)가 messages 탭에 함께 존재
+  //   - 250일치 = 약 8개월 → zip 적재 범위(25/10~) 모두 포함
+  //   - get_messages가 빈 결과 반환하면 사용자에게 안내 (실제 데이터 없는 일자)
   const handleEnterTabMode = () => {
-    // 인니 시간 기준 오늘부터 60일 전까지 dates 생성
+    // 인니 시간 기준 오늘부터 250일 전까지 dates 생성 (zip 적재 범위 포함)
     const now = new Date();
     const wibNow = new Date(now.getTime() + (7 * 60 - now.getTimezoneOffset()) * 60 * 1000);
     const dummyDates = [];
-    // 5/4 경계 비교용 (인니 시간 기준 일자)
-    // "YY/M/D" 형식 비교를 위해 [Y,M,D] 튜플로 변환
-    const TAB_MODE_MIN_DATE = { y: 26, m: 5, d: 4 };  // 2026/5/4 이후만
-    const isOnOrAfterMin = (y, m, d) => {
-      if (y !== TAB_MODE_MIN_DATE.y) return y > TAB_MODE_MIN_DATE.y;
-      if (m !== TAB_MODE_MIN_DATE.m) return m > TAB_MODE_MIN_DATE.m;
-      return d >= TAB_MODE_MIN_DATE.d;
-    };
-    for (let i = 60; i >= 0; i--) {
+    for (let i = 250; i >= 0; i--) {
       const dt = new Date(wibNow.getTime() - i * 24 * 3600 * 1000);
       const yy = dt.getUTCFullYear() % 100;
       const mm = dt.getUTCMonth() + 1;
       const dd = dt.getUTCDate();
-      // 5/4 이전 일자는 제외 (5/3 이전 데이터는 .zip 업로드 필요)
-      if (!isOnOrAfterMin(yy, mm, dd)) continue;
       dummyDates.push(`${yy}/${mm}/${dd}`);
     }
-    if (dummyDates.length === 0) {
-      // 안전망: 모든 일자가 5/4 이전이면 (불가능에 가깝지만) 빈 채로 STEP 1 진입
-      console.warn("[12-AZ-4] dummyDates 빈 배열 — 5/4 이전 시점으로 보임");
-    }
-    // 어제 디폴트 선택 (단, 5/4 이전이면 dummyDates의 첫번째 = 5/4)
+    // 어제 디폴트 선택
     const defaultSel = dummyDates.length >= 2
       ? dummyDates[dummyDates.length - 2]  // 어제
-      : dummyDates[dummyDates.length - 1];  // 마지막 (= 오늘 또는 유일 일자)
+      : dummyDates[dummyDates.length - 1];  // 오늘
 
     setDataSource("tab");
     setAllMsgs([]);  // STEP 2에서 API 호출 후 채울 예정
@@ -6066,7 +6054,7 @@ ${userText}
             }}>
               <div style={{fontSize:36,marginBottom:8}}>📡</div>
               <div style={{fontSize:15,color:"#a855f7",fontWeight:700,marginBottom:4}}>messages 탭에서 가져오기</div>
-              <div style={{fontSize:11,color:"#374151"}}>메시지 탭은 5/4 이후만 가능</div>
+              <div style={{fontSize:11,color:"#374151"}}>지난 8개월 데이터 가능 (zip 적재 25/10 ~ 현재)</div>
             </div>
 
             <div style={{
@@ -6075,9 +6063,9 @@ ${userText}
               fontSize:11, color:"#22d3ee", lineHeight:1.7,
             }}>
               💡 날짜 기준: 06:00 이전 메시지는 전날 생산분으로 처리됩니다<br/>
-              📅 5/4 이후: 메시지 탭 / 5/3 이전: .zip 파일 업로드<br/>
+              📅 메시지 탭에서 직접 가져오기 (zip 적재 25/10/1 ~ 현재)<br/>
               🆕 v3.1: PE 사전 큐레이션 + 대화체 논의 + 사회자 3단계 폴백 + 이슈 상세 카드 + 기조치 평가<br/>
-              🆕 12-AY: .zip 백업 지원 / 12-AZ: messages 탭 자동연동 직접 조회
+              🆕 12-AZ: messages 탭 자동연동 + 12-AZ-5: zip 1년치 일회성 적재 통합
             </div>
           </div>
         )}
@@ -6091,7 +6079,7 @@ ${userText}
               </div>
               <div style={{fontSize:12,color:"#475569"}}>
                 {dataSource === "tab"
-                  ? "최근 60일 중 어제 1일이 기본 선택됨 · 변경 가능 · 인니 시간 기준"
+                  ? "지난 8개월 (~250일) 중 어제 1일이 기본 선택됨 · 변경 가능 · 인니 시간 기준"
                   : `총 ${dates.length}일치 데이터 · 시작/끝 날짜 선택 (또는 빠른 선택 / 단위 변경)`}
               </div>
             </div>

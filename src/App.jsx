@@ -1054,6 +1054,24 @@ function extractField(text, fieldName) {
   return val;
 }
 
+// ★ 영역 12-BB: Countermeasure 단계 분리 헬퍼
+// .txt 다중 줄 형식 ("1. xxx\n2. yyy") + caption 한 줄 형식 ("1. xxx2. yyy") 모두 호환
+function splitActionSteps(action) {
+  if (!action || !action.trim()) return [];
+  // 1차 시도: 줄바꿈 기준 (다중 줄 .txt 형식)
+  const byNewline = action.split(/\n+/)
+    .map(s => s.trim())
+    .filter(s => /^\d+\.\s/.test(s));
+  if (byNewline.length > 1) return byNewline;
+  // 2차 시도: 한 줄 caption — \d+\.\s 패턴 직전에 split
+  // lookbehind 미지원 환경 대비 — 마커 삽입 후 split
+  const marked = action.replace(/(\D)(\d+\.\s)/g, '$1\u0001$2');
+  const bySplit = marked.split('\u0001').map(s => s.trim()).filter(Boolean);
+  if (bySplit.length > 1) return bySplit;
+  // 3차: 단계 분리 실패 — 한 덩어리로
+  return [action.trim()];
+}
+
 // ★ 영역 12-AD1: 키워드 정밀 매칭 — 짧은 영문 약어는 단어 경계 강제
 // 버그 사례: "NG" 키워드가 "tuangan", "barang", "yang" 등 인도네시아어/일반 단어 안의 "ng" 부분문자열에 잘못 매칭됨
 // 해결: 영문/숫자만으로 구성된 짧은 키워드(1~3자)는 \b 단어 경계로 매칭, 긴 키워드/한글은 부분문자열 그대로
@@ -1353,7 +1371,9 @@ function extractAllIssues(downtime) {
     const part = extractField(d.text, "Part Replacement");
     const prob = extractField(d.text, "Problem");
     const cause = extractField(d.text, "Cause");
-    const action = extractField(d.text, "Action");
+    // ★ 영역 12-BB: 실제 BM Bot 필드명은 *Countermeasure*: (Action 아님)
+    // legacy 데이터에 *Action*: 형식이 있을 수 있어 fallback 유지
+    const action = extractField(d.text, "Countermeasure") || extractField(d.text, "Action");
     const pic = extractField(d.text, "PIC");
     const alarmMatch = (d.text || "").match(/\*?Alarm\*?\s*[:：]\s*([^\n]+)/i);
     const alarm = alarmMatch ? alarmMatch[1].trim() : "";
@@ -1848,9 +1868,10 @@ async function runPreCuration(allIssues, kbPE, reportType, categoryMsgs = {}) {
         pic: i.pic || "",
         result: i.result || "Unknown",
         durationMin: i.durMin || 0,
-        actionSequence: (i.action || "").slice(0, 300)
-          ? [(i.action || "").slice(0, 300)]
-          : ["조치 정보 없음 — 원본 데이터 확인 필요"],
+        actionSequence: (() => {
+          const steps = splitActionSteps(i.action || "");
+          return steps.length > 0 ? steps : ["조치 정보 없음 — 원본 데이터 확인 필요"];
+        })(),
         splitNote: "",
         splitDetail: [],
         recurrenceGap: "",
@@ -2411,7 +2432,7 @@ function buildFallbackCuration(allIssues, categoryMsgs = {}) {
     pic: i.pic || "",
     result: i.result || "",
     durationMin: i.durMin || 0,
-    actionSequence: i.action ? [i.action.slice(0, 100)] : [],
+    actionSequence: splitActionSteps(i.action || ""),
   }));
 
   // 반복 (설비별)

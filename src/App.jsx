@@ -3997,21 +3997,25 @@ function BackBtn({ onClick, label="← 이전" }) {
 }
 
 function StepBar({ step }) {
-  const STEPS = ["업로드","날짜","보고서","이슈 확인","논의 중","문서 생성"];
+  // ★ 12-AZ-6: 업로드 단계 제거 (날짜가 첫 페이지) — step 1~5 매핑
+  const STEPS = ["날짜","보고서","이슈 확인","논의 중","문서 생성"];
   return (
     <div style={{ display:"flex", borderBottom:"1px solid rgba(51,65,85,0.3)", background:"rgba(3,6,13,0.85)", overflowX:"auto" }}>
-      {STEPS.map((s,i) => (
-        <div key={i} style={{
-          flex:"1 0 auto", padding:"10px 6px", textAlign:"center",
-          background: step===i ? "rgba(34,211,238,0.08)" : "transparent",
-          borderBottom:`2px solid ${step===i ? "#22d3ee" : step>i ? "#34d399" : "transparent"}`,
-          fontSize:9, fontWeight:800,
-          color: step===i ? "#22d3ee" : step>i ? "#34d399" : "#374151",
-        }}>
-          <div style={{ fontSize:9, marginBottom:2 }}>{i+1}</div>
-          {s}
-        </div>
-      ))}
+      {STEPS.map((s,i) => {
+        const stepNum = i + 1;  // step 1~5 매핑
+        return (
+          <div key={i} style={{
+            flex:"1 0 auto", padding:"10px 6px", textAlign:"center",
+            background: step===stepNum ? "rgba(34,211,238,0.08)" : "transparent",
+            borderBottom:`2px solid ${step===stepNum ? "#22d3ee" : step>stepNum ? "#34d399" : "transparent"}`,
+            fontSize:9, fontWeight:800,
+            color: step===stepNum ? "#22d3ee" : step>stepNum ? "#34d399" : "#374151",
+          }}>
+            <div style={{ fontSize:9, marginBottom:2 }}>{stepNum}</div>
+            {s}
+          </div>
+        );
+      })}
     </div>
   );
 }
@@ -4024,13 +4028,13 @@ const MODE_STYLE = {
 
 // ─── 메인 앱 ──────────────────────────────────────────────────────────────────
 export default function App() {
-  const [step, setStep]           = useState(0);
+  const [step, setStep]           = useState(1);  // ★ 12-AZ-6: 첫 페이지를 STEP 1 (날짜 선택)으로
   const [allMsgs, setAllMsgs]     = useState([]);
   const [dates, setDates]         = useState([]);
   const [selDates, setSelDates]   = useState([]);
   // ★ 영역 8: 날짜 범위 선택 (start/end/unit). 분석 함수는 selDates 사용 — selRange는 표시/분기용.
   const [selRange, setSelRange]   = useState({ start: null, end: null, unit: "day" });
-  const [reportType, setReportType] = useState("meeting");
+  const [reportType, setReportType] = useState("daily");  // ★ 12-AZ-6: 디폴트를 일일 생산 보고서로
   // ★ 영역 9-D: 보고서 생성 모드 (간단=명세서 표 형태, 상세=페르소나 8명 논의)
   // 영역 11: reportMode (간단/상세 모드) 폐기. 단일 흐름.
   // ★ 영역 9: 명세서 5-카테고리 분류 결과 (간단모드 표 출력용)
@@ -4157,6 +4161,14 @@ export default function App() {
     setStep(1);
     setError("");
   };
+
+  // ★ 영역 12-AZ-6: 앱 마운트 시 자동으로 messages 탭 모드 진입
+  // (업로드 단계 제거 → 첫 페이지 = 날짜 선택)
+  // 파일 업로드는 STEP 1 하단의 보조 버튼으로 옵션 제공
+  // eslint-disable-next-line react-hooks/exhaustive-deps
+  useEffect(() => {
+    handleEnterTabMode();
+  }, []);
 
   const handleDateConfirm = async () => {
     if (selDates.length === 0) return;
@@ -5975,11 +5987,12 @@ ${userText}
   };
 
   const reset = () => {
-    setStep(0); setAllMsgs([]); setDates([]); setSelDates([]);
+    // ★ 12-AZ-6: STEP 0 제거 → 끝에 handleEnterTabMode()로 STEP 1(날짜) 자동 진입
+    setAllMsgs([]); setDates([]); setSelDates([]);
     setSelRange({ start: null, end: null, unit: "day" });
     setClassified(null); setPriority(null); setKbStats(null);
     setDiscussions([]); setMinutes(null); setProgress([]);
-    setError(""); setSheetSaved(false); setReportType("meeting");
+    setError(""); setSheetSaved(false); setReportType("daily");  // ★ 디폴트를 daily로
     setTaggedIssues(null);
     setSelectedProcess("Cell"); setExtraAgents([]);
     // ★ 영역 6: 큐레이션 캐시 + 선택 상태 초기화
@@ -5989,6 +6002,8 @@ ${userText}
     // ★ 영역 7: 채팅방 상태 초기화
     setChatOpen(false); setChatStage("setup"); setChatAgents([]);
     setChatMessages([]); setChatInput(""); setChatKb({}); setChatBusy(false);
+    // ★ 12-AZ-6: messages 탭 모드 + STEP 1 자동 진입
+    handleEnterTabMode();
   };
 
   return (
@@ -6026,51 +6041,7 @@ ${userText}
 
       <div style={{maxWidth:720, margin:"0 auto", padding:"24px 18px 60px"}}>
 
-        {/* STEP 0: 데이터 소스 선택 (영역 12-AZ) */}
-        {step===0 && (
-          <div>
-            <div style={{marginBottom:20}}>
-              <div style={{fontSize:17,fontWeight:800,color:"#f1f5f9",marginBottom:4}}>데이터 소스 선택</div>
-              <div style={{fontSize:12,color:"#475569"}}>분석할 WhatsApp 메시지를 어디서 가져올지 선택</div>
-            </div>
-
-            {/* 옵션 1: 파일 업로드 (.txt / .zip) */}
-            <div onClick={()=>fileRef.current?.click()} style={{
-              border:"2px dashed rgba(34,211,238,0.3)", borderRadius:12,
-              padding:"32px 20px", textAlign:"center", cursor:"pointer",
-              background:"rgba(34,211,238,0.03)", marginBottom:14,
-            }}>
-              <input ref={fileRef} type="file" accept=".txt,.zip" onChange={handleFile} style={{display:"none"}}/>
-              <div style={{fontSize:36,marginBottom:8}}>📂</div>
-              <div style={{fontSize:15,color:"#22d3ee",fontWeight:700,marginBottom:4}}>.txt / .zip 파일 업로드</div>
-              <div style={{fontSize:11,color:"#374151"}}>WhatsApp 채팅 내보내기 (수동)</div>
-            </div>
-
-            {/* 옵션 2: messages 탭에서 가져오기 (12-AZ-3: STEP 1 통합) */}
-            <div onClick={handleEnterTabMode} style={{
-              border:"2px dashed rgba(168,85,247,0.4)", borderRadius:12,
-              padding:"32px 20px", textAlign:"center", cursor:"pointer",
-              background:"rgba(168,85,247,0.05)", marginBottom:20,
-            }}>
-              <div style={{fontSize:36,marginBottom:8}}>📡</div>
-              <div style={{fontSize:15,color:"#a855f7",fontWeight:700,marginBottom:4}}>messages 탭에서 가져오기</div>
-              <div style={{fontSize:11,color:"#374151"}}>지난 8개월 데이터 가능 (zip 적재 25/10 ~ 현재)</div>
-            </div>
-
-            <div style={{
-              padding:"10px 14px", background:"rgba(34,211,238,0.05)",
-              border:"1px solid rgba(34,211,238,0.2)", borderRadius:8,
-              fontSize:11, color:"#22d3ee", lineHeight:1.7,
-            }}>
-              💡 날짜 기준: 06:00 이전 메시지는 전날 생산분으로 처리됩니다<br/>
-              📅 메시지 탭에서 직접 가져오기 (zip 적재 25/10/1 ~ 현재)<br/>
-              🆕 v3.1: PE 사전 큐레이션 + 대화체 논의 + 사회자 3단계 폴백 + 이슈 상세 카드 + 기조치 평가<br/>
-              🆕 12-AZ: messages 탭 자동연동 + 12-AZ-5: zip 1년치 일회성 적재 통합
-            </div>
-          </div>
-        )}
-
-        {/* STEP 1: 날짜 선택 (영역 12-AZ-3: file/tab 모드 통합) */}
+        {/* STEP 1: 날짜 선택 (영역 12-AZ-6: 첫 페이지로 변경, 업로드 단계 제거) */}
         {step===1 && (
           <div>
             <div style={{marginBottom:16}}>
@@ -6094,7 +6065,6 @@ ${userText}
             />
 
             <div style={{display:"flex",gap:10, marginTop:12}}>
-              <BackBtn onClick={()=>setStep(0)} label="← 데이터 소스 재선택"/>
               <button onClick={handleDateConfirm} disabled={selDates.length===0 || tabFetchLoading} style={{
                 flex:1, padding:"12px",
                 background: tabFetchLoading
@@ -6113,6 +6083,31 @@ ${userText}
                           : `보고서 종류 선택 (${selDates.length}일) →`)
                       : "기간을 선택하세요")}
               </button>
+            </div>
+
+            {/* ★ 12-AZ-6: 파일 업로드 보조 버튼 (옵션) */}
+            <div onClick={()=>fileRef.current?.click()} style={{
+              marginTop:14, padding:"10px 14px",
+              border:"1.5px dashed rgba(51,65,85,0.5)", borderRadius:8,
+              background:"rgba(34,211,238,0.02)",
+              fontSize:11, color:"#94a3b8", textAlign:"center", cursor:"pointer",
+              display:"flex", alignItems:"center", justifyContent:"center", gap:6,
+            }}>
+              <input ref={fileRef} type="file" accept=".txt,.zip" onChange={handleFile} style={{display:"none"}}/>
+              <span>📂</span>
+              <span>파일 업로드 (옵션) — .txt / .zip 백업 직접 분석</span>
+            </div>
+
+            {/* ★ 12-AZ-6: 안내 박스 (STEP 0에서 이동) */}
+            <div style={{
+              marginTop:12, padding:"10px 14px",
+              background:"rgba(34,211,238,0.05)",
+              border:"1px solid rgba(34,211,238,0.2)", borderRadius:8,
+              fontSize:11, color:"#22d3ee", lineHeight:1.7,
+            }}>
+              💡 날짜 기준: 06:00 이전 메시지는 전날 생산분으로 처리됩니다<br/>
+              📅 messages 탭 직접 조회 — zip 적재 25/10/1 ~ 현재까지 가능<br/>
+              🆕 v3.1: PE 사전 큐레이션 + 대화체 논의 + 이슈 상세 카드 + 기조치 평가
             </div>
           </div>
         )}
@@ -6734,7 +6729,7 @@ ${userText}
                 fontSize: 12, fontWeight: 600, animation: "fadeUp 0.3s",
               }}>{teamsResult.msg}</div>
             )}
-            <button onClick={()=>{setStep(1);setMinutes(null);setDiscussions([]);setProgress([]);setReportType("meeting");}} style={{
+            <button onClick={()=>{setStep(1);setMinutes(null);setDiscussions([]);setProgress([]);setReportType("daily");}} style={{
               width:"100%", padding:"10px", background:"transparent",
               border:"1.5px solid rgba(51,65,85,0.4)", borderRadius:8,
               color:"#475569", fontSize:12, cursor:"pointer",

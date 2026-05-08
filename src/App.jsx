@@ -1037,8 +1037,21 @@ function filterByDates(msgs, dates) {
 
 // ─── 이슈 파싱 (기존 그대로) ────────────────────────────────────────────────────
 function extractField(text, fieldName) {
-  const re = new RegExp(`\\*?${fieldName}\\*?[:\\s]+\\*?\\n?-?\\s*([^\\n]+)`, "i");
-  return text.match(re)?.[1]?.replace(/\*/g, "").trim() || "";
+  // ★ 영역 12-BB: 한 줄 caption + 다중 줄 .txt 모두 호환
+  // 기존: ([^\n]+) — 줄바꿈 전까지만 캡처 → messages 탭 한 줄 caption에서는 다음 필드까지 다 캡처되는 버그
+  // 변경: (.*?) non-greedy + lookahead — 다음 *Field*: 패턴 또는 끝까지 매칭
+  // 's' flag로 .이 줄바꿈도 포함 (다중 줄 .txt 대응)
+  // 주의: colon 뒤 \\*? 제거 — 빈 필드(*Part Replacement*: *PIC*:) 케이스에서 다음 필드 별표를 먹지 않게
+  const re = new RegExp(
+    `\\*?${fieldName}\\*?[:\\s]+\\n?-?\\s*(.*?)(?=\\s*\\*[A-Z][^*]*\\*\\s*:|$)`,
+    "is"
+  );
+  const m = text.match(re);
+  if (!m) return "";
+  let val = m[1].replace(/\*/g, "").trim();
+  // BM Bot trailing 자동 메시지 제거 (예: "> _this is an automated message_")
+  val = val.replace(/>\s*_[^_]*_?\s*$/, "").trim();
+  return val;
 }
 
 // ★ 영역 12-AD1: 키워드 정밀 매칭 — 짧은 영문 약어는 단어 경계 강제

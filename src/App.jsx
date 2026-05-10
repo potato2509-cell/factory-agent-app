@@ -1780,13 +1780,17 @@ async function runOneGroupSynthesis(items, groupKey, groupValue) {
     return null;  // 2건 미만은 종합 안 함
   }
 
-  // 입력 압축: 이슈당 핵심 5필드만
+  // 입력 압축: 이슈당 핵심 6필드 (★ 12-BG-4 단계 1-RC-2: images 추가)
   const compactItems = items.map(i => ({
     eq: i.eq || i.equipment || "?",
     time: `${i.date || ""} ${i.time || ""}`.trim(),
     prob: (i.prob || i.problem || "").slice(0, 80),
     cause: (i.cause || i.rootCause || "").slice(0, 80),
     dur: i.durMin || i.durationMin || 0,
+    // ★ 영역 12-BG-4 (큐 #6 단계 1-RC-2): 같은 호기 image_analyses 최대 2개 (그룹 종합 패턴 식별용)
+    ...(i.image_analyses && i.image_analyses.length > 0
+      ? { images: i.image_analyses.slice(0, 2).map(a => String(a).slice(0, 80)) }
+      : {}),
   }));
 
   const sys = `너는 AZS 배터리 공장의 시니어 엔지니어다. 같은 ${groupKey === "category" ? "카테고리" : "호기"}에 속하는 이슈 ${items.length}건을 보고 공통 패턴과 시사점을 한국어로 요약한다.
@@ -1908,12 +1912,16 @@ async function runPreCuration(allIssues, kbPE, reportType, categoryMsgs = {}) {
     alarm: (issue._alarm || "").slice(0, 100),
   }));
 
+  // ★ 영역 12-BG-4 (큐 #6 단계 1-RC-3): images 필드 조건부 추가 (PE 큐레이션 입력 강화)
   const formatMsgs = (arr, max = 20) => arr.slice(0, max).map((m, i) => ({
     no: i + 1,
     date: m.date || "",
     time: m.time || "",
     sender: m.sender || "",
     text: (m.text || "").slice(0, 200).replace(/\n/g, " "),
+    ...(m.image_analyses && m.image_analyses.filter(a => a && String(a).trim()).length > 0
+      ? { images: m.image_analyses.filter(a => a && String(a).trim()).slice(0, 3).map(a => String(a).slice(0, 80)) }
+      : {}),
   }));
 
   const qualityData = formatMsgs(qualityList);
@@ -1932,6 +1940,10 @@ async function runPreCuration(allIssues, kbPE, reportType, categoryMsgs = {}) {
     time: m.time || "",
     sender: m.sender || "",
     text: (m.text || "").slice(0, 350).replace(/\n/g, " | "),
+    // ★ 12-BG-4 단계 1-RC-3: images 추가
+    ...(m.image_analyses && m.image_analyses.filter(a => a && String(a).trim()).length > 0
+      ? { images: m.image_analyses.filter(a => a && String(a).trim()).slice(0, 3).map(a => String(a).slice(0, 80)) }
+      : {}),
   }));
 
   // ★ 영역 12-AG1: Part 2b 전용 long format — Setting 항목 풀 추출 위해 10건 × 800자
@@ -1942,6 +1954,10 @@ async function runPreCuration(allIssues, kbPE, reportType, categoryMsgs = {}) {
     time: m.time || "",
     sender: m.sender || "",
     text: (m.text || "").slice(0, 800).replace(/\n/g, " | "),
+    // ★ 12-BG-4 단계 1-RC-3: images 추가
+    ...(m.image_analyses && m.image_analyses.filter(a => a && String(a).trim()).length > 0
+      ? { images: m.image_analyses.filter(a => a && String(a).trim()).slice(0, 3).map(a => String(a).slice(0, 80)) }
+      : {}),
   }));
   const processChangeDataLong = formatMsgsLong(processChangeList);
   const qualityWithSettingLong = (categoryMsgs.quality || []).slice(0, 8).map((m, i) => ({
@@ -1950,6 +1966,10 @@ async function runPreCuration(allIssues, kbPE, reportType, categoryMsgs = {}) {
     time: m.time || "",
     sender: m.sender || "",
     text: (m.text || "").slice(0, 800).replace(/\n/g, " | "),
+    // ★ 12-BG-4 단계 1-RC-3: images 추가
+    ...(m.image_analyses && m.image_analyses.filter(a => a && String(a).trim()).length > 0
+      ? { images: m.image_analyses.filter(a => a && String(a).trim()).slice(0, 3).map(a => String(a).slice(0, 80)) }
+      : {}),
   }));
   // ★ 영역 12-AH1: Part 3 chronic1AB용 quality 메시지 long format (5건 × 600자)
   // 1AB 라인 메시지 (Stacking 1-AB Sepa Run Problem)에 호기별 NG 정보 풍부 — 200자 슬라이스에선 잘림
@@ -1959,6 +1979,10 @@ async function runPreCuration(allIssues, kbPE, reportType, categoryMsgs = {}) {
     time: m.time || "",
     sender: m.sender || "",
     text: (m.text || "").slice(0, 600).replace(/\n/g, " | "),
+    // ★ 12-BG-4 단계 1-RC-3: images 추가
+    ...(m.image_analyses && m.image_analyses.filter(a => a && String(a).trim()).length > 0
+      ? { images: m.image_analyses.filter(a => a && String(a).trim()).slice(0, 3).map(a => String(a).slice(0, 80)) }
+      : {}),
   }));
 
   // ── ★ 영역 12-AF3: 4분할 병렬 호출 (Part 2를 2a/2b로 분할) ──
@@ -4438,6 +4462,32 @@ export default function App() {
     setRunning(true); setError(""); setProgress([]);
     setDiscussions([]); setMinutes(null); setSheetSaved(false);
 
+    // ★ 영역 12-AZ-8 (큐 #15): Wake Lock API — 보고서 생성 중 화면 꺼짐 방지
+    let wakeLock = null;
+    const requestWakeLock = async () => {
+      try {
+        if ("wakeLock" in navigator) {
+          wakeLock = await navigator.wakeLock.request("screen");
+          console.log("[12-AZ-8] Wake Lock 활성화 — 화면 꺼짐 방지");
+          wakeLock.addEventListener("release", () => {
+            console.log("[12-AZ-8] Wake Lock 해제됨");
+          });
+        } else {
+          console.log("[12-AZ-8] Wake Lock API 미지원 — 화면 꺼짐 방지 불가 (구버전 브라우저)");
+        }
+      } catch (e) {
+        console.warn("[12-AZ-8] Wake Lock 요청 실패:", e?.message);
+      }
+    };
+    // 화면 visibility 변경 시 자동 재요청 (탭 전환 후 복귀 시 wake lock 끊기는 경우 대응)
+    const handleVisibilityChange = async () => {
+      if (wakeLock !== null && document.visibilityState === "visible") {
+        await requestWakeLock();
+      }
+    };
+    document.addEventListener("visibilitychange", handleVisibilityChange);
+    await requestWakeLock();
+
     try {
       // ★ 선택된 페르소나 풀 구성: 공정 자동 + 추가 선택
       const autoAgents = PROCESSES[selectedProcess].auto;
@@ -4660,7 +4710,20 @@ export default function App() {
       setProgress(p => [...p, "✅ 완료!"]);
 
     } catch(e) { setError(e.message); }
-    finally { setRunning(false); }
+    finally {
+      setRunning(false);
+      // ★ 영역 12-AZ-8: Wake Lock 해제 + 리스너 정리
+      document.removeEventListener("visibilitychange", handleVisibilityChange);
+      if (wakeLock !== null) {
+        try {
+          await wakeLock.release();
+          wakeLock = null;
+          console.log("[12-AZ-8] Wake Lock 명시적 해제 (보고서 생성 종료)");
+        } catch (e) {
+          console.warn("[12-AZ-8] Wake Lock 해제 실패:", e?.message);
+        }
+      }
+    }
   };
 
   // ─── ★ 영역 12-AK: Teams 자동송부 인프라 (Phase E 사양 14.5 / 14.3 / 14.4) ────────
@@ -7174,11 +7237,11 @@ function DateRangePicker({ availableDates, selRange, onChange }) {
     const { y, m } = calMonth;
     const firstDay = new Date(y, m, 1);
     const lastDay = new Date(y, m + 1, 0);
-    const startDayOfWeek = firstDay.getDay() === 0 ? 7 : firstDay.getDay(); // 월=1 기준
+    const startDayOfWeek = firstDay.getDay(); // 일=0, 월=1, ..., 토=6 기준
     const daysInMonth = lastDay.getDate();
     const cells = [];
-    // 앞 빈 칸 (월요일 시작 기준)
-    for (let i = 1; i < startDayOfWeek; i++) cells.push(null);
+    // 앞 빈 칸 (일요일 시작 기준)
+    for (let i = 0; i < startDayOfWeek; i++) cells.push(null);
     for (let d = 1; d <= daysInMonth; d++) {
       const dStr = `${String(y).slice(-2)}/${m + 1}/${d}`;
       cells.push(dStr);
@@ -7210,10 +7273,10 @@ function DateRangePicker({ availableDates, selRange, onChange }) {
         </div>
         {/* 요일 헤더 */}
         <div style={{display:"grid",gridTemplateColumns:"repeat(7,1fr)",gap:2,marginBottom:4}}>
-          {["월","화","수","목","금","토","일"].map((w,i) => (
+          {["일","월","화","수","목","금","토"].map((w,i) => (
             <div key={w} style={{
               textAlign:"center", fontSize:10, fontWeight:700, padding:"4px 0",
-              color: i === 5 ? "#60a5fa" : i === 6 ? "#f87171" : "#94a3b8",
+              color: i === 0 ? "#f87171" : i === 6 ? "#60a5fa" : "#94a3b8",
             }}>{w}</div>
           ))}
         </div>

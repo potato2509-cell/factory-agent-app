@@ -1326,7 +1326,32 @@ function getIssueId(issue) {
   return `${issue.date || "?"}_${issue.time || "?"}_${issue.eq || "?"}_${(issue.prob || "").slice(0, 20)}`;
 }
 
-function extractAllIssues(downtime) {
+function extractAllIssues(downtime, allMessages = []) {
+  // ★ 영역 12-BG-4 (큐 #6 단계 1-RC-1): 같은 호기 image_analyses 매칭 준비
+  // 호기별 image 메시지 인덱스 — BM Bot Image Attachment 또는 PE Tech 첨부 이미지
+  const imageMsgsByEq = {};
+  for (const m of allMessages) {
+    if (m._messageType !== "image") continue;
+    if (!m.image_analyses || m.image_analyses.length === 0) continue;
+    const analyses = m.image_analyses.filter(a => a && String(a).trim().length > 0);
+    if (analyses.length === 0) continue;
+    // BM Bot Image Attachment 형식: "[STK-3-B5/8/5/2026, 00.00 - ...]"
+    const bmEqMatch = (m.text || "").match(/\[([\w\-\(\)\+]+)\//);
+    if (bmEqMatch) {
+      const eq = bmEqMatch[1];
+      if (!imageMsgsByEq[eq]) imageMsgsByEq[eq] = [];
+      imageMsgsByEq[eq].push({ msg: m, analyses, isBmAttachment: true });
+      continue;
+    }
+    // PE Tech 메시지: text에서 호기 패턴 직접 추출 (예: "STK-1-B4", "1-B4", "Cutter 2C(-)")
+    const peEqMatch = (m.text || "").match(/(STK|CUT|FI|ULD)-?\s*(\d-?[A-Z]\d|\d-?\d|\d-?[A-Z]\(?[\+\-]?\)?)/i);
+    if (peEqMatch) {
+      const eq = peEqMatch[0].toUpperCase().replace(/\s+/g, "");
+      if (!imageMsgsByEq[eq]) imageMsgsByEq[eq] = [];
+      imageMsgsByEq[eq].push({ msg: m, analyses, isBmAttachment: false });
+    }
+  }
+
   const equipCount = {}, partCount = {}, alarmCount = {};
   // 사전 카운트 (반복 횟수 계산용)
   downtime.forEach(d => {
@@ -1381,11 +1406,24 @@ function extractAllIssues(downtime) {
       eq ? (equipCount[eq] || 1) : 1,
       (part && part !== "-" && part.length > 2) ? (partCount[part] || 1) : 1,
     );
+    // ★ 영역 12-BG-4: 같은 호기의 image_analyses 매칭 (최대 5개)
+    const matchedImages = [];
+    if (eq && imageMsgsByEq[eq]) {
+      for (const entry of imageMsgsByEq[eq]) {
+        for (const a of entry.analyses) {
+          if (matchedImages.length < 5 && !matchedImages.includes(a)) {
+            matchedImages.push(a);
+          }
+        }
+      }
+    }
+
     return {
       ...d,
       eq, prob, cause, result, action, pic, durMin,
       stopStatus, repeatCount, _alarm: alarm,
       reasons: [],
+      image_analyses: matchedImages,  // ★ 12-BG-4: 매칭된 이미지 분석 결과
     };
   });
 }
@@ -3235,6 +3273,11 @@ function codeFallbackModerator(mode, opinions) {
 
 // ─── 7. 통합: 단일 이슈 모드별 논의 실행 ────────────────────────────────────────
 async function runIssueDiscussion(issue, modeInfo, kb, reportType, allowedAgents, onProgress) {
+  // ★ 영역 12-BG-4 (큐 #6 단계 1-RC-1): image_analyses 컨텍스트 추가
+  const imageContext = issue.image_analyses && issue.image_analyses.length > 0
+    ? `\n[첨부 이미지 분석]\n${issue.image_analyses.map((a, i) => `  ${i + 1}. ${a}`).join("\n")}`
+    : "";
+
   const issueCtx = `설비: ${issue.eq}
 발생시간: ${issue.time}
 다운타임: ${issue.durMin}분
@@ -3242,7 +3285,7 @@ async function runIssueDiscussion(issue, modeInfo, kb, reportType, allowedAgents
 원인: ${issue.cause}
 결과: ${issue.result}
 담당자: ${issue.pic}
-우선순위 사유: ${issue.reasons?.join(", ")}`;
+우선순위 사유: ${issue.reasons?.join(", ")}${imageContext}`;
 
   // ★ 기조치 건 판단: result에 "solved" 등이 있으면 이미 조치된 건
   const resultLower = (issue.result || "").toLowerCase();
@@ -4239,7 +4282,7 @@ export default function App() {
     setError("");
     const dayMsgs = filterByDates(allMsgs, selDates);
     const cl = classifyMessages(dayMsgs);
-    const bmIssues = extractAllIssues(cl.downtime);
+    const bmIssues = extractAllIssues(cl.downtime, dayMsgs);  // ★ 12-BG-4: 메시지 풀 전달
     // ★ 영역 12-AW: Critical 메시지를 가상 issue로 변환 → 본문 논의 후보 통합
     const criticalIssues = extractCriticalIssues(cl.criticalMsgs || []);
     const allIssuesFlat = [...bmIssues, ...criticalIssues];
@@ -6700,7 +6743,7 @@ ${userText}
             )}
 
             <div style={{display:"flex",gap:10,marginBottom:10}}>
-              <button onClick={downloadHtml} style={{
+              <button onClick={() => downloadHtml()} style={{
                 flex:1, padding:"11px",
                 background:"linear-gradient(135deg,#3b82f6,#22d3ee)",
                 border:"none", borderRadius:8, color:"#fff",

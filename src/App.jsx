@@ -3979,15 +3979,74 @@ ${JSON.stringify(rawEventContext, null, 1)}
 환각 방지를 위해 confidence와 evidence를 반드시 명시하세요.`;
 
   // ★ 12-AQ: Background 호출로 504 timeout 영구 회피
+  // ★ 12-BI (큐 #9): 재시도 로직 (3회 최대) + 부분 복구 + 에러 분류
+  const MAX_RETRIES = 3;
+  const RETRY_DELAYS_MS = [0, 5000, 15000];  // 1차 즉시, 2차 5초, 3차 15초
+  let raw = "";
+  let lastError = null;
+  let attempt = 0;
+
+  for (attempt = 0; attempt < MAX_RETRIES; attempt++) {
+    if (attempt > 0) {
+      console.log(`[6/7번 재시도] ${attempt + 1}회차 — ${RETRY_DELAYS_MS[attempt]}ms 대기 후 시도`);
+      await new Promise(r => setTimeout(r, RETRY_DELAYS_MS[attempt]));
+    }
+    try {
+      raw = await callClaudeBackground(sys, userMsg, {
+        model: MODEL_REASONING,
+        max_tokens: 3500,
+        onProgress: (msg) => console.log(`[6/7번 BG${attempt > 0 ? ` 재시도${attempt + 1}` : ""}] ${msg}`),
+      });
+      // 빈 응답이면 재시도
+      if (!raw || raw.length < 50) {
+        lastError = new Error(`응답 너무 짧음 (${raw?.length || 0}자) — 빈 응답 또는 무효`);
+        console.warn(`[6/7번] 시도 ${attempt + 1}: ${lastError.message}`);
+        continue;
+      }
+      // 성공 — 루프 탈출
+      break;
+    } catch (e) {
+      lastError = e;
+      // 에러 분류 (재시도 가치)
+      const msg = (e?.message || "").toLowerCase();
+      const isRetryable = msg.includes("500") || msg.includes("503") || msg.includes("429") ||
+                          msg.includes("timeout") || msg.includes("응답 대기 초과") ||
+                          msg.includes("network") || msg.includes("failed") ||
+                          msg.includes("background 트리거");
+      console.error(`[6/7번 시도 ${attempt + 1} 실패] ${e?.message?.slice(0, 200)} (재시도가능=${isRetryable})`);
+      if (!isRetryable) {
+        // 영구 에러 (예: 401 인증, 400 파라미터) — 즉시 백업
+        console.error(`[6/7번] 영구 에러로 판단 — 재시도 중단, 룰 백업으로 진행`);
+        return buildFallbackInsightsAndActions(curation, taggedResult);
+      }
+      // 마지막 시도면 루프 종료 (catch 밖에서 백업 처리)
+      if (attempt === MAX_RETRIES - 1) {
+        console.error(`[6/7번] ${MAX_RETRIES}회 재시도 모두 실패 — 룰 백업으로 진행`);
+      }
+    }
+  }
+
+  // 응답 없으면 백업
+  if (!raw || raw.length < 50) {
+    console.error(`[6/7번] 최종 응답 없음 (last error: ${lastError?.message?.slice(0, 100)}) — 룰 백업`);
+    return buildFallbackInsightsAndActions(curation, taggedResult);
+  }
+
+  // JSON 파싱 — safeJSON 1차 시도, 실패 시 부분 복구 (★ 12-BH 큐 #8 함수 재활용)
+  let parsed;
   try {
-    const raw = await callClaudeBackground(sys, userMsg, {
-      model: MODEL_REASONING,  // Sonnet 유지 (깊이)
-      max_tokens: 3500,         // 통합 호출 — Background이라 timeout 부담 없음
-      onProgress: (msg) => console.log(`[6/7번 BG] ${msg}`),
-    });
+    parsed = safeJSON(raw);
+  } catch (e) {
+    console.error(`[6/7번 safeJSON 실패] ${e?.message?.slice(0, 200)} — 부분 복구 시도`);
+    parsed = tryPartialJSONRecovery(raw);
+    if (!parsed || Object.keys(parsed).length === 0) {
+      console.error(`[6/7번] 부분 복구도 실패 — 룰 백업`);
+      return buildFallbackInsightsAndActions(curation, taggedResult);
+    }
+    console.log(`[6/7번] ★ 부분 복구 성공 — 키: ${Object.keys(parsed).join(", ")}`);
+  }
 
-    const parsed = safeJSON(raw);
-
+  try {
     // 룰 검증 (Z 옵션) — LLM 분류 결과를 안전 룰로 보정
     const insights = Array.isArray(parsed.section6_insights) ? parsed.section6_insights : [];
     const actions = Array.isArray(parsed.section7_actions) ? parsed.section7_actions : [];
@@ -4012,7 +4071,8 @@ ${JSON.stringify(rawEventContext, null, 1)}
       section7_actions: validatedActions,
     };
   } catch (e) {
-    console.error("[6/7번 Background 실패]", e?.message || e);
+    // ★ 12-BI: 룰 검증 단계 실패 — 부분 복구된 parsed에서도 검증 실패 시 룰 백업
+    console.error("[6/7번 룰 검증 실패]", e?.message?.slice(0, 200));
     return buildFallbackInsightsAndActions(curation, taggedResult);
   }
 }

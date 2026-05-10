@@ -465,7 +465,7 @@ function safeJSON(raw) {
     const reMatch = cleaned.match(/\{[\s\S]*\}/);
     if (!reMatch) {
       const err = new Error(`JSON 없음 — 중괄호 없음 (raw 길이=${rawLen})`);
-      err._rawSnippet = rawStr.slice(0, 300);
+      err._rawSnippet = rawStr.slice(0, 8000);  // ★ 12-BH: 부분 복구용 — 8000자 보존
       err._rawLength = rawLen;
       throw err;
     }
@@ -475,14 +475,14 @@ function safeJSON(raw) {
       const parsed = JSON.parse(jsonStr);
       if (!parsed || typeof parsed !== "object" || Object.keys(parsed).length === 0) {
         const err = new Error("JSON 없음 — 빈 객체 또는 비객체");
-        err._rawSnippet = rawStr.slice(0, 300);
+        err._rawSnippet = rawStr.slice(0, 8000);  // ★ 12-BH: 부분 복구용 — 8000자 보존
         err._rawLength = rawLen;
         throw err;
       }
       return parsed;
     } catch (parseErr) {
       const err = new Error(`JSON 파싱 실패 — ${parseErr.message}`);
-      err._rawSnippet = rawStr.slice(0, 300);
+      err._rawSnippet = rawStr.slice(0, 8000);  // ★ 12-BH: 부분 복구용 — 8000자 보존
       err._rawLength = rawLen;
       throw err;
     }
@@ -495,7 +495,7 @@ function safeJSON(raw) {
     const parsed = JSON.parse(jsonStr);
     if (!parsed || typeof parsed !== "object" || Object.keys(parsed).length === 0) {
       const err = new Error("JSON 없음 — 빈 객체 또는 비객체 (1차)");
-      err._rawSnippet = rawStr.slice(0, 300);
+      err._rawSnippet = rawStr.slice(0, 8000);  // ★ 12-BH: 부분 복구용 — 8000자 보존
       err._rawLength = rawLen;
       throw err;
     }
@@ -518,7 +518,7 @@ function safeJSON(raw) {
       const parsed = JSON.parse(jsonStr);
       if (!parsed || typeof parsed !== "object" || Object.keys(parsed).length === 0) {
         const err = new Error("JSON 없음 — 빈 객체 또는 비객체 (균형 복구 후)");
-        err._rawSnippet = rawStr.slice(0, 300);
+        err._rawSnippet = rawStr.slice(0, 8000);  // ★ 12-BH: 부분 복구용 — 8000자 보존
         err._rawLength = rawLen;
         throw err;
       }
@@ -526,11 +526,126 @@ function safeJSON(raw) {
     } catch (e2) {
       if (e2._rawSnippet !== undefined) throw e2;
       const err = new Error(`JSON 파싱 실패 — 균형 복구 후에도 실패: ${e2.message}`);
-      err._rawSnippet = rawStr.slice(0, 300);
+      err._rawSnippet = rawStr.slice(0, 8000);  // ★ 12-BH: 부분 복구용 — 8000자 보존
       err._rawLength = rawLen;
       throw err;
     }
   }
+}
+
+// ═════════════════════════════════════════════════════════════════════════════
+// ★ 영역 12-BH (큐 #8): JSON 부분 복구 — Part 2b 등 큰 응답 안정성 강화
+// safeJSON 실패 시 호출 — top-level 키별 + 배열 안 객체별 부분 복구
+// ═════════════════════════════════════════════════════════════════════════════
+function tryPartialJSONRecovery(raw) {
+  const cleaned = String(raw || "").replace(/```json|```/gi, "").trim();
+  const startIdx = cleaned.indexOf("{");
+  if (startIdx === -1) return {};
+  const endIdx = cleaned.lastIndexOf("}");
+  const body = (endIdx > startIdx)
+    ? cleaned.slice(startIdx + 1, endIdx)
+    : cleaned.slice(startIdx + 1);
+
+  // top-level key/value 추출 (depth 추적, string 무시)
+  const pairs = [];
+  let depth = 0, inString = false, escape = false;
+  let currentKey = null, currentKeyStart = -1, valueStart = -1;
+  let i = 0;
+  while (i < body.length) {
+    const c = body[i];
+    if (escape) { escape = false; i++; continue; }
+    if (c === "\\") { escape = true; i++; continue; }
+    if (c === '"') {
+      if (depth === 0 && currentKey === null && !inString && valueStart === -1) {
+        currentKeyStart = i + 1;
+      }
+      if (depth === 0 && currentKey === null && inString && currentKeyStart !== -1) {
+        currentKey = body.slice(currentKeyStart, i);
+        currentKeyStart = -1;
+      }
+      inString = !inString;
+      i++; continue;
+    }
+    if (inString) { i++; continue; }
+
+    if (c === ":" && depth === 0 && currentKey !== null && valueStart === -1) {
+      let j = i + 1;
+      while (j < body.length && /\s/.test(body[j])) j++;
+      valueStart = j; i = j; continue;
+    }
+    if (c === "{" || c === "[") depth++;
+    if (c === "}" || c === "]") depth--;
+    if (c === "," && depth === 0 && currentKey !== null && valueStart !== -1) {
+      pairs.push({ key: currentKey, valueStr: body.slice(valueStart, i).trim() });
+      currentKey = null; valueStart = -1;
+    }
+    i++;
+  }
+  if (currentKey !== null && valueStart !== -1) {
+    pairs.push({ key: currentKey, valueStr: body.slice(valueStart).trim() });
+  }
+
+  const result = {};
+  for (const { key, valueStr } of pairs) {
+    let v = valueStr.replace(/,\s*$/, "");
+    // 배열/객체 자동 균형
+    if (v.startsWith("[") || v.startsWith("{")) {
+      let ob = 0, cb = 0, oq = 0, cq = 0, _inStr = false, _esc = false;
+      for (const c of v) {
+        if (_esc) { _esc = false; continue; }
+        if (c === "\\") { _esc = true; continue; }
+        if (c === '"') _inStr = !_inStr;
+        if (_inStr) continue;
+        if (c === "{") ob++; if (c === "}") cb++;
+        if (c === "[") oq++; if (c === "]") cq++;
+      }
+      for (let j = 0; j < oq - cq; j++) v += "]";
+      for (let j = 0; j < ob - cb; j++) v += "}";
+    }
+    try {
+      result[key] = JSON.parse(v);
+    } catch (e) {
+      // 배열이면 객체별 부분 복구 시도
+      if (v.startsWith("[")) {
+        const arr = tryArrayPartialRecovery(v);
+        if (arr.length > 0) {
+          result[key] = arr;
+          console.log(`[12-BH 부분복구] "${key}" 배열 부분 복구: ${arr.length}개`);
+        } else {
+          console.log(`[12-BH 부분복구] "${key}" 파싱 실패 — skip`);
+        }
+      } else {
+        console.log(`[12-BH 부분복구] "${key}" 파싱 실패 — skip (object)`);
+      }
+    }
+  }
+  return result;
+}
+
+// 배열 안 객체 1개씩 추출 (broken 객체 1개 skip)
+function tryArrayPartialRecovery(arrStr) {
+  const items = [];
+  let depth = 0, inString = false, escape = false, itemStart = -1;
+  for (let i = 1; i < arrStr.length - 1; i++) {
+    const c = arrStr[i];
+    if (escape) { escape = false; continue; }
+    if (c === "\\") { escape = true; continue; }
+    if (c === '"') { inString = !inString; continue; }
+    if (inString) continue;
+    if (c === "{" && depth === 0) itemStart = i;
+    if (c === "{") depth++;
+    if (c === "}") {
+      depth--;
+      if (depth === 0 && itemStart !== -1) {
+        const itemStr = arrStr.slice(itemStart, i + 1);
+        try {
+          items.push(JSON.parse(itemStr));
+        } catch (e) { /* skip broken item */ }
+        itemStart = -1;
+      }
+    }
+  }
+  return items;
 }
 
 // ─── WhatsApp 파서 (기존 그대로) ───────────────────────────────────────────────
@@ -2142,12 +2257,15 @@ async function callCurationPart(sys, userMsg, partLabel, allIssuesForFallback = 
   }
 
   // 기존 동기 호출 + Haiku fallback (Part 2a, 2b, 3 — 안전권 유지)
+  // ★ 12-BH (큐 #8): raw를 try 밖 변수로 보존 — 부분 복구 시 전체 응답 접근 가능
+  let rawForRecovery = "";
   try {
     await new Promise(r => setTimeout(r, 200));
     const raw = await callClaudeRaw(sys, userMsg, {
       model: MODEL_REASONING,  // ★ Sonnet (품질 우선)
       max_tokens: sonnetMaxTokens,
     });
+    rawForRecovery = raw;  // ★ 12-BH: 보존
     const elapsed = ((Date.now() - t0) / 1000).toFixed(1);
     console.log(`[PE 큐레이션 ${partLabel}] Sonnet 1차 성공 (${elapsed}초, max_tokens ${sonnetMaxTokens})`);
     console.log(`[PE 큐레이션 ${partLabel}] raw 응답 첫 200자:`, (raw || "").slice(0, 200));
@@ -2156,9 +2274,23 @@ async function callCurationPart(sys, userMsg, partLabel, allIssuesForFallback = 
     const elapsed = ((Date.now() - t0) / 1000).toFixed(1);
     console.error(`[PE 큐레이션 ${partLabel} 1차 실패] (${elapsed}초)`, e?.message?.slice(0, 200));
 
+    // ★ 영역 12-BH (큐 #8): JSON 부분 복구 시도 (Haiku fallback 호출 전)
+    // safeJSON 실패 케이스에만 시도 (504 timeout은 raw 자체가 없으므로 skip)
+    if (rawForRecovery && (e?._rawSnippet !== undefined || e?.message?.includes("JSON"))) {
+      console.log(`[PE 큐레이션 ${partLabel}] ★ 부분 복구 시도 (raw 길이=${rawForRecovery.length})`);
+      const recovered = tryPartialJSONRecovery(rawForRecovery);
+      if (recovered && Object.keys(recovered).length > 0) {
+        console.log(`[PE 큐레이션 ${partLabel}] ★ 부분 복구 성공 — 키: ${Object.keys(recovered).join(", ")}`);
+        return recovered;
+      }
+      console.log(`[PE 큐레이션 ${partLabel}] ★ 부분 복구 실패 — Haiku fallback 진입`);
+    }
+
+
     // 504 timeout 시 Haiku로 fallback
     if (e?.message?.includes("504") || e?.message?.includes("Timeout") || e?.message?.includes("timeout")) {
       const tFallback = Date.now();
+      let raw2ForRecovery = "";  // ★ 12-BH
       try {
         console.log(`[PE 큐레이션 ${partLabel}] Haiku로 fallback 재시도 (max_tokens ${haikuMaxTokens})...`);
         await new Promise(r => setTimeout(r, 800));
@@ -2166,6 +2298,7 @@ async function callCurationPart(sys, userMsg, partLabel, allIssuesForFallback = 
           model: MODEL_FAST,  // Haiku fallback
           max_tokens: haikuMaxTokens,
         });
+        raw2ForRecovery = raw2;  // ★ 12-BH: 보존
         const elapsedFb = ((Date.now() - tFallback) / 1000).toFixed(1);
         console.log(`[PE 큐레이션 ${partLabel}] Haiku fallback 성공 (${elapsedFb}초)`);
         console.log(`[PE 큐레이션 ${partLabel}] fallback raw 응답 첫 200자:`, (raw2 || "").slice(0, 200));
@@ -2173,6 +2306,16 @@ async function callCurationPart(sys, userMsg, partLabel, allIssuesForFallback = 
       } catch (e2) {
         const elapsedFb = ((Date.now() - tFallback) / 1000).toFixed(1);
         console.error(`[PE 큐레이션 ${partLabel} fallback도 실패] (${elapsedFb}초)`, e2?.message?.slice(0, 200));
+
+        // ★ 12-BH (큐 #8): Haiku fallback도 JSON 부분 복구 시도
+        if (raw2ForRecovery && (e2?._rawSnippet !== undefined || e2?.message?.includes("JSON"))) {
+          console.log(`[PE 큐레이션 ${partLabel}] ★ Haiku 응답 부분 복구 시도 (raw 길이=${raw2ForRecovery.length})`);
+          const recovered = tryPartialJSONRecovery(raw2ForRecovery);
+          if (recovered && Object.keys(recovered).length > 0) {
+            console.log(`[PE 큐레이션 ${partLabel}] ★ Haiku 응답 부분 복구 성공 — 키: ${Object.keys(recovered).join(", ")}`);
+            return recovered;
+          }
+        }
       }
     }
     // 최종 실패 — 빈 객체 반환 (병합 시 룰 백업으로 보정)

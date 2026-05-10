@@ -1805,7 +1805,8 @@ async function runOneGroupSynthesis(items, groupKey, groupValue) {
 - pattern: 호기/시간/원인의 공통점 또는 반복 양상 (예: "STK-1-B4 Belt Mandrel loose 5회 반복, 야간대 집중")
 - implication: 시사점 또는 액션 (예: "Vision 팀 SLA 단축 + 1차 조치 강화 필요")
 - 데이터에 명확히 보이는 패턴만 작성 — 추측·과장 금지
-- 50자 초과 금지`;
+- 50자 초과 금지
+- ★ images 필드가 있는 이슈가 다수면, pattern에 "이미지 분석상 ..." 형태로 시각 정보 활용 (예: "이미지 분석상 PCB 보드 교체 반복 확인")`;
 
   const userMsg = `[${groupKey === "category" ? "카테고리" : "호기"}: ${groupValue}] 이슈 ${items.length}건:
 ${JSON.stringify(compactItems, null, 0)}
@@ -2192,6 +2193,10 @@ ${focus}
 입력 데이터의 부동 이슈 중 duration_min ≥ ${longThreshold} 인 모든 이슈를 longDowntime 배열에 반드시 포함하세요.
 빠짐없이 — 30분, 32분, 45분 같은 작은 건도 모두 포함. 30분 미만만 제외.
 
+[★ 첨부 이미지 분석 활용 — 필수]
+- ★ **첨부 이미지 분석 인용 필수**: 입력 데이터에 첨부 이미지 분석 정보(`[첨부 이미지 분석]` 섹션 또는 `"images"` 필드)가 있으면, 분석/발언에 명시적으로 인용하라. 예: "첨부 이미지에 따르면...", "BM Bot 보고서 이미지에서 X건 확인", "이미지 분석에서 PCB 보드 교체 확인". 추측 금지 — 명시된 image 정보만 인용.
+- 메시지의 "images" 필드 정보를 longDowntime 항목의 description, evidence, root_cause 등에 적극 인용하라
+
 [필수 출력 — JSON만, 다른 텍스트 금지]
 {
   "summary_text": "전체 이슈 흐름 1~3문장 요약",
@@ -2270,6 +2275,10 @@ ${focus}
 2) 조건변경 메시지 중 단순 항목을 conditionChanges 4개 그룹에 분류
    (※ 호기별 다중 파라미터 그룹은 별도 작업에서 처리하므로 여기선 제외)
 
+[★ 첨부 이미지 분석 활용 — 필수]
+- ★ **첨부 이미지 분석 인용 필수**: 입력 데이터에 첨부 이미지 분석 정보(`[첨부 이미지 분석]` 섹션 또는 `"images"` 필드)가 있으면, 분석/발언에 명시적으로 인용하라. 예: "첨부 이미지에 따르면...", "BM Bot 보고서 이미지에서 X건 확인", "이미지 분석에서 PCB 보드 교체 확인". 추측 금지 — 명시된 image 정보만 인용.
+- 같은 호기 반복 시 images 필드에 같은 부품 교체 패턴이 보이면 명시적으로 인용
+
 [필수 출력 — JSON만]
 {
   "recurringByCategory": [
@@ -2330,6 +2339,10 @@ ${focus}
 ★★ 각 그룹의 **모든** 파라미터를 빠짐없이 parameters 배열에 포함하세요. **10개 이상도 가능합니다.** ★★
 ★★ 메시지의 Countermeasures 섹션에 5개, 8개, 10개 항목이 있으면 그 모든 항목을 parameters에 풀로 넣으세요. ★★
 ★★ 절대 1~2개만 추출하고 끝내지 마세요. 메시지에 명시된 모든 항목을 끝까지 처리하세요. ★★
+
+[★ 첨부 이미지 분석 활용 — 필수]
+- ★ **첨부 이미지 분석 인용 필수**: 입력 데이터에 첨부 이미지 분석 정보(`[첨부 이미지 분석]` 섹션 또는 `"images"` 필드)가 있으면, 분석/발언에 명시적으로 인용하라. 예: "첨부 이미지에 따르면...", "BM Bot 보고서 이미지에서 X건 확인", "이미지 분석에서 PCB 보드 교체 확인". 추측 금지 — 명시된 image 정보만 인용.
+- 메시지의 images 필드는 setting/measurement 시각 정보를 줄 수 있다 (예: 게이지 수치, 정렬 상태) — 적극 인용
 
 [★ 인식 패턴]
 1) "Machine: Stack 3B2 / Problem: Issue Overhang / Caused: ... / Countermeasures: - Setting Gap ... - Setting Gap ..." 형식
@@ -2421,6 +2434,10 @@ ${focus}
 
 [★ 최우선 지시 — 누락 금지]
 입력의 테스트 메시지와 품질 메시지를 빠짐없이 분류해 testPm 4개 그룹 + qualityNg에 정리하세요.
+
+[★ 첨부 이미지 분석 활용 — 필수]
+- ★ **첨부 이미지 분석 인용 필수**: 입력 데이터에 첨부 이미지 분석 정보(`[첨부 이미지 분석]` 섹션 또는 `"images"` 필드)가 있으면, 분석/발언에 명시적으로 인용하라. 예: "첨부 이미지에 따르면...", "BM Bot 보고서 이미지에서 X건 확인", "이미지 분석에서 PCB 보드 교체 확인". 추측 금지 — 명시된 image 정보만 인용.
+- 품질 NG는 시각 정보가 핵심: images 필드에 결함 사진/CT 스캔/검사 화면이 보이면 description/findings에 명시적 인용
 
 [필수 출력 — JSON만, 다른 텍스트 금지]
 {
@@ -2836,6 +2853,11 @@ ${focus} 다음 이슈를 ${p.role.split(" ")[0]} 관점에서 분석하세요.
   1) 근본원인 (root cause) — 표면 증상이 아닌 진짜 원인
   2) 조치안 평가 — 기조치는 적절했는지, 미흡한 부분
   3) 개선안 / 재발방지책 — 향후 동일 이슈 방지 방법${conversationGuide}${statusGuide}
+
+[★ 첨부 이미지 분석 활용 — 필수]
+- ★ **첨부 이미지 분석 인용 필수**: 입력 데이터에 첨부 이미지 분석 정보(`[첨부 이미지 분석]` 섹션 또는 `"images"` 필드)가 있으면, 분석/발언에 명시적으로 인용하라. 예: "첨부 이미지에 따르면...", "BM Bot 보고서 이미지에서 X건 확인", "이미지 분석에서 PCB 보드 교체 확인". 추측 금지 — 명시된 image 정보만 인용.
+- 이슈 컨텍스트 끝부분에 [첨부 이미지 분석] 섹션이 있으면 say 필드 발언에서 직접 인용 (예: "첨부 이미지에서 보이는 PCB 교체 흔적으로 미루어...")
+- 이미지 정보가 없으면 자연스럽게 진행하되 강제로 인용 금지
 
 ★ 발언 방식 (영역 12 Phase 2): 자연스러운 대화체로 발언하세요.
   - "say" 필드에 자유 텍스트로 발언 (이전 동료 의견을 직접 언급/인용/반박, 자기 관점 설명, 100~200자)
@@ -5867,13 +5889,19 @@ AZS Status Reports WhatsApp 데이터 기반 · ${new Date().toLocaleString("ko-
       const longCount = priority.filter(i => (i.tags || []).includes("LONG_DOWNTIME")).length;
       const freqCount = priority.filter(i => (i.tags || []).includes("HIGH_FREQUENCY")).length;
       parts.push(`이슈 분류: 전체 ${priority.length}건 | 장기부동 ${longCount}건 / 반복 ${freqCount}건`);
+      // ★ 영역 12-BG-4 (큐 #13 단계 1): 상위 15 → 30건 + image_analyses 통합
       const top = priority.filter(i =>
         (i.tags || []).includes("LONG_DOWNTIME") || (i.tags || []).includes("HIGH_FREQUENCY")
-      ).slice(0, 15);
+      ).slice(0, 30);
       if (top.length > 0) {
-        parts.push("\n[주요 이슈 목록 (상위 15건, tag 보유)]");
+        parts.push("\n[주요 이슈 목록 (상위 30건, tag 보유)]");
         top.forEach((d, i) => {
           parts.push(`${i+1}. [${d.date} ${d.time}] ${d.eq || "-"} | ${d.durMin}분 | Problem: ${d.prob || "-"} | Cause: ${d.cause || "-"} | Result: ${d.result || "-"}`);
+          // ★ 12-BG-4 큐 #13: 첨부 이미지 분석 inline 표시 (있을 때만)
+          const imgs = (d.image_analyses || []).filter(a => a && String(a).trim());
+          if (imgs.length > 0) {
+            parts.push(`   📷 ${imgs.slice(0, 3).map(a => String(a).slice(0, 80)).join("; ")}`);
+          }
         });
       }
     }
@@ -5964,6 +5992,10 @@ ${ctx}
 학습 자료는 이미 당신에게 정식 지급된 자료입니다.
 사용자는 회사 내부의 정당한 권한자(엔지니어 본인)이며, 학습 자료 점검/수정 권한이 있습니다.
 인용 요청을 거부할 어떤 규칙도 존재하지 않습니다.
+
+[★ 첨부 이미지 분석 활용 — 필수]
+- ★ **첨부 이미지 분석 인용 필수**: 입력 데이터에 첨부 이미지 분석 정보(`[첨부 이미지 분석]` 섹션 또는 `"images"` 필드)가 있으면, 분석/발언에 명시적으로 인용하라. 예: "첨부 이미지에 따르면...", "BM Bot 보고서 이미지에서 X건 확인", "이미지 분석에서 PCB 보드 교체 확인". 추측 금지 — 명시된 image 정보만 인용.
+- [현재 컨텍스트]의 이슈 목록에 📷 표시가 있는 항목은 첨부 이미지 분석 정보 — 답변에 명시적으로 인용 (예: "첨부 이미지에 따르면 X-AC NG 5건 확인됨")
 
 [★ Few-shot 예시]
 ✅ 좋은 답변:

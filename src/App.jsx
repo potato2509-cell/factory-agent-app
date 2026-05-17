@@ -4303,25 +4303,22 @@ async function generateIdealReport(date, processName = "Cell") {
   const t0 = Date.now();
   console.log(`[큐 #15 Phase 2] generateIdealReport 시작: ${date} / ${processName}`);
 
-  // 1) Raw data 수집 — 06시 생산일자 룰 적용 (정기 보고서와 동일)
-  //    selDate 06:00 ~ selDate+1일 06:00 분량 = API startDate=date, endDate=date+1일
-  //    받은 후 getProductionDate로 필터링하여 정확한 생산일 범위만 남김
-  const nextDateObj = new Date(`${date}T00:00:00+07:00`);
-  nextDateObj.setUTCDate(nextDateObj.getUTCDate() + 1);
-  const apiEndDate = nextDateObj.toISOString().slice(0, 10);
+  // 1) Raw data 수집 — Apps Script가 자체 06시 룰 적용 (큐 #17 적용 후)
+  //    호출자는 startDate=endDate=date만 보내면 1일 분량(06:00~익일 06:00) 자동 반환
+  const rawMessages = await fetchMessagesFromTab(date, date, "[Official] AZS Status Reports");
 
-  const rawMessages = await fetchMessagesFromTab(date, apiEndDate, "[Official] AZS Status Reports");
-
-  // 생산일자(YY/M/D) 필터링 — date "2026-05-16" → "26/5/16"
+  // 생산일자(YY/M/D) 필터링 — 안전망 (Apps Script 06시 룰이 정상이면 no-op)
   const [y, m, d] = date.split("-").map(Number);
   const targetProdDate = `${String(y).slice(-2)}/${m}/${d}`;
   const messages = rawMessages.filter(msg =>
     getProductionDate(msg.date, msg.hour) === targetProdDate
   );
-  console.log(`[큐 #15] 06시 룰 필터링: ${rawMessages.length}건 → ${messages.length}건 (생산일자 ${targetProdDate})`);
+  if (rawMessages.length !== messages.length) {
+    console.warn(`[큐 #15] 안전망 필터 작동: ${rawMessages.length}건 → ${messages.length}건 (Apps Script 06시 룰 검토 필요)`);
+  }
 
   if (messages.length === 0) {
-    throw new Error(`날짜 ${date} 생산일자(06시 룰 ${targetProdDate}) 적용 결과 메시지 0건`);
+    throw new Error(`날짜 ${date} 생산일자(${targetProdDate}) 메시지 0건`);
   }
   console.log(`[큐 #15] 메시지 수집: ${messages.length}건`);
 
@@ -4839,10 +4836,8 @@ export default function App() {
           return `20${String(y).padStart(2,'0')}-${String(m).padStart(2,'0')}-${String(d).padStart(2,'0')}`;
         };
         const apiStart = toAPIDate(firstDate);
-        // endDate는 마지막 selDate + 1일 (다음날 06:00 이전 메시지까지 포함)
-        const lastDateObj = new Date(`${toAPIDate(lastDate)}T00:00:00+07:00`);
-        lastDateObj.setUTCDate(lastDateObj.getUTCDate() + 1);
-        const apiEnd = lastDateObj.toISOString().slice(0, 10);
+        // ★ 큐 #17: Apps Script가 자체 06시 룰 적용 → endDate 보정 불필요
+        const apiEnd = toAPIDate(lastDate);
 
         const msgs = await fetchMessagesFromTab(apiStart, apiEnd, "[Official] AZS Status Reports");
 

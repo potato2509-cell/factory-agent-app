@@ -4507,9 +4507,10 @@ ${formatReport(idealReport, "[정답 보고서]")}
 
   let rawResponse;
   try {
-    rawResponse = await callClaudeRaw(systemPrompt, userMsg, {
+    rawResponse = await callClaudeBackground(systemPrompt, userMsg, {
       model: MODEL_REASONING,
       max_tokens: 3000,
+      onProgress: (msg) => console.log(`[큐 #15 Phase 3 judge] ${msg}`),
     });
   } catch (e) {
     throw new Error(`judge 호출 실패: ${e.message}`);

@@ -235,6 +235,14 @@ const PERSONAS = {
     focus: "불량 패턴, 공정 변수(온도·압력·속도), 수율 추이, Cpk, 유사 불량 이력",
     stance: "이슈 발생 시 ① 어느 공정에서 발생했는지 진단 ② 임시조치/근본조치 구분 제시 ③ 데이터 근거 제시. PE/ME는 TE 진단을 우선 검토.",
   },
+  Cell_PLC: {
+    label: "Cell PLC", process: "Cell",
+    color: "#fbbf24", bg: "rgba(251,191,36,0.12)", icon: "⚡",
+    role: "PLC Program Engineer - Cell 공정 (Stacker, Press 등)",
+    priority: "시퀀스 로직 안정성 → 안전 인터록 무결성 → PLC 통신 신뢰성 → 알람 처리 → 프로그램 유지보수성",
+    focus: "Cell 공정 설비(Stacker, Press) PLC 시퀀스, 전기 제어, 안전 인터록, 알람 누락/오작동, MES·Vision·Robot 인터페이스",
+    stance: "설비 정지 시 ME(하드웨어)와 협력하여 PLC 측 원인 분석. 신규 알람 발생 시 시퀀스 로직 점검 우선. TE 근본원인 분석에 제어 신호 흐름 정보 제공.",
+  },
   // ── Elec 공정 ──
   Elec_PE: {
     label: "Elec 생산", process: "Elec",
@@ -260,12 +268,20 @@ const PERSONAS = {
     focus: "Elec 공정 불량 패턴, 공정 변수, 수율 추이, Cpk, 유사 불량 이력",
     stance: "이슈 발생 시 ① 어느 공정에서 발생했는지 진단 ② 임시조치/근본조치 구분 제시 ③ 데이터 근거 제시. PE/ME는 TE 진단을 우선 검토.",
   },
+  Elec_PLC: {
+    label: "Elec PLC", process: "Elec",
+    color: "#f59e0b", bg: "rgba(245,158,11,0.12)", icon: "⚡",
+    role: "PLC Program Engineer - Elec 공정 (Notching, Coater 등)",
+    priority: "시퀀스 로직 안정성 → 안전 인터록 무결성 → PLC 통신 신뢰성 → 알람 처리 → 프로그램 유지보수성",
+    focus: "Elec 공정 설비(Notching, Coater) PLC 시퀀스, 전기 제어, 안전 인터록, 알람 누락/오작동, MES·Vision·Robot 인터페이스",
+    stance: "설비 정지 시 ME(하드웨어)와 협력하여 PLC 측 원인 분석. 신규 알람 발생 시 시퀀스 로직 점검 우선. TE 근본원인 분석에 제어 신호 흐름 정보 제공.",
+  },
   // ── 공통 (Cell/Elec 모두 지원) ──
   FA: {
     label: "FA (반송)", process: "공통",
     color: "#a78bfa", bg: "rgba(167,139,250,0.12)", icon: "🟣",
     role: "FA (Factory Automation) Engineer — 자동 반송 시스템 (전 공정 공통)",
-    priority: "반송 흐름 안정성 → 반송 설비 가동률 → WIP 적정 수준 → MES/PLC 연동",
+    priority: "반송 흐름 안정성 → 반송 설비 가동률 → WIP 적정 수준 → MES 통신",
     focus: "C/V 잼·정렬, Stocker 처리능력, OHT 충돌·경로, AGV 배터리·통신, MES 통신, WIP 누적, 반송 중 손상",
     stance: "이슈가 공정인가 반송인가 검토. TE 분석 시 반송 중 발생 가능성(낙하·충격·대기) 제시.",
   },
@@ -277,6 +293,14 @@ const PERSONAS = {
     focus: "검사 통과율, 오검/미검률, 조명·카메라 컨디션, 신규 불량 패턴, 검사 기준",
     stance: "검출 정확도 관점에서 의견. 오검·미검 가능성, 신규 불량 모드 여부 검토.",
   },
+  FA_PLC: {
+    label: "FA PLC", process: "공통",
+    color: "#eab308", bg: "rgba(234,179,8,0.12)", icon: "⚡",
+    role: "PLC Program Engineer — 반송 시스템 (Conveyor, OHT, Stocker, AGV 등)",
+    priority: "반송 시퀀스 안정성 → 충돌·정체 방지 인터록 → 통신 신뢰성 (MES/AGV) → 알람 처리 → 경로 최적화",
+    focus: "반송 PLC 시퀀스 (C/V, OHT, Stocker), 충돌 방지 인터록, AGV 경로 제어, 통신 에러, 알람 패턴",
+    stance: "반송 이상 발생 시 FA(하드웨어/경로)와 협력하여 PLC 측 시퀀스 점검. 신규 통신 에러 시 인터페이스 코드 우선 검토.",
+  },
 };
 
 // ─── 공정 정의 ─────────────────────────────────────────────────────────────────
@@ -284,18 +308,18 @@ const PROCESSES = {
   Cell: {
     label: "Cell 공정",
     icon: "🔵",
-    auto: ["Cell_PE", "Cell_ME", "Cell_TE"],
+    auto: ["Cell_PE", "Cell_ME", "Cell_TE", "Cell_PLC"],
     otherProcess: "Elec",
   },
   Elec: {
     label: "Elec 공정",
     icon: "🔷",
-    auto: ["Elec_PE", "Elec_ME", "Elec_TE"],
+    auto: ["Elec_PE", "Elec_ME", "Elec_TE", "Elec_PLC"],
     otherProcess: "Cell",
   },
 };
 
-const COMMON_AGENTS = ["FA", "Vision"];
+const COMMON_AGENTS = ["FA", "Vision", "FA_PLC"];
 
 // 공장 운영 철학 (모든 페르소나 공통)
 const FACTORY_PHILOSOPHY = `
@@ -4278,10 +4302,11 @@ JSON: {"heading":"3. 🟡 STANDARD 이슈 액션 플랜 (미완료)","items":["[
   // 섹션 4: 담당자별 종합 액션
   try {
     await new Promise(r => setTimeout(r, 500));
-    const sys4 = `AZS 배터리 공장 ${reportTitle}. 한국어. JSON만. 5팀 슬롯 모두 필수 채움.
+    const sys4 = `AZS 배터리 공장 ${reportTitle}. 한국어. JSON만. 6팀 슬롯 모두 필수 채움.
 raw 데이터에 해당 팀 활동이 명시되지 않으면 "(해당 활동 없음 — 모니터링 권장)" 형태로 채움. 빈 문자열·항목 생략·축소 절대 금지.
-JSON: {"heading":"4. 담당자별 액션 아이템","items":["[PE] 조치 (60자이내)","[ME] 조치","[TE] 조치","[FA] 조치","[Vision] 조치"]}`;
-    const raw4 = await callClaudeRaw(sys4, ctx, { model: MODEL_REASONING, max_tokens: 600 });
+PLC 슬롯: Cell/Elec/FA 공정의 PLC 관련 시퀀스·인터록·알람·통신 이슈 통합.
+JSON: {"heading":"4. 담당자별 액션 아이템","items":["[PE] 조치 (60자이내)","[ME] 조치","[TE] 조치","[FA] 조치","[Vision] 조치","[PLC] 조치"]}`;
+    const raw4 = await callClaudeRaw(sys4, ctx, { model: MODEL_REASONING, max_tokens: 700 });
     sections.push(safeJSON(raw4));
   } catch { sections.push({ heading:"4. 담당자별 액션 아이템", items:["-"] }); }
 

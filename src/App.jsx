@@ -4415,9 +4415,193 @@ ${rawContext}`;
   };
 }
 
-// 큐 #15 Phase 2 임시 글로벌 노출 (콘솔 검증용 — Phase 3 진입 시 제거)
+// ─── 큐 #15 Phase 3: GapLog Apps Script 호출 헬퍼 ───────────────────────────
+// AZS_WhatsApp_Webhook 프로젝트의 ?action=gaplog.append 엔드포인트 호출
+async function appendGapLogRow(gapData) {
+  const GAPLOG_SECRET = import.meta.env.VITE_GAPLOG_SECRET || "";
+  if (!GAPLOG_SECRET) {
+    throw new Error("VITE_GAPLOG_SECRET 환경변수 미설정 — Netlify에 등록 필요");
+  }
+
+  const url = `${WHAPI_APPS_SCRIPT_URL}?action=gaplog.append&secret=${encodeURIComponent(GAPLOG_SECRET)}`;
+  let res;
+  try {
+    res = await fetch(url, {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ data: gapData }),
+      redirect: "follow",
+    });
+  } catch (e) {
+    throw new Error(`GapLog 호출 네트워크 오류: ${e.message}`);
+  }
+
+  if (!res.ok) {
+    const errText = await res.text().catch(() => "");
+    throw new Error(`GapLog append HTTP ${res.status}: ${errText.slice(0, 200)}`);
+  }
+  const result = await res.json();
+  if (!result.ok) {
+    throw new Error(`GapLog append 실패: ${result.error || "unknown"}`);
+  }
+  return result;
+}
+
+// ─── 큐 #15 Phase 3: judge 호출 (현재 vs 정답 5섹션 4차원 비교) ─────────────
+async function judgeReports(currentReport, idealReport, date) {
+  const t0 = Date.now();
+  console.log(`[큐 #15 Phase 3] judgeReports 시작: ${date}`);
+
+  // 두 레포트 직렬화 (generateReport는 sections이 배열, generateIdealReport는 객체)
+  const formatReport = (rpt, label) => {
+    if (!rpt || !rpt.sections) return `${label}: (empty)`;
+    const sections = Array.isArray(rpt.sections)
+      ? rpt.sections
+      : Object.values(rpt.sections);
+    return `${label}:\n` + sections.map(s =>
+      `${s.heading || "(no heading)"}\n${(s.items || []).map(it => `  - ${it}`).join("\n")}`
+    ).join("\n\n");
+  };
+
+  const systemPrompt = `당신은 AZS 배터리 공장 일일 회의록 품질 검토자입니다.
+두 회의록(현재 시스템 생성 vs 정답)을 비교하여 차이점을 4가지 차원으로 분석하세요.
+
+차원 정의:
+- missing: 정답에는 있지만 현재 보고서에 없는 항목 (누락)
+- error: 현재 보고서가 잘못 기술한 항목 (오류)
+- extra: 현재 보고서에만 있는 비핵심/불필요 항목 (잉여)
+- insight_missing: 정답에만 있는 핵심 인사이트/패턴 (관점 누락)
+
+반드시 다음 JSON 형식으로만 출력. 다른 설명/마크다운/코드블록 금지:
+
+{
+  "gaps": [
+    {
+      "section": 1,
+      "dimension": "missing",
+      "gap_description": "차이 항목 설명 (한국어 100자 내외)",
+      "severity": "high",
+      "current_value": "현재 보고서가 출력한 내용 (없으면 '(없음)')",
+      "ideal_value": "정답 보고서가 출력한 내용",
+      "raw_evidence": "raw data 근거 또는 인용 (없으면 '(N/A)')"
+    }
+  ]
+}
+
+기준:
+- section: 1~5 (1=전체현황, 2=DEEP, 3=STANDARD, 4=담당자, 5=재발방지)
+- dimension: missing | error | extra | insight_missing 중 하나
+- severity: high(중대한 누락/오류), medium(개선 권장), low(스타일/사소함)
+- gap이 없는 섹션은 건너뜀 (강제로 작성 X)
+- 최대 15개까지
+- 두 보고서가 동일한 항목은 gap으로 보고하지 말 것`;
+
+  const userMsg = `날짜: ${date}
+
+${formatReport(currentReport, "[현재 시스템 보고서]")}
+
+${formatReport(idealReport, "[정답 보고서]")}
+
+위 두 보고서를 비교하여 차이점을 JSON으로 출력하세요.`;
+
+  let rawResponse;
+  try {
+    rawResponse = await callClaudeRaw(systemPrompt, userMsg, {
+      model: MODEL_REASONING,
+      max_tokens: 3000,
+    });
+  } catch (e) {
+    throw new Error(`judge 호출 실패: ${e.message}`);
+  }
+
+  let parsed;
+  try {
+    parsed = safeJSON(rawResponse);
+  } catch (e) {
+    console.error("[큐 #15 Phase 3] JSON 파싱 실패. 원본 응답 (앞 500자):");
+    console.error(String(rawResponse).slice(0, 500));
+    throw new Error(`judge JSON 파싱 실패: ${e.message}`);
+  }
+
+  if (!Array.isArray(parsed.gaps)) {
+    throw new Error(`judge 응답에 gaps 배열 없음 — 형식 이상`);
+  }
+
+  const elapsedSec = ((Date.now() - t0) / 1000).toFixed(1);
+  console.log(`[큐 #15 Phase 3] judge 완료 (${elapsedSec}초, ${parsed.gaps.length}건 gap 식별)`);
+
+  return {
+    gaps: parsed.gaps,
+    elapsedSec: parseFloat(elapsedSec),
+    _rawResponse: rawResponse,
+  };
+}
+
+// ─── 큐 #15 Phase 3: 통합 흐름 (ideal 생성 → judge → GapLog 자동 적재) ──────
+async function compareAndLogGaps(currentReport, date, processName = "Cell") {
+  const t0 = Date.now();
+  console.log(`[큐 #15 Phase 3] compareAndLogGaps 시작: ${date}`);
+
+  if (!currentReport) {
+    throw new Error("currentReport 없음 — 먼저 논의앱에서 회의록 생성 후 window._latestReport 사용");
+  }
+
+  // Step 1: 정답 레포트 생성 (Phase 2 재사용)
+  console.log("[큐 #15 Phase 3] Step 1/3: 정답 레포트 생성 중...");
+  const idealReport = await generateIdealReport(date, processName);
+
+  // Step 2: judge 비교 호출
+  console.log("[큐 #15 Phase 3] Step 2/3: judge 비교 분석 중...");
+  const judgeResult = await judgeReports(currentReport, idealReport, date);
+
+  // Step 3: GapLog 자동 적재 (gap 1건당 1회 호출)
+  console.log(`[큐 #15 Phase 3] Step 3/3: GapLog 적재 (${judgeResult.gaps.length}건)...`);
+  const logResults = [];
+  for (let i = 0; i < judgeResult.gaps.length; i++) {
+    const g = judgeResult.gaps[i];
+    try {
+      const result = await appendGapLogRow({
+        report_date: date,
+        section: g.section,
+        dimension: g.dimension,
+        gap_description: g.gap_description,
+        severity: g.severity || "medium",
+        raw_evidence: g.raw_evidence || "",
+        current_value: g.current_value || "",
+        ideal_value: g.ideal_value || "",
+      });
+      logResults.push({ ok: true, id: result.id, section: g.section, dim: g.dimension });
+      console.log(`  [${i + 1}/${judgeResult.gaps.length}] ✓ §${g.section} ${g.dimension} → ${result.id}`);
+    } catch (e) {
+      logResults.push({ ok: false, error: e.message, section: g.section, dim: g.dimension });
+      console.error(`  [${i + 1}/${judgeResult.gaps.length}] ✗ §${g.section} ${g.dimension}: ${e.message}`);
+    }
+  }
+
+  const successCount = logResults.filter(r => r.ok).length;
+  const totalElapsed = ((Date.now() - t0) / 1000).toFixed(1);
+  console.log(`[큐 #15 Phase 3] ✅ 완료 (${totalElapsed}초): GapLog ${successCount}/${judgeResult.gaps.length}건 적재`);
+
+  return {
+    date,
+    idealReport,
+    judgeResult,
+    logResults,
+    summary: {
+      gapCount: judgeResult.gaps.length,
+      loggedCount: successCount,
+      failedCount: logResults.length - successCount,
+      totalElapsedSec: parseFloat(totalElapsed),
+    },
+  };
+}
+
+// 큐 #15 Phase 2/3 임시 글로벌 노출 (콘솔 검증용 — Phase 4 진입 시 제거)
 if (typeof window !== "undefined") {
   window.generateIdealReport = generateIdealReport;
+  window.judgeReports = judgeReports;
+  window.compareAndLogGaps = compareAndLogGaps;
+  window.appendGapLogRow = appendGapLogRow;  // 단독 테스트용
 }
 
 // ─── UI 헬퍼 ──────────────────────────────────────────────────────────────────
@@ -5031,6 +5215,8 @@ export default function App() {
       report.curation = curation;  // 메인 페이지에서 1~5번 표시 위해
       report.discussions = allDiscussions;  // ★ Phase 2: 페르소나 매칭용
       setMinutes(report);
+      // ★ 큐 #15 Phase 3 검증용: 콘솔에서 compareAndLogGaps 호출 시 사용
+      if (typeof window !== "undefined") window._latestReport = report;
 
       // 시트 저장 — 영역 12-X5 (3): 새 4축 필드 + 페르소나 say 통합 컬럼
       setProgress(p => [...p, "💾 구글 시트 저장 중..."]);

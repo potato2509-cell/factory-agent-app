@@ -4296,6 +4296,130 @@ ${discussionSummary}`;
   };
 }
 
+// ─── 큐 #15 Phase 2 (사양 v1 §3.2): 정답 레포트 생성 ────────────────────────
+// 동일 일자 raw messages + ImageAnalysis로 Claude가 "이상적 레포트" 5섹션 생성
+// 비교 운영용 — UI 통합 없음 (Phase 3에서 generateReport와 자동 비교 연결)
+async function generateIdealReport(date, processName = "Cell") {
+  const t0 = Date.now();
+  console.log(`[큐 #15 Phase 2] generateIdealReport 시작: ${date} / ${processName}`);
+
+  // 1) Raw data 수집 (12-AZ get_messages 재사용)
+  const messages = await fetchMessagesFromTab(date, date, "[Official] AZS Status Reports");
+  if (messages.length === 0) {
+    throw new Error(`날짜 ${date}에 데이터 없음 — get_messages 결과 0건`);
+  }
+  console.log(`[큐 #15] 메시지 수집: ${messages.length}건`);
+
+  // 2) Raw 컨텍스트 구성 (텍스트 + 이미지 분석 결과 통합)
+  const contextLines = messages.map((m, i) => {
+    const head = `[${i + 1}] ${m.date} ${m.time} ${m.sender}`;
+    const text = m.text ? `\n  text: ${m.text}` : "";
+    const imgAnalysis = (m.image_analyses && m.image_analyses[0])
+      ? `\n  [이미지 분석] ${m.image_analyses[0]}` : "";
+    return head + text + imgAnalysis;
+  });
+  const rawContext = contextLines.join("\n\n");
+
+  // 토큰 한도 가드 (대략 글자수/3 ≈ 토큰, 한글 보수적)
+  const estTokens = Math.round(rawContext.length / 3);
+  console.log(`[큐 #15] 추정 입력 토큰: ~${estTokens.toLocaleString()}`);
+  if (estTokens > 180000) {
+    throw new Error(`입력 토큰 초과 위험 (~${estTokens.toLocaleString()}, 한도 180K)`);
+  }
+
+  // 3) Claude 호출 (5섹션 통합 JSON, Background — 큰 토큰/긴 시간)
+  const systemPrompt = `당신은 AZS 배터리 공장 ${processName} 라인의 일일 회의록 작성 전문가입니다.
+주어진 WhatsApp 그룹 메시지(텍스트 + 이미지 분석 결과)를 기반으로 5섹션 통합 JSON으로 한국어 회의록을 작성하세요.
+
+반드시 다음 JSON 구조 그대로 출력. 다른 설명/마크다운/주석/코드블록 절대 금지:
+
+{
+  "section1_overall": {
+    "heading": "1. 전체 현황 요약",
+    "items": ["시간대별 패턴 핵심 (60자이내)", "빈도 패턴 핵심", "주요 이슈 요약", "KPI 또는 영향"]
+  },
+  "section2_deep_issues": {
+    "heading": "2. 🔴 DEEP 이슈 종합 (심각/긴급)",
+    "items": ["[설비명] 합의·충돌·권고 핵심 (80자이내)", "..."]
+  },
+  "section3_standard_actions": {
+    "heading": "3. 🟡 STANDARD 이슈 액션 플랜 (미완료)",
+    "items": ["[설비명] 액션·담당·우선순위 (80자이내)", "..."]
+  },
+  "section4_owner_actions": {
+    "heading": "4. 담당자별 액션 아이템",
+    "items": ["[PE] 조치 (60자이내)", "[ME] 조치", "[TE] 조치", "[FA] 조치 (해당시)", "[Vision] 조치 (해당시)"]
+  },
+  "section5_prevention": {
+    "heading": "5. 재발방지 대책 및 차기 계획",
+    "items": ["재발방지 핵심 대책 (60자이내)", "장기 개선 과제", "모니터링 항목", "차기 일정"]
+  }
+}
+
+기준:
+- 모든 items는 한국어
+- 메시지 내용 근거 기반 (주관적 해석 최소화)
+- DEEP 이슈 없으면 items: ["DEEP 이슈 없음"]
+- STANDARD 이슈 없으면 items: ["STANDARD 이슈 없음"]
+- 각 항목 길이 가이드 준수`;
+
+  const userMsg = `날짜: ${date}
+공정: ${processName}
+전체 메시지: ${messages.length}건
+
+[WhatsApp 메시지 원본]
+${rawContext}`;
+
+  console.log(`[큐 #15] Claude API 호출 시작 (Background, 최대 5분 대기)`);
+  const rawResponse = await callClaudeBackground(systemPrompt, userMsg, {
+    model: MODEL_REASONING,
+    max_tokens: 4000,
+    onProgress: (msg) => console.log(`[큐 #15] ${msg}`),
+  });
+
+  // 4) JSON 파싱
+  let parsed;
+  try {
+    parsed = safeJSON(rawResponse);
+  } catch (e) {
+    console.error("[큐 #15] JSON 파싱 실패. 원본 응답 (앞 500자):");
+    console.error(String(rawResponse).slice(0, 500));
+    throw new Error(`JSON 파싱 실패: ${e.message}`);
+  }
+
+  // 5) 스키마 검증 (5섹션 다 있는지)
+  const requiredKeys = [
+    "section1_overall", "section2_deep_issues", "section3_standard_actions",
+    "section4_owner_actions", "section5_prevention"
+  ];
+  const missingKeys = requiredKeys.filter(k =>
+    !parsed[k] || !parsed[k].heading || !Array.isArray(parsed[k].items)
+  );
+  if (missingKeys.length > 0) {
+    console.warn(`[큐 #15] 일부 섹션 누락/형식 이상: ${missingKeys.join(", ")} — 가능한 부분만 사용`);
+  }
+
+  const elapsedSec = ((Date.now() - t0) / 1000).toFixed(1);
+  console.log(`[큐 #15 Phase 2] ✅ 완료 (${elapsedSec}초)`);
+
+  return {
+    date,
+    processName,
+    messageCount: messages.length,
+    estInputTokens: estTokens,
+    elapsedSec: parseFloat(elapsedSec),
+    model: MODEL_REASONING,
+    sections: parsed,
+    _rawResponse: rawResponse,        // Phase 3 비교용 원본 보존
+    _generatedAt: new Date().toISOString(),
+  };
+}
+
+// 큐 #15 Phase 2 임시 글로벌 노출 (콘솔 검증용 — Phase 3 진입 시 제거)
+if (typeof window !== "undefined") {
+  window.generateIdealReport = generateIdealReport;
+}
+
 // ─── UI 헬퍼 ──────────────────────────────────────────────────────────────────
 function Spinner() {
   return <span style={{
@@ -4522,9 +4646,7 @@ export default function App() {
         const msgs = await fetchMessagesFromTab(apiStart, apiEnd, "[Official] AZS Status Reports");
 
         if (msgs.length === 0) {
-          const errMsg = `해당 기간(${apiStart} ~ ${apiEnd})에 메시지가 없습니다`;
-          setError(errMsg);
-          alert(`⚠️ ${errMsg}`);  // ★ 영역 12-BK: 모바일에서도 잘 보이게
+          setError(`해당 기간(${apiStart} ~ ${apiEnd})에 메시지가 없습니다`);
           setTabFetchLoading(false);
           return;
         }
@@ -4537,12 +4659,7 @@ export default function App() {
         const validSelDates = selDates.filter(d => realDs.includes(d));
         if (validSelDates.length === 0) {
           // 사용자 선택이 데이터에 없음 → 가장 가까운 일자로 폴백
-          // ★ 영역 12-BK: 진단 — 무엇이 응답에 있고 무엇이 선택됐는지 명시
-          const diag = `선택: ${selDates.join(', ')} / 응답 일자: ${realDs.join(', ')} / 총 ${msgs.length}건`;
-          console.log(`[12-AZ-3 진단] ${diag}`);
-          const errMsg = `선택한 일자에 메시지가 없습니다.\n${diag}`;
-          setError(errMsg);
-          alert(`⚠️ ${errMsg}`);  // ★ 영역 12-BK: 모바일에서도 잘 보이게
+          setError(`선택한 일자(${selDates.join(', ')})에 메시지가 없습니다. 다른 날짜를 선택하세요.`);
           setTabFetchLoading(false);
           return;
         }
@@ -4553,9 +4670,7 @@ export default function App() {
         setStep(2);
       } catch (err) {
         console.error("[12-AZ-3] messages 탭 조회 실패:", err);
-        const errMsg = `조회 실패: ${err?.message || err}`;
-        setError(errMsg);
-        alert(`⚠️ ${errMsg}`);  // ★ 영역 12-BK: 모바일에서도 잘 보이게
+        setError(`조회 실패: ${err?.message || err}`);
       } finally {
         setTabFetchLoading(false);
       }

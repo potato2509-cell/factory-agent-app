@@ -4428,7 +4428,8 @@ async function appendGapLogRow(gapData) {
   try {
     res = await fetch(url, {
       method: "POST",
-      headers: { "Content-Type": "application/json" },
+      // ★ Apps Script CORS 회피: text/plain으로 preflight 우회 (서버는 e.postData.contents 그대로 JSON.parse)
+      headers: { "Content-Type": "text/plain;charset=utf-8" },
       body: JSON.stringify({ data: gapData }),
       redirect: "follow",
     });

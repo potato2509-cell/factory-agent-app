@@ -4610,12 +4610,135 @@ async function compareAndLogGaps(currentReport, date, processName = "Cell") {
   };
 }
 
-// 큐 #15 Phase 2/3 임시 글로벌 노출 (콘솔 검증용 — Phase 4 진입 시 제거)
+// ─── 큐 #15 Phase 5a: GapLog 조회 헬퍼 ────────────────────────────────────
+// Apps Script ?action=gaplog.list 호출 (filter 옵션 지원)
+async function fetchGapLogList(filter = {}) {
+  const GAPLOG_SECRET = import.meta.env.VITE_GAPLOG_SECRET || "";
+  if (!GAPLOG_SECRET) {
+    throw new Error("VITE_GAPLOG_SECRET 환경변수 미설정");
+  }
+
+  const url = `${WHAPI_APPS_SCRIPT_URL}?action=gaplog.list&secret=${encodeURIComponent(GAPLOG_SECRET)}`;
+  let res;
+  try {
+    res = await fetch(url, {
+      method: "POST",
+      headers: { "Content-Type": "text/plain;charset=utf-8" },
+      body: JSON.stringify({ filter }),
+      redirect: "follow",
+    });
+  } catch (e) {
+    throw new Error(`GapLog list 네트워크 오류: ${e.message}`);
+  }
+
+  if (!res.ok) {
+    const errText = await res.text().catch(() => "");
+    throw new Error(`GapLog list HTTP ${res.status}: ${errText.slice(0, 200)}`);
+  }
+  const result = await res.json();
+  if (!result.ok) {
+    throw new Error(`GapLog list 실패: ${result.error || "unknown"}`);
+  }
+  return result;
+}
+
+// ─── 큐 #15 Phase 5a: 누적 gap 패턴 분석 ─────────────────────────────────
+async function analyzeGapPatterns(filter = { status: "open" }) {
+  const t0 = Date.now();
+  console.log(`[큐 #15 Phase 5a] analyzeGapPatterns 시작 (filter: ${JSON.stringify(filter)})`);
+
+  // 1) GapLog 로드
+  const listResult = await fetchGapLogList(filter);
+  if (listResult.count === 0) {
+    throw new Error("분석할 gap 없음 — filter 조건 확인 (예: status='open')");
+  }
+  console.log(`[큐 #15 Phase 5a] ${listResult.count}건 gap 로드`);
+
+  // 2) gap 요약 텍스트 구성 (Claude에게 전달)
+  const gapSummary = listResult.gaps.map((g, i) =>
+    `[${i + 1}] id=${g.id} §${g.section} ${g.dimension} (${g.severity || "medium"})
+  날짜: ${g.report_date}
+  내용: ${g.gap_description}
+  현재값: ${String(g.current_value || "").slice(0, 100)}
+  정답값: ${String(g.ideal_value || "").slice(0, 100)}`
+  ).join("\n\n");
+
+  // 3) Claude 패턴 분석 호출
+  const systemPrompt = `당신은 AZS 논의앱 코드 품질 진단 전문가입니다.
+누적된 N건의 gap을 분석하여 공통 패턴을 도출하고, 각 패턴에 대해 원인 가설과 영향 받는 코드 영역을 식별하세요.
+
+반드시 다음 JSON 형식 그대로 출력 (다른 설명/마크다운/코드블록 절대 금지):
+
+{
+  "patterns": [
+    {
+      "pattern_id": "P1",
+      "title": "패턴 제목 (한국어, 50자 내외)",
+      "gap_count": 5,
+      "affected_gap_ids": ["gap-xxx", "gap-yyy"],
+      "hypothesis": "원인 가설 — 어떤 코드 동작이 이 패턴을 만드는지",
+      "affected_code_area": "App.jsx의 어느 함수/영역으로 추정 (모르면 '추정 어려움')",
+      "severity": "high",
+      "recommended_action": "패치 방향 (구체적이지 않아도 됨)"
+    }
+  ],
+  "summary": "전체 요약 (한국어, 2~3문장)"
+}
+
+기준:
+- 패턴은 최소 2건 이상의 gap이 공유해야 의미 있음 (단발성 1건은 제외)
+- 패턴 수는 보통 3~7개 (너무 잘게 나누지 말 것)
+- severity: high=즉시 패치 권장, medium=다음 사이클, low=장기 과제
+- affected_code_area는 가능한 만큼 구체적으로 (예: "generateReport §4 프롬프트")`;
+
+  const userMsg = `누적 gap ${listResult.count}건을 분석하세요.
+
+${gapSummary}`;
+
+  console.log(`[큐 #15 Phase 5a] Claude 분석 호출... (Background)`);
+  const rawResponse = await callClaudeBackground(systemPrompt, userMsg, {
+    model: MODEL_REASONING,
+    max_tokens: 3000,
+    onProgress: (msg) => console.log(`[큐 #15 Phase 5a] ${msg}`),
+  });
+
+  // 4) JSON 파싱
+  let parsed;
+  try {
+    parsed = safeJSON(rawResponse);
+  } catch (e) {
+    console.error("[큐 #15 Phase 5a] JSON 파싱 실패. 원본 (앞 500자):");
+    console.error(String(rawResponse).slice(0, 500));
+    throw new Error(`JSON 파싱 실패: ${e.message}`);
+  }
+
+  if (!Array.isArray(parsed.patterns)) {
+    throw new Error("patterns 배열 없음 — 응답 형식 이상");
+  }
+
+  const elapsedSec = ((Date.now() - t0) / 1000).toFixed(1);
+  console.log(`[큐 #15 Phase 5a] ✅ 완료 (${elapsedSec}초): ${parsed.patterns.length}개 패턴 식별`);
+
+  return {
+    gapCount: listResult.count,
+    patternCount: parsed.patterns.length,
+    patterns: parsed.patterns,
+    summary: parsed.summary,
+    elapsedSec: parseFloat(elapsedSec),
+    _rawGaps: listResult.gaps,    // Phase 5b에서 사용
+    _rawResponse: rawResponse,
+    _generatedAt: new Date().toISOString(),
+  };
+}
+
+// 큐 #15 Phase 2/3/5a 임시 글로벌 노출 (콘솔 검증용 — Phase 5c UI 진입 시 제거)
 if (typeof window !== "undefined") {
   window.generateIdealReport = generateIdealReport;
   window.judgeReports = judgeReports;
   window.compareAndLogGaps = compareAndLogGaps;
-  window.appendGapLogRow = appendGapLogRow;  // 단독 테스트용
+  window.appendGapLogRow = appendGapLogRow;
+  window.fetchGapLogList = fetchGapLogList;
+  window.analyzeGapPatterns = analyzeGapPatterns;
 }
 
 // ─── UI 헬퍼 ──────────────────────────────────────────────────────────────────

@@ -4234,8 +4234,13 @@ ${discussionSummary}`;
   // 섹션 1: 전체 현황 요약 (시간/빈도 분석 포함)
   try {
     await new Promise(r => setTimeout(r, 500));
-    const sys1 = `AZS 배터리 공장 ${reportTitle} 작성. 한국어. JSON만:
-{"heading":"1. 전체 현황 요약","items":["시간대별 패턴 핵심 (60자이내)","빈도 패턴 핵심","주요 이슈 요약","KPI 또는 영향"]}`;
+    const sys1 = `AZS 배터리 공장 ${reportTitle} 작성. 한국어. JSON만. 4개 items 슬롯 모두 필수 채움.
+각 슬롯 작성 규칙:
+- 1번: 핵심 KPI 정량 (수율%, 불량률%, 총 생산량, 불량 분류별 건수) — 우선순위 최상
+- 2번: 시간대별 집중 패턴 (예: "06~09시 설비 기동 NG 집중, 14~17시 전극 정렬 다발")
+- 3번: 빈도 TOP 패턴 (반복 발생 카테고리, 건수 명시)
+- 4번: 주요 이슈 요약 (장기 정지 / 다발 불량 중심, 최대 3건)
+JSON: {"heading":"1. 전체 현황 요약","items":["핵심 KPI 정량 (80자이내)","시간대별 패턴 (80자이내)","빈도 패턴 (80자이내)","주요 이슈 요약 (80자이내)"]}`;
     const raw1 = await callClaudeRaw(sys1, ctx, { model: MODEL_REASONING, max_tokens: 600 });
     sections.push(safeJSON(raw1));
   } catch { sections.push({ heading:"1. 전체 현황 요약", items:["-"] }); }
@@ -4246,8 +4251,13 @@ ${discussionSummary}`;
     const deepCtx = grouped.DEEP.map((d, i) =>
       `이슈${i+1}: ${d.issue.eq} - 합의:${d.moderator.consensus} 충돌:${d.moderator.conflicts} 권고:${d.moderator.recommendation}`
     ).join(" / ") || "DEEP 이슈 없음";
-    const sys2 = `AZS 배터리 공장 ${reportTitle}. 한국어. JSON만:
-{"heading":"2. 🔴 DEEP 이슈 종합 (심각/긴급)","items":["[설비명] 합의·충돌·권고 핵심 (80자이내)","항목2","항목3"]}`;
+    const sys2 = `AZS 배터리 공장 ${reportTitle}. 한국어. JSON만. items 최소 5개 작성 필수.
+포함 규칙 (우선순위 순):
+- 정지 30분 이상 OR 불량 10건 이상 이슈 우선 포함
+- 반복 발생 이슈(동일 설비 또는 동일 카테고리 2회+)는 건수 무관 필수 포함 (예: 1-A2 5회, 1-A4 18회)
+- 근본원인은 raw 데이터 표현 그대로 인용 (추론·일반화 금지)
+  예: "2Sheet Detection 센서 케이블 교체"는 원본 그대로 사용, "Vision 센서 오염"으로 일반화 절대 X
+JSON: {"heading":"2. 🔴 DEEP 이슈 종합 (심각/긴급)","items":["[설비명] 합의·충돌·권고 핵심 (80자이내)","항목2","항목3","항목4","항목5"]}`;
     const raw2 = await callClaudeRaw(sys2, `${ctx}\n\nDEEP 종합: ${deepCtx}`, { model: MODEL_REASONING, max_tokens: 700 });
     sections.push(safeJSON(raw2));
   } catch { sections.push({ heading:"2. 🔴 DEEP 이슈 종합", items:["-"] }); }
@@ -4258,17 +4268,19 @@ ${discussionSummary}`;
     const stdCtx = grouped.STANDARD.map((d, i) =>
       `이슈${i+1}: ${d.issue.eq} - ${d.moderator.summary} | 액션: ${(d.moderator.actions || []).map(a => a.action).join(", ")}`
     ).join(" / ") || "STANDARD 이슈 없음";
-    const sys3 = `AZS 배터리 공장 ${reportTitle}. 한국어. JSON만:
-{"heading":"3. 🟡 STANDARD 이슈 액션 플랜 (미완료)","items":["[설비명] 액션·담당·우선순위 (80자이내)","항목2","항목3"]}`;
-    const raw3 = await callClaudeRaw(sys3, `${ctx}\n\nSTANDARD: ${stdCtx}`, { model: MODEL_REASONING, max_tokens: 700 });
+    const sys3 = `AZS 배터리 공장 ${reportTitle}. 한국어. JSON만. items 최소 5개 작성 필수.
+모든 STANDARD 이슈를 누락 없이 포함 (raw에 5개 이상 있으면 모두 포함). 항목 잘림·중단 금지.
+JSON: {"heading":"3. 🟡 STANDARD 이슈 액션 플랜 (미완료)","items":["[설비명] 액션·담당·우선순위 (80자이내)","항목2","항목3","항목4","항목5"]}`;
+    const raw3 = await callClaudeRaw(sys3, `${ctx}\n\nSTANDARD: ${stdCtx}`, { model: MODEL_REASONING, max_tokens: 1200 });
     sections.push(safeJSON(raw3));
   } catch { sections.push({ heading:"3. 🟡 STANDARD 이슈 액션 플랜", items:["-"] }); }
 
   // 섹션 4: 담당자별 종합 액션
   try {
     await new Promise(r => setTimeout(r, 500));
-    const sys4 = `AZS 배터리 공장 ${reportTitle}. 한국어. JSON만:
-{"heading":"4. 담당자별 액션 아이템","items":["[PE] 조치 (60자이내)","[ME] 조치","[TE] 조치","[FA] 조치 (해당시)","[Vision] 조치 (해당시)"]}`;
+    const sys4 = `AZS 배터리 공장 ${reportTitle}. 한국어. JSON만. 5팀 슬롯 모두 필수 채움.
+raw 데이터에 해당 팀 활동이 명시되지 않으면 "(해당 활동 없음 — 모니터링 권장)" 형태로 채움. 빈 문자열·항목 생략·축소 절대 금지.
+JSON: {"heading":"4. 담당자별 액션 아이템","items":["[PE] 조치 (60자이내)","[ME] 조치","[TE] 조치","[FA] 조치","[Vision] 조치"]}`;
     const raw4 = await callClaudeRaw(sys4, ctx, { model: MODEL_REASONING, max_tokens: 600 });
     sections.push(safeJSON(raw4));
   } catch { sections.push({ heading:"4. 담당자별 액션 아이템", items:["-"] }); }
@@ -4276,8 +4288,10 @@ ${discussionSummary}`;
   // 섹션 5: 재발방지 및 차기 계획
   try {
     await new Promise(r => setTimeout(r, 500));
-    const sys5 = `AZS 배터리 공장 ${reportTitle}. 한국어. JSON만:
-{"heading":"5. 재발방지 대책 및 차기 계획","items":["재발방지 핵심 대책 (60자이내)","장기 개선 과제","모니터링 항목","차기 일정"]}`;
+    const sys5 = `AZS 배터리 공장 ${reportTitle}. 한국어. JSON만. 4개 슬롯 모두 필수 채움.
+"장기 개선 과제" 슬롯에는 반드시 DB화 / 주간 추적 / 효과 검증 / 자동 알람 시스템 같은 장기 모니터링 항목을 포함.
+모든 슬롯에 raw 근거가 부족해도 "(검토 필요)" 형태로 반드시 채움. 빈 문자열·생략 금지.
+JSON: {"heading":"5. 재발방지 대책 및 차기 계획","items":["재발방지 핵심 대책 (60자이내)","장기 개선 과제 (DB화·주간 추적·효과 검증 포함)","모니터링 항목","차기 일정"]}`;
     const raw5 = await callClaudeRaw(sys5, ctx, { model: MODEL_REASONING, max_tokens: 600 });
     sections.push(safeJSON(raw5));
   } catch { sections.push({ heading:"5. 재발방지 대책 및 차기 계획", items:["-"] }); }

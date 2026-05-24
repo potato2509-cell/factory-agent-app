@@ -4770,7 +4770,64 @@ ${gapSummary}`;
   };
 }
 
-// 큐 #15 Phase 2/3/5a 임시 글로벌 노출 (콘솔 검증용 — Phase 5c UI 진입 시 제거)
+// ─── 큐 #15 Phase 4: 자동 비교 (레포트 생성 후 자동 호출) ──────────────────
+// 일일(단일 생산일자) 레포트만 비교. 범위·중복은 스킵. 비동기 — 화면 흐름 안 막음.
+//   report      : generateReport 결과 (window._latestReport)
+//   selDates    : ["YY/M/D"] (예: ["26/5/16"]) — length===1일 때만 실행
+//   processName : "Cell" | "Elec" 등 (selectedProcess)
+//   setProgress : 진행 표시 (없으면 console만)
+//   opts.force  : true면 중복이어도 강제 비교 (콘솔 디버그용)
+async function runAutoCompare(report, selDates, processName, setProgress, { force = false } = {}) {
+  const emit = (msg) => {
+    if (typeof setProgress === "function") setProgress(p => [...p, msg]);
+    console.log(`[큐 #15 자동비교] ${msg}`);
+  };
+
+  // 1) 일일 레포트만 (selDates 정확히 1개)
+  if (!Array.isArray(selDates) || selDates.length !== 1) {
+    console.log(`[큐 #15 자동비교] 범위/비단일 레포트 — 비교 생략 (selDates=${(selDates || []).join(",")})`);
+    return;
+  }
+
+  // 2) 생산일자(YY/M/D) → YYYY-MM-DD 변환 (기존 toAPIDate 패턴 재사용)
+  let date;
+  try {
+    const [y, m, d] = String(selDates[0]).split("/").map(Number);
+    if (!y || !m || !d) throw new Error("형식 불일치");
+    date = `20${String(y).padStart(2, "0")}-${String(m).padStart(2, "0")}-${String(d).padStart(2, "0")}`;
+  } catch (e) {
+    console.warn(`[큐 #15 자동비교] 날짜 변환 실패: "${selDates[0]}" — 비교 생략`);
+    return;
+  }
+
+  // 3) 중복 체크 (같은 report_date 이미 비교됐으면 스킵)
+  if (!force) {
+    try {
+      const dup = await fetchGapLogList({ report_date: date });
+      if (dup.count > 0) {
+        emit(`ℹ️ 이미 비교된 날짜 (${date}) — 품질 비교 생략`);
+        return;
+      }
+    } catch (e) {
+      emit(`⚠️ 중복 확인 실패 — 품질 비교 보류 (${e.message})`);
+      return;
+    }
+  }
+
+  // 4) 비교 실행 (정답 생성 + judge + GapLog 적재)
+  emit(`🔍 품질 비교 중... (정답 레포트 생성, 약 40초)`);
+  try {
+    const result = await compareAndLogGaps(report, date, processName || "Cell");
+    const logged = (result && result.summary && result.summary.loggedCount) || 0;
+    const failed = (result && result.summary && result.summary.failedCount) || 0;
+    emit(`💾 GapLog 적재 완료 (${logged}건${failed > 0 ? `, 실패 ${failed}건` : ""})`);
+  } catch (e) {
+    emit(`⚠️ 품질 비교 실패 — ${e.message}`);
+    console.error("[큐 #15 자동비교] 비교 실패:", e);
+  }
+}
+
+// 큐 #15 Phase 2/3/5a/4 임시 글로벌 노출 (콘솔 검증용 — Phase 5c UI 진입 시 제거)
 if (typeof window !== "undefined") {
   window.generateIdealReport = generateIdealReport;
   window.judgeReports = judgeReports;
@@ -4778,6 +4835,7 @@ if (typeof window !== "undefined") {
   window.appendGapLogRow = appendGapLogRow;
   window.fetchGapLogList = fetchGapLogList;
   window.analyzeGapPatterns = analyzeGapPatterns;
+  window.runAutoCompare = runAutoCompare;
 }
 
 // ─── UI 헬퍼 ──────────────────────────────────────────────────────────────────
@@ -5391,6 +5449,11 @@ export default function App() {
       setMinutes(report);
       // ★ 큐 #15 Phase 3 검증용: 콘솔에서 compareAndLogGaps 호출 시 사용
       if (typeof window !== "undefined") window._latestReport = report;
+
+      // ★ 큐 #15 Phase 4: 자동 비교 (일일 레포트만, 비동기 — 화면 흐름 안 막음)
+      runAutoCompare(report, selDates, selectedProcess, setProgress).catch(e =>
+        console.error("[큐 #15 자동비교] 예외:", e)
+      );
 
       // 시트 저장 — 영역 12-X5 (3): 새 4축 필드 + 페르소나 say 통합 컬럼
       setProgress(p => [...p, "💾 구글 시트 저장 중..."]);

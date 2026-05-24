@@ -1511,6 +1511,38 @@ function getIssueId(issue) {
   return `${issue.date || "?"}_${issue.time || "?"}_${issue.eq || "?"}_${(issue.prob || "").slice(0, 20)}`;
 }
 
+// ★ 큐 #19 ⑧(재작업): 전극 조각 미회수(혼입 의심) 메시지 직접 추출
+// crack은 BM Downtime Bot이 아니라 image caption 양식(*Machine* / *phenomenon: crack* / *Result: Potongan tidak lengkap*)
+// → 모호분류로 품질 카테고리(categoryMsgs.quality)로 감. tagged.issues(downtime)에 없으므로 메시지에서 직접 추출
+function extractFragmentLost(categoryMsgs = {}) {
+  const regex = SCORE_KEYWORD_MATRIX.electrode_fragment_lost._regex;
+  const pools = [
+    ...(categoryMsgs.quality || []),
+    ...(categoryMsgs.critical || []),
+    ...(categoryMsgs.process_change || []),
+    ...(categoryMsgs.test || []),
+  ];
+  const out = [];
+  const seen = new Set();
+  for (const m of pools) {
+    const txt = m.text || "";
+    if (!regex.test(txt)) continue;  // crack + 미회수(tidak ketemu/lengkap 등) 조합만 — "ditemukan"(발견)은 제외
+    const grab = (label) => {
+      const mm = txt.match(new RegExp(`\\*?\\s*${label}\\s*:?\\s*\\*?\\s*([^\\n*]+)`, "i"));
+      return mm ? mm[1].trim() : "";
+    };
+    const machine = grab("Machine") || grab("Mesin");
+    const phenom = grab("phenomenon") || grab("fenomena");
+    const result = grab("Result") || grab("Hasil");
+    const timeF = grab("Time") || String(m.time || "");
+    const key = `${machine}|${timeF}|${phenom}`;
+    if (seen.has(key)) continue;  // 동일 건 중복 제거
+    seen.add(key);
+    out.push({ machine: machine || "?", phenomenon: phenom, result, time: timeF });
+  }
+  return out;
+}
+
 function extractAllIssues(downtime, allMessages = []) {
   // ★ 영역 12-BG-4 (큐 #6 단계 1-RC-1): 같은 호기 image_analyses 매칭 준비
   // 호기별 image 메시지 인덱스 — BM Bot Image Attachment 또는 PE Tech 첨부 이미지
@@ -5349,6 +5381,8 @@ export default function App() {
         setProgress(p => [...p, `⚠️ PE 큐레이션 실패 — 폴백 사용`]);
         curation = buildFallbackCuration(allIssuesForCuration, categoryMsgs);
       }
+      // ★ 큐 #19 ⑧: crack 조각미회수 추출 (큐레이션 성공/폴백 무관 — 품질 메시지에서 직접)
+      if (curation) curation.fragmentLost = extractFragmentLost(categoryMsgs);
 
       // ★ 영역 11-B: 5-카테고리 분류 즉시 실행 (체크박스 + 큐레이션 모두 활용)
       const taggedNow = classifyIssues5Category(allIssuesFlat, {
@@ -5497,6 +5531,8 @@ export default function App() {
           curation = buildFallbackCuration(allIssuesForCuration, categoryMsgs);
         }
       }
+      // ★ 큐 #19 ⑧: crack 조각미회수 추출 (재사용/폴백 무관 — 품질 메시지에서 직접)
+      if (curation) curation.fragmentLost = extractFragmentLost(categoryMsgs);
 
       setProgress(p => [...p, `🏷️ 5-카테고리: 장기부동 ${taggedResult.counts.LONG_DOWNTIME} / 반복 ${taggedResult.counts.HIGH_FREQUENCY} / 조건변경 ${taggedResult.counts.CONDITION_CHANGE} / 테스트 ${taggedResult.counts.TEST_PM} / 품질 ${taggedResult.counts.QUALITY_NG}`]);
 
@@ -6064,21 +6100,22 @@ export default function App() {
       }
     }
 
-    // ★ 큐 #19 ⑧: 전극 조각 미회수 별도 노출 (혼입 의심) — scoreIssueMatrix와 동일 정규식 사용
-    const _fragRegex = SCORE_KEYWORD_MATRIX.electrode_fragment_lost._regex;
-    const _fragIssues = (tagged.issues || []).filter(it => _fragRegex.test(`${it.prob || ""} ${it.cause || ""} ${it.text || ""}`));
+    // ★ 큐 #19 ⑧(재작업): 전극 조각 미회수 별도 노출 — cur.fragmentLost(품질 메시지에서 직접 추출)
+    // crack은 BM downtime이 아니라 품질 메시지(image caption)라 tagged.issues에 없음 → curation.fragmentLost 사용
+    const _fragList = (cur.fragmentLost || []);
     let fragmentLostHtml = "";
-    if (_fragIssues.length > 0) {
-      const _fragItems = _fragIssues.slice(0, 12).map(it => {
-        const _eq = it.eq || it.equipment || "?";
-        const _occ = String(it.occurredAt || "").replace(/\n/g, " ").slice(0, 30);
-        const _p = String(it.prob || it.text || "").replace(/\n/g, " ").slice(0, 110);
-        return `<li><b>${esc(_eq)}</b>${_occ ? ` <span style="color:#999;">(${esc(_occ)})</span>` : ""} — ${esc(_p)}</li>`;
+    if (_fragList.length > 0) {
+      const _fragItems = _fragList.slice(0, 15).map(it => {
+        const _m = esc(String(it.machine || "?").slice(0, 30));
+        const _ph = esc(String(it.phenomenon || "").slice(0, 60));
+        const _r = esc(String(it.result || "").slice(0, 80));
+        const _t = it.time ? ` <span style="color:#999;">(${esc(String(it.time).slice(0, 20))})</span>` : "";
+        return `<li><b>${_m}</b>${_t}${_ph ? ` — ${_ph}` : ""}${_r ? `: <span style="color:#8e44ad;">${_r}</span>` : ""}</li>`;
       }).join("");
       fragmentLostHtml = `
       <div class="critical" style="border-left-color:#8e44ad;background:#faf5ff;">
-        <h3 style="margin-top:0;">⚠️ 전극 조각 미회수 — 혼입 의심 (${_fragIssues.length}건)</h3>
-        <p style="margin:4px 0;">전극 크랙 후 조각이 회수되지 않은 케이스입니다. 후공정 셀 혼입 가능성이 있어 <b>안전·품질 확인</b>이 필요합니다.</p>
+        <h3 style="margin-top:0;">⚠️ 전극 조각 미회수 — 혼입 의심 (${_fragList.length}건)</h3>
+        <p style="margin:4px 0;">전극 크랙 후 조각이 회수되지 않은(미회수) 케이스입니다. 후공정 셀 혼입 가능성이 있어 <b>안전·품질 확인</b>이 필요합니다.</p>
         <ul style="margin:6px 0 0;line-height:1.7;">${_fragItems}</ul>
       </div>`;
     }

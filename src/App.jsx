@@ -4777,11 +4777,12 @@ ${gapSummary}`;
 //   processName : "Cell" | "Elec" 등 (selectedProcess)
 //   setProgress : 진행 표시 (없으면 console만)
 //   opts.force  : true면 중복이어도 강제 비교 (콘솔 디버그용)
-async function runAutoCompare(report, selDates, processName, setProgress, { force = false } = {}) {
+async function runAutoCompare(report, selDates, processName, setProgress, { force = false, setStatus, refreshBadge } = {}) {
   const emit = (msg) => {
     if (typeof setProgress === "function") setProgress(p => [...p, msg]);
     console.log(`[큐 #15 자동비교] ${msg}`);
   };
+  const status = (s) => { if (typeof setStatus === "function") setStatus(s); };
 
   // 1) 일일 레포트만 (selDates 정확히 1개)
   if (!Array.isArray(selDates) || selDates.length !== 1) {
@@ -4797,6 +4798,7 @@ async function runAutoCompare(report, selDates, processName, setProgress, { forc
     date = `20${String(y).padStart(2, "0")}-${String(m).padStart(2, "0")}-${String(d).padStart(2, "0")}`;
   } catch (e) {
     console.warn(`[큐 #15 자동비교] 날짜 변환 실패: "${selDates[0]}" — 비교 생략`);
+    status({ state: "failed", message: `날짜 변환 실패 (${selDates[0]})` });
     return;
   }
 
@@ -4806,23 +4808,30 @@ async function runAutoCompare(report, selDates, processName, setProgress, { forc
       const dup = await fetchGapLogList({ report_date: date });
       if (dup.count > 0) {
         emit(`ℹ️ 이미 비교된 날짜 (${date}) — 품질 비교 생략`);
+        status({ state: "skipped", date });
         return;
       }
     } catch (e) {
       emit(`⚠️ 중복 확인 실패 — 품질 비교 보류 (${e.message})`);
+      status({ state: "failed", date, message: `중복 확인 실패: ${e.message}` });
       return;
     }
   }
 
   // 4) 비교 실행 (정답 생성 + judge + GapLog 적재)
   emit(`🔍 품질 비교 중... (정답 레포트 생성, 약 40초)`);
+  status({ state: "running", date });
   try {
     const result = await compareAndLogGaps(report, date, processName || "Cell");
     const logged = (result && result.summary && result.summary.loggedCount) || 0;
     const failed = (result && result.summary && result.summary.failedCount) || 0;
     emit(`💾 GapLog 적재 완료 (${logged}건${failed > 0 ? `, 실패 ${failed}건` : ""})`);
+    status({ state: "done", date, gapCount: logged });
+    // 비교로 gap이 새로 쌓였으니 배지 재계산
+    if (typeof refreshBadge === "function") { try { await refreshBadge(); } catch (_) {} }
   } catch (e) {
     emit(`⚠️ 품질 비교 실패 — ${e.message}`);
+    status({ state: "failed", date, message: e.message });
     console.error("[큐 #15 자동비교] 비교 실패:", e);
   }
 }
@@ -4910,6 +4919,11 @@ export default function App() {
   const [running, setRunning]     = useState(false);
   const [error, setError]         = useState("");
   const [sheetSaved, setSheetSaved] = useState(false);
+  // ★ 큐 #15 Phase 5c: 자동 비교 고정 상태 + 업데이트 준비 배지
+  const [autoCompareStatus, setAutoCompareStatus] = useState(null);
+  // { state:"running"|"done"|"skipped"|"failed", date, gapCount, message }
+  const [updateReady, setUpdateReady] = useState(null);
+  // { ready:bool, dateCount, dates:[...] }
   // ★ 공정/추가 에이전트 선택 state
   const [selectedProcess, setSelectedProcess] = useState("Cell");
   const [extraAgents, setExtraAgents] = useState([]);
@@ -5023,6 +5037,21 @@ export default function App() {
     setStep(1);
     setError("");
   };
+
+  // ★ 큐 #15 Phase 5c: 업데이트 준비 배지 갱신 (open gap의 서로 다른 날짜 ≥ 3)
+  const refreshUpdateBadge = async () => {
+    try {
+      const r = await fetchGapLogList({ status: "open" });
+      const dates = [...new Set((r.gaps || []).map(g => String(g.report_date).trim()))]
+        .filter(Boolean).sort();
+      setUpdateReady({ ready: dates.length >= 3, dateCount: dates.length, dates });
+    } catch (e) {
+      console.error("[큐 #15 배지 갱신 실패]", e.message);
+    }
+  };
+  // 마운트 시 1회 배지 계산
+  // eslint-disable-next-line react-hooks/exhaustive-deps
+  useEffect(() => { refreshUpdateBadge(); }, []);
 
   // ★ 영역 12-AZ-6: 앱 마운트 시 자동으로 messages 탭 모드 진입
   // (업로드 단계 제거 → 첫 페이지 = 날짜 선택)
@@ -5450,10 +5479,12 @@ export default function App() {
       // ★ 큐 #15 Phase 3 검증용: 콘솔에서 compareAndLogGaps 호출 시 사용
       if (typeof window !== "undefined") window._latestReport = report;
 
-      // ★ 큐 #15 Phase 4: 자동 비교 (일일 레포트만, 비동기 — 화면 흐름 안 막음)
-      runAutoCompare(report, selDates, selectedProcess, setProgress).catch(e =>
-        console.error("[큐 #15 자동비교] 예외:", e)
-      );
+      // ★ 큐 #15 Phase 4/5c: 자동 비교 (일일 레포트만, 비동기 — 화면 흐름 안 막음)
+      setAutoCompareStatus(null);  // 새 레포트 — 이전 비교 상태 초기화
+      runAutoCompare(report, selDates, selectedProcess, setProgress, {
+        setStatus: setAutoCompareStatus,
+        refreshBadge: refreshUpdateBadge,
+      }).catch(e => console.error("[큐 #15 자동비교] 예외:", e));
 
       // 시트 저장 — 영역 12-X5 (3): 새 4축 필드 + 페르소나 say 통합 컬럼
       setProgress(p => [...p, "💾 구글 시트 저장 중..."]);
@@ -7417,6 +7448,42 @@ ${userText}
                 borderRadius:5, color:"#a78bfa", fontSize:10, cursor:"pointer", padding:"2px 8px",
               }}>변경</button>
             </div>
+
+            {/* ★ 큐 #15 Phase 5c: 자동 비교 고정 상태 (자리 비워도 남음) */}
+            {autoCompareStatus && (
+              <div style={{
+                background: autoCompareStatus.state === "done" ? "rgba(52,211,153,0.08)"
+                          : autoCompareStatus.state === "failed" ? "rgba(239,68,68,0.08)"
+                          : autoCompareStatus.state === "skipped" ? "rgba(148,163,184,0.08)"
+                          : "rgba(167,139,250,0.08)",
+                border: `1px solid ${autoCompareStatus.state === "done" ? "rgba(52,211,153,0.3)"
+                          : autoCompareStatus.state === "failed" ? "rgba(239,68,68,0.3)"
+                          : autoCompareStatus.state === "skipped" ? "rgba(148,163,184,0.3)"
+                          : "rgba(167,139,250,0.3)"}`,
+                borderRadius:8, padding:"10px 14px", marginBottom:14,
+                display:"flex", alignItems:"center", gap:8, fontSize:12, fontWeight:600,
+                color: autoCompareStatus.state === "done" ? "#34d399"
+                     : autoCompareStatus.state === "failed" ? "#ef4444"
+                     : autoCompareStatus.state === "skipped" ? "#94a3b8" : "#a78bfa",
+              }}>
+                {autoCompareStatus.state === "running" && <Spinner/>}
+                {autoCompareStatus.state === "running" && `🔍 품질 비교 중... (${autoCompareStatus.date}) — 백그라운드 진행, 자리 비우셔도 됩니다`}
+                {autoCompareStatus.state === "done" && `✅ 품질 비교 완료 (${autoCompareStatus.date}, gap ${autoCompareStatus.gapCount}건 적재)`}
+                {autoCompareStatus.state === "skipped" && `ℹ️ 이미 비교된 날짜 (${autoCompareStatus.date}) — 비교 생략`}
+                {autoCompareStatus.state === "failed" && `⚠️ 품질 비교 실패${autoCompareStatus.date ? ` (${autoCompareStatus.date})` : ""} — ${autoCompareStatus.message || ""}`}
+              </div>
+            )}
+
+            {/* ★ 큐 #15 Phase 5c: 업데이트 준비 배지 (open gap 누적 3일치 이상) */}
+            {updateReady && updateReady.ready && (
+              <div style={{
+                background:"rgba(251,191,36,0.1)", border:"1px solid rgba(251,191,36,0.4)",
+                borderRadius:8, padding:"10px 14px", marginBottom:14,
+                display:"flex", alignItems:"center", gap:8, fontSize:12, fontWeight:700, color:"#fbbf24",
+              }}>
+                🔧 로직 업데이트 준비됨 (누적 {updateReady.dateCount}일치)
+              </div>
+            )}
 
             {progress.length > 0 && (
               <div style={{

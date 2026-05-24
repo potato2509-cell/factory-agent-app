@@ -185,6 +185,15 @@ const SCORE_KEYWORD_MATRIX = {
     ],
     fields: ["text", "result"],
   },
+  // ★ 큐 #19 ⑧: 전극 조각 미회수 (혼입 리스크) — 안전 승격 (bonus 8, full_stop 5 ~ safety 10 사이)
+  // "조각/electrode + 미회수(tidak ketemu/lengkap·belum ketemu·미발견·not found·hilang)" 조합만 매칭
+  // 단순 "potongan"(조각)은 정상 맥락에도 흔해 과매칭 → 조합 정규식 사용. _minCount 없음 → 매칭만으로 bonus
+  electrode_fragment_lost: {
+    bonus: 8,
+    keywords: [],  // 정규식 별도 처리
+    fields: ["problem", "cause", "text"],
+    _regex: /(potongan|electrode|elektroda|조각|fragment|partikel)[\s\S]{0,40}(tidak\s*(ketemu|lengkap)|belum\s*ketemu|미발견|못\s*찾|not\s*found|hilang)/i,
+  },
 };
 
 // 명세서 §4.3: High Frequency 원인 카테고리 키워드 매트릭스 (부록 A)
@@ -328,6 +337,15 @@ const FACTORY_PHILOSOPHY = `
 "생산 목표만 달성 가능한 수준"이라면 굳이 불량을 감수하며 가동할 이유가 없습니다.
 → 품질·근본조치 우선, 무리한 가동 지양이 운영 철학입니다.
 `.trim();
+
+// ★ 큐 #19 ⑥: 구체 수치 출처 검증 규칙 — 큐레이션 Part1~3 sys에 삽입 (71EA 같은 환각 방지)
+const NUMERIC_SOURCE_RULE = `
+
+[★ 수치 출처 검증 — 환각 금지]
+- EA·시간·%·건수 등 구체 수치는 입력 raw 데이터 또는 첨부 이미지 분석에 명시된 값만 사용하라.
+- 출처 없는 정량 수치를 새로 만들지 마라 (예: 근거 없는 "71EA 불량", "12시간 드리프트" 금지).
+- 계산·추정값은 반드시 "추정"·"약" 등으로 명시하라.
+- 부동 시작은 본문 Start Time 기준 — 보고시각(메시지 수신)과 혼동하지 마라.`;
 
 // ─── Google Sheets ─────────────────────────────────────────────────────────────
 async function saveToSheets(data) {
@@ -1556,6 +1574,8 @@ function extractAllIssues(downtime, allMessages = []) {
 
   const _outIssues = downtime.map(d => {
     const result = extractField(d.text, "Result");
+    // ★ 큐 #19 ④: 발생시각(본문 Start Time)을 보고시각(메시지 timestamp)과 별도로 보존
+    const occurredAt = extractField(d.text, "Start Time") || "";
     const durStr = extractField(d.text, "Duration");
     let durMin = parseInt(durStr) || 0;
 
@@ -1611,6 +1631,7 @@ function extractAllIssues(downtime, allMessages = []) {
     return {
       ...d,
       eq, prob, cause, result, action, pic, durMin,
+      occurredAt,  // ★ 큐 #19 ④: 발생시각 (보고시각과 구분)
       stopStatus, repeatCount, _alarm: alarm,
       reasons: [],
       image_analyses: matchedImages,  // ★ 12-BG-4: 매칭된 이미지 분석 결과
@@ -1920,9 +1941,13 @@ function scoreIssueMatrix(issue) {
     if (def._regex) {
       const match = text.match(def._regex);
       if (match) {
-        const count = parseInt(match[1] || "0", 10);
-        const minCount = def._minCount || 1;
-        breakdown[key] = count >= minCount ? def.bonus : 0;
+        // ★ 큐 #19 ⑧: _minCount 미지정 시 매칭만으로 bonus (조각 미회수 등 count 무관 패턴)
+        if (def._minCount != null) {
+          const count = parseInt(match[1] || "0", 10);
+          breakdown[key] = count >= def._minCount ? def.bonus : 0;
+        } else {
+          breakdown[key] = def.bonus;
+        }
       } else {
         breakdown[key] = 0;
       }
@@ -2456,7 +2481,7 @@ async function curationPart1_LongDowntime(issuesData, totalCount, focus, kbText,
   const sys = `${FACTORY_PHILOSOPHY}
 
 당신은 AZS 배터리 공장의 ${PERSONAS.Cell_PE.role.replace(" - Cell 공정", "")}입니다.
-이 작업은 일일 이슈 브리핑의 1번 섹션 (장기부동) 정리입니다.${kbText}
+이 작업은 일일 이슈 브리핑의 1번 섹션 (장기부동) 정리입니다.${kbText}${NUMERIC_SOURCE_RULE}
 
 ${focus}
 
@@ -2537,7 +2562,7 @@ async function curationPart2a_RecurringSimple(issuesData, processChangeData, tot
   const sys = `${FACTORY_PHILOSOPHY}
 
 당신은 AZS 배터리 공장의 ${PERSONAS.Cell_PE.role.replace(" - Cell 공정", "")}입니다.
-이 작업은 일일 이슈 브리핑의 2번 (발생빈도) + 3번 (조건변경 단순 항목) 정리입니다.${kbText}
+이 작업은 일일 이슈 브리핑의 2번 (발생빈도) + 3번 (조건변경 단순 항목) 정리입니다.${kbText}${NUMERIC_SOURCE_RULE}
 
 ${focus}
 
@@ -2601,7 +2626,7 @@ async function curationPart2b_ConditionChangeGroups(processChangeData, qualityWi
   const sys = `${FACTORY_PHILOSOPHY}
 
 당신은 AZS 배터리 공장의 ${PERSONAS.Cell_PE.role.replace(" - Cell 공정", "")}입니다.
-이 작업은 호기별 조건변경 그룹 (다중 파라미터 변경) 정밀 추출 전용입니다.${kbText}
+이 작업은 호기별 조건변경 그룹 (다중 파라미터 변경) 정밀 추출 전용입니다.${kbText}${NUMERIC_SOURCE_RULE}
 
 ${focus}
 
@@ -2699,7 +2724,7 @@ async function curationPart3_TestPmQuality(testData, qualityData, focus, kbText,
   const sys = `${FACTORY_PHILOSOPHY}
 
 당신은 AZS 배터리 공장의 ${PERSONAS.Cell_PE.role.replace(" - Cell 공정", "")}입니다.
-이 작업은 일일 이슈 브리핑의 4번 (테스트/PM) + 5번 (품질 NG) 섹션 정리입니다.${kbText}
+이 작업은 일일 이슈 브리핑의 4번 (테스트/PM) + 5번 (품질 NG) 섹션 정리입니다.${kbText}${NUMERIC_SOURCE_RULE}
 
 ${focus}
 
@@ -6012,9 +6037,11 @@ export default function App() {
       const _dur = it.durMin || it.duration || 0;
       const _prob = String(it.prob || it.problem || it.text || "").replace(/\n/g, " ").slice(0, 140);
       const _cause = String(it.cause || "").replace(/\n/g, " ").slice(0, 140);
+      const _occ = String(it.occurredAt || "").replace(/\n/g, " ").slice(0, 40);  // ★ 큐 #19 ④: 발생시각
       return `
       <div class="critical" style="border-left-color:#e67e22;">
         <h3 style="margin-top:0;">🟠 ${esc(_eq)} — ${_dur}분 <span style="font-size:0.62em;font-weight:700;color:#e67e22;background:#fff3e0;padding:1px 8px;border-radius:8px;margin-left:6px;vertical-align:middle;">룰 보강</span></h3>
+        ${_occ ? `<p style="margin:4px 0;font-size:0.9em;color:#555;"><b>발생:</b> ${esc(_occ)} <span style="color:#999;font-size:0.92em;">(본문 Start Time)</span></p>` : ""}
         <p style="margin:4px 0;"><b>문제:</b> ${esc(_prob) || "-"}</p>
         ${_cause ? `<p style="margin:4px 0;color:#666;"><b>원인:</b> ${esc(_cause)}</p>` : ""}
         <p style="font-size:0.84em;color:#999;margin:6px 0 0;">※ LLM 큐레이션이 누락한 30분+ full stop — 룰로 자동 편입 (페르소나 논의 없음)</p>
@@ -6035,6 +6062,25 @@ export default function App() {
           curationBadge = `<div style="background:#fffaf0;border:1px solid #e67e22;border-radius:6px;padding:8px 12px;margin:0 0 14px;color:#b9770e;font-size:0.9em;">ℹ️ 큐레이션 중 일부 Part가 Haiku fallback/부분복구로 처리됨 (${esc(_parts)}). 결과는 정상 생성되었으나 품질이 평소보다 낮을 수 있습니다.</div>`;
         }
       }
+    }
+
+    // ★ 큐 #19 ⑧: 전극 조각 미회수 별도 노출 (혼입 의심) — scoreIssueMatrix와 동일 정규식 사용
+    const _fragRegex = SCORE_KEYWORD_MATRIX.electrode_fragment_lost._regex;
+    const _fragIssues = (tagged.issues || []).filter(it => _fragRegex.test(`${it.prob || ""} ${it.cause || ""} ${it.text || ""}`));
+    let fragmentLostHtml = "";
+    if (_fragIssues.length > 0) {
+      const _fragItems = _fragIssues.slice(0, 12).map(it => {
+        const _eq = it.eq || it.equipment || "?";
+        const _occ = String(it.occurredAt || "").replace(/\n/g, " ").slice(0, 30);
+        const _p = String(it.prob || it.text || "").replace(/\n/g, " ").slice(0, 110);
+        return `<li><b>${esc(_eq)}</b>${_occ ? ` <span style="color:#999;">(${esc(_occ)})</span>` : ""} — ${esc(_p)}</li>`;
+      }).join("");
+      fragmentLostHtml = `
+      <div class="critical" style="border-left-color:#8e44ad;background:#faf5ff;">
+        <h3 style="margin-top:0;">⚠️ 전극 조각 미회수 — 혼입 의심 (${_fragIssues.length}건)</h3>
+        <p style="margin:4px 0;">전극 크랙 후 조각이 회수되지 않은 케이스입니다. 후공정 셀 혼입 가능성이 있어 <b>안전·품질 확인</b>이 필요합니다.</p>
+        <ul style="margin:6px 0 0;line-height:1.7;">${_fragItems}</ul>
+      </div>`;
     }
 
     const longDowntimeHtml = (cur.longDowntime || []).map((d) => {
@@ -6467,6 +6513,7 @@ export default function App() {
 
 <h1>${esc(title)}</h1>
 ${curationBadge}
+${fragmentLostHtml}
 <p class="meta"><b>분석 기간:</b> ${esc(periodLabel)}<br>
 <b>출처:</b> AZS Status Reports WhatsApp 그룹<br>
 <b>레코드:</b> ${(() => {

@@ -1519,6 +1519,29 @@ function extractAllIssues(downtime, allMessages = []) {
     }
   }
 
+  // ★ 큐 #19 ①: 봇 중복 제거 — Equipment+Start Time+End Time+Duration 완전일치 시 1건 병합
+  // (봇이 동일 다운타임을 수초~1분 간격으로 재전송하는 케이스. 예: 5/19 STK-4-A6 12:50/12:51, 5/22 STK-4-A2 14:55)
+  // 완전일치만 병합하므로 실제 재발(다른 Start/End)은 보존됨 → repeatCount 부풀림·중복 카운트 방지
+  let _dupMerged = 0;
+  {
+    const _seenKeys = new Set();
+    const _deduped = [];
+    for (const d of downtime) {
+      const _eqK = extractField(d.text, "Equipment") || "";
+      const _stK = extractField(d.text, "Start Time") || "";
+      const _enK = extractField(d.text, "End Time") || "";
+      const _duK = extractField(d.text, "Duration") || "";
+      // 키 구성요소가 전부 비면 dedup 판단 불가 → 그대로 유지 (보수적)
+      if (!_eqK && !_stK && !_enK && !_duK) { _deduped.push(d); continue; }
+      const _key = `${_eqK}|${_stK}|${_enK}|${_duK}`;
+      if (_seenKeys.has(_key)) { _dupMerged++; continue; }
+      _seenKeys.add(_key);
+      _deduped.push(d);
+    }
+    if (_dupMerged > 0) console.log(`[extractAllIssues] ★ 봇 중복 ${_dupMerged}건 병합 (${downtime.length}→${_deduped.length})`);
+    downtime = _deduped;
+  }
+
   const equipCount = {}, partCount = {}, alarmCount = {};
   // 사전 카운트 (반복 횟수 계산용)
   downtime.forEach(d => {
@@ -1531,7 +1554,7 @@ function extractAllIssues(downtime, allMessages = []) {
     if (alarm) alarmCount[alarm] = (alarmCount[alarm] || 0) + 1;
   });
 
-  return downtime.map(d => {
+  const _outIssues = downtime.map(d => {
     const result = extractField(d.text, "Result");
     const durStr = extractField(d.text, "Duration");
     let durMin = parseInt(durStr) || 0;
@@ -1593,6 +1616,9 @@ function extractAllIssues(downtime, allMessages = []) {
       image_analyses: matchedImages,  // ★ 12-BG-4: 매칭된 이미지 분석 결과
     };
   });
+  // ★ 큐 #19 ①: 봇 중복 병합 건수를 배열 속성으로 보존 (generateReport 진단 배지에서 사용)
+  try { Object.defineProperty(_outIssues, "_dupMerged", { value: _dupMerged, enumerable: false }); } catch (e) {}
+  return _outIssues;
 }
 
 // ─── 영역 12-AW: Critical 메시지 → 가상 issue 변환 ─────────────────────────
@@ -2056,6 +2082,7 @@ async function runGroupSyntheses(groups, groupKey, allIssues) {
 // 각 호출 max_tokens 2000 / Sonnet (MODEL_REASONING) / 504 시 Haiku fallback
 // Promise.all로 동시 실행 → 전체 시간 = 가장 느린 1건 (~8~10초)
 async function runPreCuration(allIssues, kbPE, reportType, categoryMsgs = {}) {
+  _curationDiag = [];  // ★ 큐 #19 ⑦: 진단 수집 리셋 (레포트 생성마다 새로)
   const qualityList = categoryMsgs.quality || [];
   const processChangeList = categoryMsgs.process_change || [];
   const testList = categoryMsgs.test || [];
@@ -2239,13 +2266,14 @@ async function runPreCuration(allIssues, kbPE, reportType, categoryMsgs = {}) {
   let backupCriticalSummary = part1.criticalSummary || [];
   if (backupCriticalSummary.length === 0 && backupLongDowntime.length > 0) {
     const top = backupLongDowntime[0];
+    // ★ 큐 #19 ⑦: placeholder("데이터 분석 필요") 차단 — 룰로 산출 가능한 정보만 넣고, 없으면 줄 생략
+    const _topEqs = backupLongDowntime.slice(0, 3).map(d => `${d.equipment}(${d.durationMin}분)`).join(", ");
     backupCriticalSummary = [
       `최장 부동: ${top.equipment} ${top.durationMin}분 — ${(top.rootCause || "").slice(0, 100)}`,
       `30분+ 부동 이슈 ${dataLongCount}건 발생`,
-      `주목 패턴: 데이터 분석 필요`,
-      `품질 추세: 데이터 분석 필요`,
-      `특이사항: 큐레이션 LLM 응답 미흡 — 룰 백업 사용`,
-    ];
+      _topEqs ? `장기부동 상위: ${_topEqs}` : null,
+      `⚠️ 큐레이션 LLM 응답 미흡 — 룰 백업으로 생성됨 (주목 패턴·품질 추세 등 심층 분석 누락, 정밀도 주의)`,
+    ].filter(Boolean);
   }
 
   // ★ 영역 12-BD: 그룹 종합 병렬 호출 (카테고리/호기 각각 ≥2건 그룹만)
@@ -2259,7 +2287,7 @@ async function runPreCuration(allIssues, kbPE, reportType, categoryMsgs = {}) {
   };
 
   // 결과 병합 — 영역 12-Y: 새 필드 (recordBreakdown, chronicIssues, conditionChangeGroups, chronic1AB, line3DCutterCpc) 보존
-  return normalizeBriefing({
+  const _briefingOut = normalizeBriefing({
     summary_text: part1.summary_text || (backupLongDowntime.length > 0
       ? `총 ${allIssues.length}건 부동 이슈 발생, ${dataLongCount}건이 ${longThreshold}분 이상 장기부동`
       : ""),
@@ -2277,10 +2305,47 @@ async function runPreCuration(allIssues, kbPE, reportType, categoryMsgs = {}) {
     qualityNg: part3.qualityNg || { table: [], trend: "데이터 없음" },
     groupSyntheses,  // ★ 12-BD 그룹 종합
   });
+  // ★ 큐 #19 ⑦: 큐레이션 진단을 브리핑에 부착 (generateReport에서 GapLog 적재 + 배지)
+  try { _briefingOut._diagnostics = [..._curationDiag]; } catch (e) {}
+  return _briefingOut;
 }
 
 // ─── 분할 헬퍼: 공통 호출 (Sonnet 1차 → 504 시 Haiku fallback) ─────────────────
 // ★ 영역 12-AQ: Part 1처럼 무거운 호출은 useBackground:true로 504 영구 회피
+// ★ 큐 #19 ⑦: 큐레이션 실패/fallback 진단 수집 (모듈 레벨 — runPreCuration 시작 시 리셋)
+//   fatal=true → 빈 객체 반환(룰 백업 전환), fatal=false → 구제됨(부분복구/Haiku)이나 품질 저하 신호
+let _curationDiag = [];
+function _pushCurDiag(part, errorType, t0, fatal) {
+  try { _curationDiag.push({ part, errorType, elapsed: Number(((Date.now() - t0) / 1000).toFixed(1)), fatal: !!fatal }); } catch (e) {}
+}
+// ★ 큐 #19 ⑦: 큐레이션 진단을 GapLog에 적재 (dimension=curation_fail). 진단 없으면 no-op
+async function _logCurationDiag(curation, date) {
+  const _diags = (curation && curation._diagnostics) || [];
+  if (!_diags.length) return;
+  try {
+    const _fatal = _diags.filter(d => d.fatal);
+    const _parts = [...new Set(_diags.map(d => d.part))].join(", ");
+    const _types = [...new Set(_diags.map(d => d.errorType))].join(", ");
+    const _desc = _fatal.length > 0
+      ? `큐레이션 ${_fatal.map(d => d.part).join("/")} 실패(${[...new Set(_fatal.map(d => d.errorType))].join(",")}) → 룰 백업 전환`
+      : `큐레이션 ${_parts} fallback/부분복구(${_types}) — 정상 생성되나 품질 저하`;
+    await appendGapLogRow({
+      report_date: date,
+      section: 0,
+      dimension: "curation_fail",
+      gap_description: _desc.slice(0, 200),
+      severity: _fatal.length > 0 ? "high" : "mid",
+      raw_evidence: JSON.stringify(_diags).slice(0, 500),
+      current_value: _fatal.length > 0 ? "룰 백업 생성" : "fallback/부분복구",
+      ideal_value: "LLM 큐레이션 정상 출력",
+      status: "open",
+    });
+    console.log(`[generateReport] ★ 큐레이션 진단 GapLog 적재: ${_desc}`);
+  } catch (e) {
+    console.error(`[generateReport] 큐레이션 진단 GapLog 적재 실패:`, e?.message?.slice(0, 150));
+  }
+}
+
 async function callCurationPart(sys, userMsg, partLabel, allIssuesForFallback = [], categoryMsgsForFallback = {}, maxTokensOverride = null, useBackground = false) {
   // ★ 영역 12-Z4: 응답 시간 측정용
   // ★ 영역 12-AE1: maxTokensOverride — Part 2 강화 시 1800→2200 (conditionChangeGroups 풀 출력용)
@@ -2303,6 +2368,7 @@ async function callCurationPart(sys, userMsg, partLabel, allIssuesForFallback = 
     } catch (e) {
       const elapsed = ((Date.now() - t0) / 1000).toFixed(1);
       console.error(`[PE 큐레이션 ${partLabel} Background 실패] (${elapsed}초)`, e?.message?.slice(0, 200));
+      _pushCurDiag(partLabel, "background_fail", t0, true);
       // Background 실패 시 빈 객체 반환 (룰 백업으로 보정)
       return {};
     }
@@ -2333,6 +2399,7 @@ async function callCurationPart(sys, userMsg, partLabel, allIssuesForFallback = 
       const recovered = tryPartialJSONRecovery(rawForRecovery);
       if (recovered && Object.keys(recovered).length > 0) {
         console.log(`[PE 큐레이션 ${partLabel}] ★ 부분 복구 성공 — 키: ${Object.keys(recovered).join(", ")}`);
+        _pushCurDiag(partLabel, "partial_recovery_sonnet", t0, false);
         return recovered;
       }
       console.log(`[PE 큐레이션 ${partLabel}] ★ 부분 복구 실패 — Haiku fallback 진입`);
@@ -2354,6 +2421,7 @@ async function callCurationPart(sys, userMsg, partLabel, allIssuesForFallback = 
         const elapsedFb = ((Date.now() - tFallback) / 1000).toFixed(1);
         console.log(`[PE 큐레이션 ${partLabel}] Haiku fallback 성공 (${elapsedFb}초)`);
         console.log(`[PE 큐레이션 ${partLabel}] fallback raw 응답 첫 200자:`, (raw2 || "").slice(0, 200));
+        _pushCurDiag(partLabel, "sonnet_timeout_haiku_fallback", t0, false);
         return safeJSON(raw2);
       } catch (e2) {
         const elapsedFb = ((Date.now() - tFallback) / 1000).toFixed(1);
@@ -2365,10 +2433,18 @@ async function callCurationPart(sys, userMsg, partLabel, allIssuesForFallback = 
           const recovered = tryPartialJSONRecovery(raw2ForRecovery);
           if (recovered && Object.keys(recovered).length > 0) {
             console.log(`[PE 큐레이션 ${partLabel}] ★ Haiku 응답 부분 복구 성공 — 키: ${Object.keys(recovered).join(", ")}`);
+            _pushCurDiag(partLabel, "partial_recovery_haiku", t0, false);
             return recovered;
           }
         }
       }
+    }
+    // ★ 큐 #19 ⑦: 진단 기록 (최종 실패 → 룰 백업). errorType 판별
+    {
+      const _msg = (e?.message || "").toLowerCase();
+      const _et = (_msg.includes("504") || _msg.includes("timeout")) ? "timeout_both_fail"
+        : (_msg.includes("json")) ? "json_parse_fail" : "unknown_fail";
+      _pushCurDiag(partLabel, _et, t0, true);
     }
     // 최종 실패 — 빈 객체 반환 (병합 시 룰 백업으로 보정)
     return {};
@@ -5242,6 +5318,7 @@ export default function App() {
       let curation;
       try {
         curation = await runPreCuration(allIssuesForCuration, kbForCuration, reportType, categoryMsgs);
+        await _logCurationDiag(curation, date);  // ★ 큐 #19 ⑦: 큐레이션 진단 GapLog 적재
         setProgress(p => [...p, `✅ PE 큐레이션 완료 (장기부동 ${curation.long_downtime.length}건, 반복 ${curation.recurring.length}건)`]);
       } catch {
         setProgress(p => [...p, `⚠️ PE 큐레이션 실패 — 폴백 사용`]);
@@ -5388,6 +5465,7 @@ export default function App() {
         setProgress(p => [...p, "📝 PE 사전 큐레이션 중 (전체 이슈 정리)..."]);
         try {
           curation = await runPreCuration(allIssuesForCuration, kbResult.kb["Cell_PE"] || kbResult.kb["Elec_PE"] || "", reportType, categoryMsgs);
+          await _logCurationDiag(curation, date);  // ★ 큐 #19 ⑦: 큐레이션 진단 GapLog 적재
           setProgress(p => [...p, `✅ PE 큐레이션 완료`]);
         } catch {
           setProgress(p => [...p, `⚠️ PE 큐레이션 실패 - 폴백 사용`]);
@@ -5578,7 +5656,18 @@ export default function App() {
     const actions = minutes.actions || [];
     const tagged = minutes.tagged || { issues: [], counts: {} };
     const issuesCount = (tagged.issues || []).length;
-    const long30 = (cur.longDowntime || []).filter(it => Number(it.duration || it.durMin || 0) >= 30);
+    // ★ 큐 #19 ③: 30분+ full stop 강제 편입 — LLM 큐레이션(cur.longDowntime)이 빠뜨린 30분+ 건을 룰로 보강
+    // (예: 5/21 STK-1-D4 92분, 5/20 STK-3-D6 33분, 5/19 FI-4-1/MAG-2-A 55분 — LLM이 longDowntime에 안 담은 누락분)
+    const _normLongKey = (eq, dur) => `${String(eq || "").toUpperCase().replace(/\s/g, "")}|${Number(dur) || 0}`;
+    const _curLong30 = (cur.longDowntime || []).filter(it => Number(it.duration || it.durMin || 0) >= 30);
+    const _curLongKeys = new Set((cur.longDowntime || []).map(it => _normLongKey(it.equipment || it.eq, it.duration || it.durMin)));
+    const _ruleLong30 = (tagged.issues || [])
+      .filter(it => Number(it.durMin || it.duration || 0) >= 30)
+      .filter(it => !_curLongKeys.has(_normLongKey(it.eq || it.equipment, it.durMin || it.duration)))
+      // 룰 보강분 내부 (eq+dur) 중복 제거 (dedup으로 대부분 제거되나 방어)
+      .filter((it, idx, arr) => arr.findIndex(x => _normLongKey(x.eq || x.equipment, x.durMin || x.duration) === _normLongKey(it.eq || it.equipment, it.durMin || it.duration)) === idx);
+    const long30 = [..._curLong30, ..._ruleLong30];
+    if (_ruleLong30.length > 0) console.log(`[generateReport] ★ 30분+ 룰 보강 ${_ruleLong30.length}건: ${_ruleLong30.map(x => (x.eq || x.equipment) + "(" + (x.durMin || x.duration) + "분)").join(", ")}`);
 
     // TOP 5 (score 기준)
     const scoredIssues = (tagged.issues || [])
@@ -5909,6 +5998,45 @@ export default function App() {
     };
 
     // 1번 장기부동 박스 — 영역 12-Y1: 새 필드 (splitDetail, recurrenceGap, collateralDamage, historyPattern, actionAnalysis)
+    // ★ 큐 #19 ③: 30분+ full stop 강제 편입 — LLM 큐레이션(cur.longDowntime)이 누락한 30분+ 건을 룰로 보강
+    // (예: 5/21 STK-1-D4 92분, 5/20 STK-3-D6 33분, 5/19 FI-4-1/MAG-2-A 55분)
+    const _normLongKey = (eq, dur) => `${String(eq || "").toUpperCase().replace(/\s/g, "")}|${Number(dur) || 0}`;
+    const _curLongKeys = new Set((cur.longDowntime || []).map(it => _normLongKey(it.equipment || it.eq, it.duration || it.durMin)));
+    const _ruleLong30 = (tagged.issues || [])
+      .filter(it => Number(it.durMin || it.duration || 0) >= 30)
+      .filter(it => !_curLongKeys.has(_normLongKey(it.eq || it.equipment, it.durMin || it.duration)))
+      .filter((it, idx, arr) => arr.findIndex(x => _normLongKey(x.eq || x.equipment, x.durMin || x.duration) === _normLongKey(it.eq || it.equipment, it.durMin || it.duration)) === idx);
+    if (_ruleLong30.length > 0) console.log(`[downloadHtml] ★ 30분+ 룰 보강 ${_ruleLong30.length}건: ${_ruleLong30.map(x => (x.eq || x.equipment) + "(" + (x.durMin || x.duration) + "분)").join(", ")}`);
+    const ruleLong30Html = _ruleLong30.map(it => {
+      const _eq = it.eq || it.equipment || "?";
+      const _dur = it.durMin || it.duration || 0;
+      const _prob = String(it.prob || it.problem || it.text || "").replace(/\n/g, " ").slice(0, 140);
+      const _cause = String(it.cause || "").replace(/\n/g, " ").slice(0, 140);
+      return `
+      <div class="critical" style="border-left-color:#e67e22;">
+        <h3 style="margin-top:0;">🟠 ${esc(_eq)} — ${_dur}분 <span style="font-size:0.62em;font-weight:700;color:#e67e22;background:#fff3e0;padding:1px 8px;border-radius:8px;margin-left:6px;vertical-align:middle;">룰 보강</span></h3>
+        <p style="margin:4px 0;"><b>문제:</b> ${esc(_prob) || "-"}</p>
+        ${_cause ? `<p style="margin:4px 0;color:#666;"><b>원인:</b> ${esc(_cause)}</p>` : ""}
+        <p style="font-size:0.84em;color:#999;margin:6px 0 0;">※ LLM 큐레이션이 누락한 30분+ full stop — 룰로 자동 편입 (페르소나 논의 없음)</p>
+      </div>`;
+    }).join("");
+
+    // ★ 큐 #19 ⑦: 큐레이션 진단 배지 (HTML 생성만 — GapLog 적재는 generateReport 본체 async에서 수행)
+    let curationBadge = "";
+    {
+      const _diags = (cur && cur._diagnostics) || [];
+      if (_diags.length > 0) {
+        const _fatal = _diags.filter(d => d.fatal);
+        const _parts = [...new Set(_diags.map(d => d.part))].join(", ");
+        const _types = [...new Set(_diags.map(d => d.errorType))].join(", ");
+        if (_fatal.length > 0) {
+          curationBadge = `<div style="background:#fff5f5;border:2px solid #c0392b;border-radius:6px;padding:10px 14px;margin:0 0 14px;color:#c0392b;font-weight:600;">⚠️ 이 레포트는 LLM 큐레이션 일부 실패로 <b>룰 백업</b>이 사용되었습니다 — 심층 분석(주목 패턴·품질 추세 등)이 누락되어 정밀도가 낮을 수 있습니다.<br><span style="font-weight:400;font-size:0.88em;">실패 Part: ${esc(_parts)} / 유형: ${esc(_types)}</span></div>`;
+        } else {
+          curationBadge = `<div style="background:#fffaf0;border:1px solid #e67e22;border-radius:6px;padding:8px 12px;margin:0 0 14px;color:#b9770e;font-size:0.9em;">ℹ️ 큐레이션 중 일부 Part가 Haiku fallback/부분복구로 처리됨 (${esc(_parts)}). 결과는 정상 생성되었으나 품질이 평소보다 낮을 수 있습니다.</div>`;
+        }
+      }
+    }
+
     const longDowntimeHtml = (cur.longDowntime || []).map((d) => {
       const matchedDisc = findMatchingDiscForCuration(d);
       const personaConvHtml = buildPersonaConvHtml(matchedDisc);
@@ -6338,6 +6466,7 @@ export default function App() {
 <body>
 
 <h1>${esc(title)}</h1>
+${curationBadge}
 <p class="meta"><b>분석 기간:</b> ${esc(periodLabel)}<br>
 <b>출처:</b> AZS Status Reports WhatsApp 그룹<br>
 <b>레코드:</b> ${(() => {
@@ -6359,7 +6488,7 @@ ${(cur.criticalSummary || []).length > 0 ? `<ul>${cur.criticalSummary.map(c => `
 
 <hr>
 <h2>🚨 1. 장기부동 건 — 상세</h2>
-${longDowntimeHtml || "<p>장기부동 이슈 없음</p>"}
+${(longDowntimeHtml + ruleLong30Html) || "<p>장기부동 이슈 없음</p>"}
 
 ${chronicIssuesHtml}
 

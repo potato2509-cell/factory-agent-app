@@ -5375,9 +5375,13 @@ export default function App() {
       let curation;
       try {
         curation = await runPreCuration(allIssuesForCuration, kbForCuration, reportType, categoryMsgs);
-        await _logCurationDiag(curation, date);  // ★ 큐 #19 ⑦: 큐레이션 진단 GapLog 적재
+        // ★ 큐 #19 폴백버그 수정(방안A): date 미정의 ReferenceError 차단 — selDates[0](YY/M/D) → YYYY-MM-DD 변환(GapLog report_date 일관)
+        const _reportDate = selDates[0] ? dateStrToIso(selDates[0]) : "";
+        await _logCurationDiag(curation, _reportDate);  // ★ 큐 #19 ⑦: 큐레이션 진단 GapLog 적재
         setProgress(p => [...p, `✅ PE 큐레이션 완료 (장기부동 ${curation.long_downtime.length}건, 반복 ${curation.recurring.length}건)`]);
-      } catch {
+      } catch (e) {
+        // ★ 큐 #19 폴백버그 수정(방안B): 에러 swallow 방지 — try 내부(_logCurationDiag 포함) 실패 원인 콘솔 노출
+        console.error(`[큐레이션 try-catch 트리거 / handleReportConfirm]`, e?.message, e?.stack);
         setProgress(p => [...p, `⚠️ PE 큐레이션 실패 — 폴백 사용`]);
         curation = buildFallbackCuration(allIssuesForCuration, categoryMsgs);
       }
@@ -5524,9 +5528,13 @@ export default function App() {
         setProgress(p => [...p, "📝 PE 사전 큐레이션 중 (전체 이슈 정리)..."]);
         try {
           curation = await runPreCuration(allIssuesForCuration, kbResult.kb["Cell_PE"] || kbResult.kb["Elec_PE"] || "", reportType, categoryMsgs);
-          await _logCurationDiag(curation, date);  // ★ 큐 #19 ⑦: 큐레이션 진단 GapLog 적재
+          // ★ 큐 #19 폴백버그 수정(방안A): date 미정의 ReferenceError 차단 — selDates[0](YY/M/D) → YYYY-MM-DD 변환(GapLog report_date 일관)
+          const _reportDate = selDates[0] ? dateStrToIso(selDates[0]) : "";
+          await _logCurationDiag(curation, _reportDate);  // ★ 큐 #19 ⑦: 큐레이션 진단 GapLog 적재
           setProgress(p => [...p, `✅ PE 큐레이션 완료`]);
-        } catch {
+        } catch (e) {
+          // ★ 큐 #19 폴백버그 수정(방안B): 에러 swallow 방지 — try 내부(_logCurationDiag 포함) 실패 원인 콘솔 노출
+          console.error(`[큐레이션 try-catch 트리거 / runAnalysis 폴백경로]`, e?.message, e?.stack);
           setProgress(p => [...p, `⚠️ PE 큐레이션 실패 - 폴백 사용`]);
           curation = buildFallbackCuration(allIssuesForCuration, categoryMsgs);
         }

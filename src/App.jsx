@@ -4815,9 +4815,10 @@ async function fetchGapLogList(filter = {}) {
 }
 
 // ─── 큐 #15 Phase 5a: 누적 gap 패턴 분석 ─────────────────────────────────
-async function analyzeGapPatterns(filter = { status: "open" }) {
+async function analyzeGapPatterns(filter = { status: "open" }, opts = {}) {
   const t0 = Date.now();
-  console.log(`[큐 #15 Phase 5a] analyzeGapPatterns 시작 (filter: ${JSON.stringify(filter)})`);
+  const _dfLog = (opts.dateFilter && opts.dateFilter.length) ? opts.dateFilter.join(", ") : "(all)";
+  console.log(`[큐 #15 Phase 5a] analyzeGapPatterns 시작 (filter: ${JSON.stringify(filter)}, dateFilter: ${_dfLog})`);
 
   // 1) GapLog 로드
   const listResult = await fetchGapLogList(filter);
@@ -4826,8 +4827,19 @@ async function analyzeGapPatterns(filter = { status: "open" }) {
   }
   console.log(`[큐 #15 Phase 5a] ${listResult.count}건 gap 로드`);
 
+  // ★ 큐 #20: 클라이언트 측 report_date 필터 (Apps Script gaplog.list가 report_date 필터 미지원 가정)
+  let filteredGaps = listResult.gaps || [];
+  if (opts.dateFilter && Array.isArray(opts.dateFilter) && opts.dateFilter.length > 0) {
+    const dateSet = new Set(opts.dateFilter.map(d => String(d).trim()));
+    filteredGaps = filteredGaps.filter(g => dateSet.has(String(g.report_date).trim()));
+    console.log(`[큐 #20 dateFilter 적용] 전체 ${listResult.count}건 → ${filteredGaps.length}건 (대상 일자: ${opts.dateFilter.join(", ")})`);
+    if (filteredGaps.length === 0) {
+      throw new Error(`해당 일자(${opts.dateFilter.join(", ")})에 매칭되는 gap이 0건 — 일자 입력 확인 또는 'all'로 전체 분석`);
+    }
+  }
+
   // 2) gap 요약 텍스트 구성 (Claude에게 전달)
-  const gapSummary = listResult.gaps.map((g, i) =>
+  const gapSummary = filteredGaps.map((g, i) =>
     `[${i + 1}] id=${g.id} §${g.section} ${g.dimension} (${g.severity || "medium"})
   날짜: ${g.report_date}
   내용: ${g.gap_description}
@@ -4863,7 +4875,7 @@ async function analyzeGapPatterns(filter = { status: "open" }) {
 - severity: high=즉시 패치 권장, medium=다음 사이클, low=장기 과제
 - affected_code_area는 가능한 만큼 구체적으로 (예: "generateReport §4 프롬프트")`;
 
-  const userMsg = `누적 gap ${listResult.count}건을 분석하세요.
+  const userMsg = `누적 gap ${filteredGaps.length}건을 분석하세요.
 
 ${gapSummary}`;
 
@@ -4892,14 +4904,16 @@ ${gapSummary}`;
   console.log(`[큐 #15 Phase 5a] ✅ 완료 (${elapsedSec}초): ${parsed.patterns.length}개 패턴 식별`);
 
   return {
-    gapCount: listResult.count,
+    gapCount: filteredGaps.length,  // ★ 큐 #20: 필터 적용 후 카운트 (UI 표시용)
+    totalGapCount: listResult.count,  // ★ 큐 #20: 필터 전 전체 카운트 (참고용)
     patternCount: parsed.patterns.length,
     patterns: parsed.patterns,
     summary: parsed.summary,
     elapsedSec: parseFloat(elapsedSec),
-    _rawGaps: listResult.gaps,    // Phase 5b에서 사용
+    _rawGaps: filteredGaps,    // Phase 5b에서 사용 (필터 적용된 gap만)
     _rawResponse: rawResponse,
     _generatedAt: new Date().toISOString(),
+    _dateFilter: opts.dateFilter || null,  // ★ 큐 #20: 적용된 필터 정보
   };
 }
 
@@ -5063,6 +5077,17 @@ export default function App() {
   const [patternsLoading, setPatternsLoading] = useState(false);
   const [patternsExpanded, setPatternsExpanded] = useState(false);
   const [patternsLastRunAt, setPatternsLastRunAt] = useState(0);  // 쿨다운 추적 (Date.now())
+  // ★ 큐 #20: 분석 대상 일자 필터 (콤마 구분, 기본값 = 오늘 기준 최근 7일, "all"이면 전체)
+  const [patternsDateFilter, setPatternsDateFilter] = useState(() => {
+    const today = new Date();
+    const dates = [];
+    for (let i = 6; i >= 0; i--) {
+      const d = new Date(today);
+      d.setDate(d.getDate() - i);
+      dates.push(`${d.getFullYear()}-${String(d.getMonth()+1).padStart(2,"0")}-${String(d.getDate()).padStart(2,"0")}`);
+    }
+    return dates.join(", ");
+  });
   // ★ 공정/추가 에이전트 선택 state
   const [selectedProcess, setSelectedProcess] = useState("Cell");
   const [extraAgents, setExtraAgents] = useState([]);
@@ -5207,7 +5232,14 @@ export default function App() {
     setPatternsLoading(true);
     setPatternsExpanded(true);
     try {
-      const result = await analyzeGapPatterns({ status: "open" });
+      // ★ 큐 #20: dateFilter 파싱 (콤마 구분, "all"/빈 문자열이면 미적용 = 전체 분석)
+      const trimmed = (patternsDateFilter || "").trim();
+      let dateFilter = null;
+      if (trimmed && trimmed.toLowerCase() !== "all") {
+        dateFilter = trimmed.split(",").map(s => s.trim()).filter(Boolean);
+        if (dateFilter.length === 0) dateFilter = null;
+      }
+      const result = await analyzeGapPatterns({ status: "open" }, { dateFilter });
       setPatternsResult(result);
       setPatternsLastRunAt(Date.now());
       console.log(`[큐 #20] ✅ 패턴 분석 완료: ${result.patternCount}개 패턴 / ${result.gapCount}건 gap`);
@@ -5260,7 +5292,8 @@ export default function App() {
 <h1>🔍 큐 #15 Phase 5a — 누적 Gap 패턴 분석 결과</h1>
 <p class="meta">
   <b>생성 시각:</b> ${esc(generatedAt)}<br>
-  <b>분석 대상:</b> open 상태 gap ${patternsResult.gapCount}건<br>
+  <b>분석 대상:</b> open 상태 gap ${patternsResult.gapCount}건${patternsResult.totalGapCount && patternsResult.totalGapCount !== patternsResult.gapCount ? ` <span style="color:#888;">(전체 ${patternsResult.totalGapCount}건 중 필터링)</span>` : ""}<br>
+  ${patternsResult._dateFilter ? `<b>일자 필터:</b> <code>${esc(patternsResult._dateFilter.join(", "))}</code><br>` : ""}
   <b>식별 패턴:</b> ${patternsResult.patternCount}개<br>
   <b>분석 소요:</b> ${patternsResult.elapsedSec}초
 </p>
@@ -7291,6 +7324,17 @@ ${userText}
     // ★ 큐 #20 Phase 5a UI: 패턴 분석 state 초기화
     setPatternsResult(null); setPatternsLoading(false);
     setPatternsExpanded(false); setPatternsLastRunAt(0);
+    // patternsDateFilter는 초기값(최근 7일) 자동 복원 — reset 직후 다시 분석할 때 편의
+    {
+      const today = new Date();
+      const dates = [];
+      for (let i = 6; i >= 0; i--) {
+        const d = new Date(today);
+        d.setDate(d.getDate() - i);
+        dates.push(`${d.getFullYear()}-${String(d.getMonth()+1).padStart(2,"0")}-${String(d.getDate()).padStart(2,"0")}`);
+      }
+      setPatternsDateFilter(dates.join(", "));
+    }
     // ★ 12-AZ-6: messages 탭 모드 + STEP 1 자동 진입
     handleEnterTabMode();
   };
@@ -7825,6 +7869,30 @@ ${userText}
             {/* ★ 큐 #20 Phase 5a UI: 패턴 분석 버튼 + in-place 패널 */}
             {updateReady && updateReady.ready && (
               <div style={{marginBottom:14}}>
+                {/* ★ 큐 #20: 분석 대상 일자 필터 인풋 */}
+                <div style={{
+                  display:"flex", gap:6, marginBottom:6, alignItems:"center", flexWrap:"wrap",
+                }}>
+                  <label style={{fontSize:10, color:"#a78bfa", fontWeight:700, flexShrink:0}}>
+                    📅 분석 대상 일자:
+                  </label>
+                  <input
+                    type="text"
+                    value={patternsDateFilter}
+                    onChange={(e) => setPatternsDateFilter(e.target.value)}
+                    placeholder="2026-05-25, 2026-05-26, 2026-05-28 (또는 'all' = 전체)"
+                    disabled={patternsLoading}
+                    style={{
+                      flex:1, minWidth:200, padding:"5px 8px", fontSize:10,
+                      background:"rgba(15,23,42,0.6)", border:"1px solid rgba(124,58,237,0.3)",
+                      borderRadius:5, color:"#cbd5e1", fontFamily:"monospace",
+                    }}
+                  />
+                </div>
+                <div style={{fontSize:9, color:"#64748b", marginBottom:10, lineHeight:1.5, paddingLeft:6}}>
+                  ※ YYYY-MM-DD 형식 콤마 구분 · 기본값: 오늘 기준 최근 7일 · 'all' 입력 시 전체 gap 분석
+                </div>
+
                 <div style={{display:"flex", gap:8, marginBottom: patternsExpanded ? 10 : 0}}>
                   <button onClick={()=>runPatternAnalysis()} disabled={patternsLoading} style={{
                     flex:1, padding:"9px 14px",
@@ -7868,9 +7936,18 @@ ${userText}
                           flexWrap:"wrap", gap:8,
                         }}>
                           <div style={{fontSize:11, color:"#cbd5e1"}}>
-                            <b style={{color:"#a78bfa"}}>📊 분석 대상:</b> open gap {patternsResult.gapCount}건 ·{" "}
+                            <b style={{color:"#a78bfa"}}>📊 분석 대상:</b> open gap {patternsResult.gapCount}건
+                            {patternsResult.totalGapCount && patternsResult.totalGapCount !== patternsResult.gapCount && (
+                              <span style={{color:"#64748b"}}> (전체 {patternsResult.totalGapCount}건 중 필터링)</span>
+                            )}
+                            {" · "}
                             <b style={{color:"#a78bfa"}}>식별 패턴:</b> {patternsResult.patternCount}개 ·{" "}
                             <b style={{color:"#a78bfa"}}>소요:</b> {patternsResult.elapsedSec}초
+                            {patternsResult._dateFilter && (
+                              <div style={{fontSize:9, color:"#94a3b8", marginTop:3, fontFamily:"monospace"}}>
+                                🆕 일자 필터: {patternsResult._dateFilter.join(", ")}
+                              </div>
+                            )}
                           </div>
                           <div style={{display:"flex", gap:6}}>
                             <button onClick={downloadPatternsHtml} style={{

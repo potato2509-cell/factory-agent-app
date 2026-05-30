@@ -4372,6 +4372,20 @@ async function generateReport(date, dates, discussions, priority, reportType, kb
     return `[이슈${i+1}-LITE] ${d.issue.eq}: ${m.supplement} / 재발: ${m.recurRisk}`;
   }).join("\n\n");
 
+  // ★ 큐 #20 P6 패치: 미해결 이슈 목록 추출 (sys5 §5 후속조치 구체화용)
+  // curation.longDowntime 중 result에 unsolved/not solved 포함된 항목만
+  const _unsolvedIssues = ((curation && curation.longDowntime) || [])
+    .filter(d => {
+      const r = String(d.result || "").toLowerCase();
+      return r.includes("unsolved") || r.includes("not solved");
+    })
+    .slice(0, 10);  // 최대 10건 (ctx 비대 방지)
+  const _unsolvedText = _unsolvedIssues.length > 0
+    ? `\n\n[미해결 이슈 ${_unsolvedIssues.length}건 — §5 후속조치 작성 시 반드시 반영]\n${_unsolvedIssues.map((d, i) =>
+        `${i+1}. ${d.equipment || "?"} (${d.durationMin || 0}분) — ${(d.rootCause || d.title || "원인 미파악").slice(0, 80)} · 결과: ${d.result || "-"}`
+      ).join("\n")}`
+    : "";
+
   const ctx = `날짜: ${dateStr}
 보고서 종류: ${reportTitle}
 본문 논의: ${priority.urgent.length + priority.important.length + priority.normal.length}건 (LONG_DOWNTIME ${priority.urgent.length} / HIGH_FREQUENCY ${priority.important.length})
@@ -4382,6 +4396,7 @@ ${analytics.timeOfDay.map((t, i) => `${i+1}. ${t.label} ${t.count}건`).join("\n
 
 [빈도 TOP 5 (설비×공정)]
 ${analytics.categoryFreq.map((c, i) => `${i+1}. ${c.key} ${c.count}건`).join("\n")}
+${_unsolvedText}
 
 [건별 논의 결과]
 ${discussionSummary}`;
@@ -4443,14 +4458,14 @@ JSON: {"heading":"4. 담당자별 액션 아이템","items":["[PE] 조치 (60자
     sections.push(safeJSON(raw4));
   } catch { sections.push({ heading:"4. 담당자별 액션 아이템", items:["-"] }); }
 
-  // 섹션 5: 재발방지 및 차기 계획
+  // 섹션 5: 재발방지 및 차기 계획 — ★ 큐 #20 P6 패치: 구체성 강화 + 일반론 강요 제거
   try {
     await new Promise(r => setTimeout(r, 500));
     const sys5 = `AZS 배터리 공장 ${reportTitle}. 한국어. JSON만. 4개 슬롯 모두 필수 채움.
-"장기 개선 과제" 슬롯에는 반드시 DB화 / 주간 추적 / 효과 검증 / 자동 알람 시스템 같은 장기 모니터링 항목을 포함.
-모든 슬롯에 raw 근거가 부족해도 "(검토 필요)" 형태로 반드시 채움. 빈 문자열·생략 금지.
-JSON: {"heading":"5. 재발방지 대책 및 차기 계획","items":["재발방지 핵심 대책 (60자이내)","장기 개선 과제 (DB화·주간 추적·효과 검증 포함)","모니터링 항목","차기 일정"]}`;
-    const raw5 = await callClaudeRaw(sys5, ctx, { model: MODEL_REASONING, max_tokens: 600 });
+원칙: raw 데이터에 근거 있는 항목 우선. 근거 없는 슬롯은 "데이터 부족 — 추후 확인" 명시 (일반론 채우기 금지).
+"장기 개선 과제" 슬롯: DB화/주간 추적/효과 검증/자동 알람 같은 장기 모니터링 항목 — 단 raw에 단서 있을 때만, 없으면 "추가 검토 필요".
+JSON: {"heading":"5. 재발방지 대책 및 차기 계획","items":["재발방지 핵심 대책 (60자이내)","장기 개선 과제 (raw 단서 있을 때만, DB화·주간 추적·효과 검증)","모니터링 항목 (대상 호기/부품·주기 명시)","차기 일정 (담당자·완료 목표일·검증 방법 명시, 150자이내)"]}`;
+    const raw5 = await callClaudeRaw(sys5, ctx, { model: MODEL_REASONING, max_tokens: 900 });
     sections.push(safeJSON(raw5));
   } catch { sections.push({ heading:"5. 재발방지 대책 및 차기 계획", items:["-"] }); }
 
@@ -4814,6 +4829,43 @@ async function fetchGapLogList(filter = {}) {
   return result;
 }
 
+// ─── 큐 #20: GapLog status 업데이트 (패치 적용 후 gap 닫기용) ───────────────
+// AZS_WhatsApp_Webhook 프로젝트의 ?action=gaplog.update 엔드포인트 호출
+// 입력: { ids: [string], status: "resolved"|"open", closed_reason: string }
+// Apps Script가 ids 배열 순회하며 status, closed_at(=현재 timestamp), closed_reason 갱신
+async function updateGapLogStatus({ ids, status, closed_reason = "" }) {
+  if (!Array.isArray(ids) || ids.length === 0) {
+    throw new Error("ids 배열이 비어있음");
+  }
+  const GAPLOG_SECRET = import.meta.env.VITE_GAPLOG_SECRET || "";
+  if (!GAPLOG_SECRET) {
+    throw new Error("VITE_GAPLOG_SECRET 환경변수 미설정");
+  }
+
+  const url = `${WHAPI_APPS_SCRIPT_URL}?action=gaplog.update&secret=${encodeURIComponent(GAPLOG_SECRET)}`;
+  let res;
+  try {
+    res = await fetch(url, {
+      method: "POST",
+      headers: { "Content-Type": "text/plain;charset=utf-8" },
+      body: JSON.stringify({ ids, status, closed_reason }),
+      redirect: "follow",
+    });
+  } catch (e) {
+    throw new Error(`GapLog update 네트워크 오류: ${e.message}`);
+  }
+
+  if (!res.ok) {
+    const errText = await res.text().catch(() => "");
+    throw new Error(`GapLog update HTTP ${res.status}: ${errText.slice(0, 200)}`);
+  }
+  const result = await res.json();
+  if (!result.ok) {
+    throw new Error(`GapLog update 실패: ${result.error || "unknown"}`);
+  }
+  return result;  // { ok: true, updatedCount: N, closed_at: "..." }
+}
+
 // ─── 큐 #15 Phase 5a: 누적 gap 패턴 분석 ─────────────────────────────────
 async function analyzeGapPatterns(filter = { status: "open" }, opts = {}) {
   const t0 = Date.now();
@@ -4990,6 +5042,7 @@ if (typeof window !== "undefined") {
   window.compareAndLogGaps = compareAndLogGaps;
   window.appendGapLogRow = appendGapLogRow;
   window.fetchGapLogList = fetchGapLogList;
+  window.updateGapLogStatus = updateGapLogStatus;  // ★ 큐 #20: gap 닫기 헬퍼
   window.analyzeGapPatterns = analyzeGapPatterns;
   window.runAutoCompare = runAutoCompare;
 }
@@ -5077,6 +5130,8 @@ export default function App() {
   const [patternsLoading, setPatternsLoading] = useState(false);
   const [patternsExpanded, setPatternsExpanded] = useState(false);
   const [patternsLastRunAt, setPatternsLastRunAt] = useState(0);  // 쿨다운 추적 (Date.now())
+  // ★ 큐 #20: 패턴별 gap 닫기 상태 — { [pattern_id]: {stage:"idle"|"confirming"|"closing"|"done"|"error", result?, error?} }
+  const [closeStatus, setCloseStatus] = useState({});
   // ★ 큐 #20: 분석 대상 일자 필터 (콤마 구분, 기본값 = 오늘 기준 최근 7일, "all"이면 전체)
   const [patternsDateFilter, setPatternsDateFilter] = useState(() => {
     const today = new Date();
@@ -5251,6 +5306,49 @@ export default function App() {
       });
     } finally {
       setPatternsLoading(false);
+    }
+  };
+
+  // ★ 큐 #20 Phase 5a UI: 패턴 분석 결과 HTML 다운로드 (운영 규칙: 모든 결과물 HTML 통일)
+  // ★ 큐 #20 P6 사이클: 패턴 카드의 gap 일괄 닫기 핸들러 (인라인 2단계 확인)
+  // 1단계: 사용자가 "🔒 gap N건 닫기" 버튼 클릭 → stage=confirming
+  // 2단계: "✓ 확정" 클릭 → stage=closing → updateGapLogStatus 호출 → done/error
+  const closeGapsForPattern = async (pattern, action) => {
+    const pid = pattern.pattern_id || `idx-${pattern.title?.slice(0,20)}`;
+    const ids = pattern.affected_gap_ids || [];
+    if (ids.length === 0) {
+      console.warn(`[큐 #20] 패턴 "${pid}"에 affected_gap_ids 없음 — 닫기 불가`);
+      return;
+    }
+    if (action === "request") {
+      // 1단계 — 확인 모드 진입
+      setCloseStatus(s => ({ ...s, [pid]: { stage: "confirming" } }));
+    } else if (action === "cancel") {
+      // 취소
+      setCloseStatus(s => ({ ...s, [pid]: { stage: "idle" } }));
+    } else if (action === "confirm") {
+      // 2단계 — 실제 닫기 실행
+      setCloseStatus(s => ({ ...s, [pid]: { stage: "closing" } }));
+      try {
+        const reason = `[큐 #20 ${pid}] ${(pattern.title || "").slice(0, 80)}`;
+        const result = await updateGapLogStatus({ ids, status: "resolved", closed_reason: reason });
+        setCloseStatus(s => ({
+          ...s,
+          [pid]: {
+            stage: "done",
+            result: {
+              updatedCount: result.updatedCount || ids.length,
+              closed_at: result.closed_at || new Date().toISOString(),
+            },
+          },
+        }));
+        console.log(`[큐 #20] ✅ 패턴 "${pid}" gap ${result.updatedCount || ids.length}건 closed`);
+        // 배지 카운트 재계산 (open gap 줄었을 테니)
+        try { await refreshUpdateBadge(); } catch (_) {}
+      } catch (e) {
+        console.error(`[큐 #20] gap 닫기 실패 (${pid}):`, e?.message);
+        setCloseStatus(s => ({ ...s, [pid]: { stage: "error", error: e?.message || "알 수 없는 오류" } }));
+      }
     }
   };
 
@@ -7324,6 +7422,7 @@ ${userText}
     // ★ 큐 #20 Phase 5a UI: 패턴 분석 state 초기화
     setPatternsResult(null); setPatternsLoading(false);
     setPatternsExpanded(false); setPatternsLastRunAt(0);
+    setCloseStatus({});  // ★ 큐 #20: gap 닫기 진행 상태 초기화
     // patternsDateFilter는 초기값(최근 7일) 자동 복원 — reset 직후 다시 분석할 때 편의
     {
       const today = new Date();
@@ -7989,12 +8088,18 @@ ${userText}
                                              { color:"#fde047", bg:"rgba(212,172,13,0.15)", border:"#d4ac0d", icon:"🟡", label:"LOW" };
                           return sorted.map((p, i) => {
                             const sty = sevStyle(p.severity);
+                            const pid = p.pattern_id || `idx-${p.title?.slice(0,20)}`;
+                            const cs = closeStatus[pid] || { stage: "idle" };
+                            const isDone = cs.stage === "done";
+                            const idsCount = (p.affected_gap_ids || []).length;
                             return (
                               <div key={i} style={{
-                                background:"rgba(15,23,42,0.5)",
+                                background: isDone ? "rgba(15,23,42,0.3)" : "rgba(15,23,42,0.5)",
                                 border:`1px solid ${sty.border}40`,
                                 borderLeft:`5px solid ${sty.border}`,
                                 borderRadius:6, padding:"10px 14px", marginBottom:8,
+                                opacity: isDone ? 0.55 : 1,  // ★ 큐 #20: 닫힌 패턴 회색처리
+                                transition: "opacity 0.3s",
                               }}>
                                 <div style={{
                                   display:"flex", alignItems:"center", justifyContent:"space-between",
@@ -8046,6 +8151,63 @@ ${userText}
                                     </div>
                                   )}
                                 </div>
+
+                                {/* ★ 큐 #20 P6 사이클: gap 닫기 UI 행 (인라인 2단계 확인) */}
+                                {idsCount > 0 && (
+                                  <div style={{
+                                    marginTop:10, paddingTop:8,
+                                    borderTop:`1px dashed ${sty.border}40`,
+                                    display:"flex", alignItems:"center", gap:8, flexWrap:"wrap",
+                                  }}>
+                                    {cs.stage === "idle" && (
+                                      <button onClick={()=>closeGapsForPattern(p, "request")} style={{
+                                        padding:"5px 12px", fontSize:10,
+                                        background:"rgba(52,211,153,0.1)", border:"1px solid rgba(52,211,153,0.4)",
+                                        borderRadius:5, color:"#34d399", cursor:"pointer", fontWeight:700,
+                                      }}>🔒 이 패턴의 gap {idsCount}건 닫기 (resolved)</button>
+                                    )}
+                                    {cs.stage === "confirming" && (
+                                      <>
+                                        <span style={{fontSize:10, color:"#fbbf24", fontWeight:700}}>
+                                          ⚠️ {idsCount}건을 resolved로 닫습니다. 확정하시겠습니까?
+                                        </span>
+                                        <button onClick={()=>closeGapsForPattern(p, "confirm")} style={{
+                                          padding:"5px 12px", fontSize:10,
+                                          background:"linear-gradient(135deg,#10b981,#34d399)", border:"none",
+                                          borderRadius:5, color:"#fff", cursor:"pointer", fontWeight:800,
+                                        }}>✓ 확정</button>
+                                        <button onClick={()=>closeGapsForPattern(p, "cancel")} style={{
+                                          padding:"5px 12px", fontSize:10,
+                                          background:"transparent", border:"1px solid rgba(100,116,139,0.4)",
+                                          borderRadius:5, color:"#94a3b8", cursor:"pointer", fontWeight:700,
+                                        }}>✕ 취소</button>
+                                      </>
+                                    )}
+                                    {cs.stage === "closing" && (
+                                      <span style={{fontSize:10, color:"#a78bfa", display:"flex", alignItems:"center", gap:6}}>
+                                        <Spinner/> Apps Script gaplog.update 호출 중...
+                                      </span>
+                                    )}
+                                    {cs.stage === "done" && (
+                                      <span style={{fontSize:10, color:"#34d399", fontWeight:700}}>
+                                        ✅ {cs.result?.updatedCount || idsCount}건 closed
+                                        {cs.result?.closed_at && ` · ${new Date(cs.result.closed_at).toLocaleString("ko-KR", { month:"2-digit", day:"2-digit", hour:"2-digit", minute:"2-digit" })}`}
+                                      </span>
+                                    )}
+                                    {cs.stage === "error" && (
+                                      <>
+                                        <span style={{fontSize:10, color:"#fca5a5", fontWeight:700}}>
+                                          ❌ 실패: {cs.error?.slice(0, 100)}
+                                        </span>
+                                        <button onClick={()=>closeGapsForPattern(p, "request")} style={{
+                                          padding:"3px 10px", fontSize:9,
+                                          background:"rgba(245,158,11,0.1)", border:"1px solid rgba(245,158,11,0.3)",
+                                          borderRadius:4, color:"#fbbf24", cursor:"pointer", fontWeight:700,
+                                        }}>🔄 다시 시도</button>
+                                      </>
+                                    )}
+                                  </div>
+                                )}
                               </div>
                             );
                           });

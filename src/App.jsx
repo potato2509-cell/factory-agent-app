@@ -4831,9 +4831,12 @@ async function fetchGapLogList(filter = {}) {
 
 // ─── 큐 #20: GapLog status 업데이트 (패치 적용 후 gap 닫기용) ───────────────
 // AZS_WhatsApp_Webhook 프로젝트의 ?action=gaplog.update 엔드포인트 호출
-// 입력: { ids: [string], status: "resolved"|"open", closed_reason: string }
-// Apps Script가 ids 배열 순회하며 status, closed_at(=현재 timestamp), closed_reason 갱신
-async function updateGapLogStatus({ ids, status, closed_reason = "" }) {
+// ★ 실제 Apps Script(gapLog.gs Phase 5c) 인터페이스에 맞춤:
+//   요청 body: { filter: { id: [ids...] }, updates: { status, resolved_in_cycle } }
+//   응답:      { ok, updated, ids }  (updated = 갱신된 행 수, ids = 갱신된 행의 id 배열)
+//   허용 update 컬럼: status, resolved_in_cycle, severity 만 (불변필드 보호)
+//   filter 안전장치: filter가 비어있으면 서버가 거부 (전체 갱신 사고 방지)
+async function updateGapLogStatus({ ids, status, resolved_in_cycle = "" }) {
   if (!Array.isArray(ids) || ids.length === 0) {
     throw new Error("ids 배열이 비어있음");
   }
@@ -4848,7 +4851,10 @@ async function updateGapLogStatus({ ids, status, closed_reason = "" }) {
     res = await fetch(url, {
       method: "POST",
       headers: { "Content-Type": "text/plain;charset=utf-8" },
-      body: JSON.stringify({ ids, status, closed_reason }),
+      body: JSON.stringify({
+        filter: { id: ids },                          // ★ Apps Script: filter.id 배열 허용
+        updates: { status, resolved_in_cycle },       // ★ Apps Script: 허용 컬럼만
+      }),
       redirect: "follow",
     });
   } catch (e) {
@@ -4863,7 +4869,7 @@ async function updateGapLogStatus({ ids, status, closed_reason = "" }) {
   if (!result.ok) {
     throw new Error(`GapLog update 실패: ${result.error || "unknown"}`);
   }
-  return result;  // { ok: true, updatedCount: N, closed_at: "..." }
+  return result;  // { ok: true, updated: N, ids: [...] }
 }
 
 // ─── 큐 #15 Phase 5a: 누적 gap 패턴 분석 ─────────────────────────────────
@@ -5330,19 +5336,29 @@ export default function App() {
       // 2단계 — 실제 닫기 실행
       setCloseStatus(s => ({ ...s, [pid]: { stage: "closing" } }));
       try {
-        const reason = `[큐 #20 ${pid}] ${(pattern.title || "").slice(0, 80)}`;
-        const result = await updateGapLogStatus({ ids, status: "resolved", closed_reason: reason });
+        // ★ Apps Script resolved_in_cycle 컬럼에 들어갈 cycle 식별자
+        //   형식: cycle-q20-{pattern_id}-{YYYYMMDD} (예: cycle-q20-P6-20260530)
+        //   GapLog 시트에서 같은 cycle로 닫힌 gap들을 그룹핑하여 추적 가능
+        const ymd = new Date().toISOString().slice(0, 10).replace(/-/g, "");
+        const cycleTag = `cycle-q20-${pid}-${ymd}`;
+        const result = await updateGapLogStatus({
+          ids,
+          status: "resolved",
+          resolved_in_cycle: cycleTag,
+        });
         setCloseStatus(s => ({
           ...s,
           [pid]: {
             stage: "done",
             result: {
-              updatedCount: result.updatedCount || ids.length,
-              closed_at: result.closed_at || new Date().toISOString(),
+              updatedCount: result.updated || 0,           // ★ Apps Script: result.updated
+              updatedIds: result.ids || [],                // ★ Apps Script: 갱신된 id 배열
+              closed_at: new Date().toISOString(),         // 클라이언트 측 시각 (시트엔 별도 컬럼 없음)
+              resolved_in_cycle: cycleTag,                 // UI 표시용
             },
           },
         }));
-        console.log(`[큐 #20] ✅ 패턴 "${pid}" gap ${result.updatedCount || ids.length}건 closed`);
+        console.log(`[큐 #20] ✅ 패턴 "${pid}" gap ${result.updated}건 closed (cycle: ${cycleTag})`);
         // 배지 카운트 재계산 (open gap 줄었을 테니)
         try { await refreshUpdateBadge(); } catch (_) {}
       } catch (e) {
@@ -8189,10 +8205,17 @@ ${userText}
                                       </span>
                                     )}
                                     {cs.stage === "done" && (
-                                      <span style={{fontSize:10, color:"#34d399", fontWeight:700}}>
-                                        ✅ {cs.result?.updatedCount || idsCount}건 closed
-                                        {cs.result?.closed_at && ` · ${new Date(cs.result.closed_at).toLocaleString("ko-KR", { month:"2-digit", day:"2-digit", hour:"2-digit", minute:"2-digit" })}`}
-                                      </span>
+                                      <div style={{display:"flex", flexDirection:"column", gap:2}}>
+                                        <span style={{fontSize:10, color:"#34d399", fontWeight:700}}>
+                                          ✅ {cs.result?.updatedCount || idsCount}건 closed
+                                          {cs.result?.closed_at && ` · ${new Date(cs.result.closed_at).toLocaleString("ko-KR", { month:"2-digit", day:"2-digit", hour:"2-digit", minute:"2-digit" })}`}
+                                        </span>
+                                        {cs.result?.resolved_in_cycle && (
+                                          <span style={{fontSize:9, color:"#94a3b8", fontFamily:"monospace"}}>
+                                            🏷️ {cs.result.resolved_in_cycle}
+                                          </span>
+                                        )}
+                                      </div>
                                     )}
                                     {cs.stage === "error" && (
                                       <>

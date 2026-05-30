@@ -317,18 +317,21 @@ const PROCESSES = {
   Cell: {
     label: "Cell 공정",
     icon: "🔵",
-    auto: ["Cell_PE", "Cell_ME", "Cell_TE", "Cell_PLC"],
+    // ★ 큐 #21: PLC 자동참여 제거 — Cell_PLC는 PLC 그룹에서 수동 선택
+    auto: ["Cell_PE", "Cell_ME", "Cell_TE"],
     otherProcess: "Elec",
   },
   Elec: {
     label: "Elec 공정",
     icon: "🔷",
-    auto: ["Elec_PE", "Elec_ME", "Elec_TE", "Elec_PLC"],
+    // ★ 큐 #21: PLC 자동참여 제거 — Elec_PLC는 PLC 그룹에서 수동 선택
+    auto: ["Elec_PE", "Elec_ME", "Elec_TE"],
     otherProcess: "Cell",
   },
 };
 
-const COMMON_AGENTS = ["FA", "Vision", "FA_PLC"];
+const COMMON_AGENTS = ["FA", "Vision"];  // ★ 큐 #21: FA_PLC 이동 — PLC 그룹에서 관리
+const PLC_AGENTS = ["Cell_PLC", "Elec_PLC", "FA_PLC"];  // ★ 큐 #21: PLC 그룹 (수동 선택)
 
 // 공장 운영 철학 (모든 페르소나 공통)
 const FACTORY_PHILOSOPHY = `
@@ -5138,8 +5141,11 @@ export default function App() {
   const [patternsLastRunAt, setPatternsLastRunAt] = useState(0);  // 쿨다운 추적 (Date.now())
   // ★ 큐 #20: 패턴별 gap 닫기 상태 — { [pattern_id]: {stage:"idle"|"confirming"|"closing"|"done"|"error", result?, error?} }
   const [closeStatus, setCloseStatus] = useState({});
-  // ★ 큐 #20: 분석 대상 일자 필터 (콤마 구분, 기본값 = 오늘 기준 최근 7일, "all"이면 전체)
-  const [patternsDateFilter, setPatternsDateFilter] = useState(() => {
+  // ★ 큐 #21: 일자 필터를 캡슐 칩으로 (메모리 #18 합의 스펙)
+  //   - patternsDateChips: 선택된 일자 배열 (기본 = 오늘 기준 최근 7일)
+  //   - patternsAddInput: '+ 일자 추가' 보조 인풋의 임시 값
+  //   - patternsUseAll: '🌐 전체 분석' 토글 (true면 chips 무시하고 전체 gap 분석)
+  const [patternsDateChips, setPatternsDateChips] = useState(() => {
     const today = new Date();
     const dates = [];
     for (let i = 6; i >= 0; i--) {
@@ -5147,8 +5153,10 @@ export default function App() {
       d.setDate(d.getDate() - i);
       dates.push(`${d.getFullYear()}-${String(d.getMonth()+1).padStart(2,"0")}-${String(d.getDate()).padStart(2,"0")}`);
     }
-    return dates.join(", ");
+    return dates;
   });
+  const [patternsAddInput, setPatternsAddInput] = useState("");
+  const [patternsUseAll, setPatternsUseAll] = useState(false);
   // ★ 공정/추가 에이전트 선택 state
   const [selectedProcess, setSelectedProcess] = useState("Cell");
   const [extraAgents, setExtraAgents] = useState([]);
@@ -5293,12 +5301,14 @@ export default function App() {
     setPatternsLoading(true);
     setPatternsExpanded(true);
     try {
-      // ★ 큐 #20: dateFilter 파싱 (콤마 구분, "all"/빈 문자열이면 미적용 = 전체 분석)
-      const trimmed = (patternsDateFilter || "").trim();
+      // ★ 큐 #21: dateFilter 결정 — useAll이면 null(전체), 아니면 chips 배열 그대로
+      //   가드: useAll이 false인데 chips가 비어있으면 진입 안 됨 (UI에서 버튼 비활성)
       let dateFilter = null;
-      if (trimmed && trimmed.toLowerCase() !== "all") {
-        dateFilter = trimmed.split(",").map(s => s.trim()).filter(Boolean);
-        if (dateFilter.length === 0) dateFilter = null;
+      if (!patternsUseAll) {
+        if (patternsDateChips.length === 0) {
+          throw new Error("분석할 일자가 없습니다 — 일자 칩 추가 또는 '🌐 전체 분석' 토글");
+        }
+        dateFilter = patternsDateChips;
       }
       const result = await analyzeGapPatterns({ status: "open" }, { dateFilter });
       setPatternsResult(result);
@@ -7439,7 +7449,7 @@ ${userText}
     setPatternsResult(null); setPatternsLoading(false);
     setPatternsExpanded(false); setPatternsLastRunAt(0);
     setCloseStatus({});  // ★ 큐 #20: gap 닫기 진행 상태 초기화
-    // patternsDateFilter는 초기값(최근 7일) 자동 복원 — reset 직후 다시 분석할 때 편의
+    // ★ 큐 #21: 칩/인풋/전체 토글도 초기값으로 복원 (reset 직후 다시 분석할 때 편의)
     {
       const today = new Date();
       const dates = [];
@@ -7448,7 +7458,9 @@ ${userText}
         d.setDate(d.getDate() - i);
         dates.push(`${d.getFullYear()}-${String(d.getMonth()+1).padStart(2,"0")}-${String(d.getDate()).padStart(2,"0")}`);
       }
-      setPatternsDateFilter(dates.join(", "));
+      setPatternsDateChips(dates);
+      setPatternsAddInput("");
+      setPatternsUseAll(false);
     }
     // ★ 12-AZ-6: messages 탭 모드 + STEP 1 자동 진입
     handleEnterTabMode();
@@ -7767,6 +7779,41 @@ ${userText}
                 </div>
               </div>
 
+              {/* ★ 큐 #21: PLC 분석 그룹 (자동참여 → 수동 선택으로 변경, 기본 체크 해제) */}
+              <div style={{marginTop:10}}>
+                <div style={{fontSize:9,color:"#64748b",fontWeight:700,marginBottom:6}}>
+                  ── PLC 분석 (선택 시 참여)
+                </div>
+                <div style={{display:"flex",gap:6,flexWrap:"wrap"}}>
+                  {PLC_AGENTS.map(code => {
+                    const p = PERSONAS[code];
+                    const checked = extraAgents.includes(code);
+                    return (
+                      <label key={code} style={{
+                        fontSize:11, padding:"4px 10px",
+                        background: checked ? p.bg : "rgba(15,23,42,0.4)",
+                        color: checked ? p.color : "#64748b",
+                        border:`1px solid ${checked ? p.color : "rgba(51,65,85,0.5)"}`,
+                        borderRadius:14, cursor:"pointer", fontWeight: checked ? 700 : 400,
+                        display:"flex", alignItems:"center", gap:5,
+                      }}>
+                        <input
+                          type="checkbox"
+                          checked={checked}
+                          onChange={() => {
+                            setExtraAgents(prev =>
+                              checked ? prev.filter(a => a !== code) : [...prev, code]
+                            );
+                          }}
+                          style={{margin:0, cursor:"pointer"}}
+                        />
+                        {p.icon} {p.label}
+                      </label>
+                    );
+                  })}
+                </div>
+              </div>
+
               <div style={{fontSize:9,color:"#475569",marginTop:8,lineHeight:1.5}}>
                 💡 추가한 에이전트는 모든 DEEP/STANDARD 이슈에 참여합니다. (LITE는 사회자 단독)
               </div>
@@ -7984,34 +8031,124 @@ ${userText}
             {/* ★ 큐 #20 Phase 5a UI: 패턴 분석 버튼 + in-place 패널 */}
             {updateReady && updateReady.ready && (
               <div style={{marginBottom:14}}>
-                {/* ★ 큐 #20: 분석 대상 일자 필터 인풋 */}
+                {/* ★ 큐 #21: 칩 UI — 캡슐 + 우측 ❌ + 일자 추가 + 전체 분석 토글 */}
                 <div style={{
-                  display:"flex", gap:6, marginBottom:6, alignItems:"center", flexWrap:"wrap",
+                  fontSize:10, color:"#a78bfa", fontWeight:700, marginBottom:6,
+                  display:"flex", alignItems:"center", justifyContent:"space-between", gap:8, flexWrap:"wrap",
                 }}>
-                  <label style={{fontSize:10, color:"#a78bfa", fontWeight:700, flexShrink:0}}>
-                    📅 분석 대상 일자:
+                  <span>📅 분석 대상 일자 {patternsUseAll ? "(전체 모드 — 칩 무시)" : `(${patternsDateChips.length}개 선택, ❌ 탭하여 제거)`}</span>
+                  <label style={{
+                    fontSize:9, color: patternsUseAll ? "#34d399" : "#64748b", cursor:"pointer",
+                    display:"flex", alignItems:"center", gap:4, fontWeight:600,
+                  }}>
+                    <input
+                      type="checkbox"
+                      checked={patternsUseAll}
+                      onChange={(e) => setPatternsUseAll(e.target.checked)}
+                      disabled={patternsLoading}
+                      style={{margin:0, cursor:"pointer"}}
+                    />
+                    🌐 전체 분석으로 전환
                   </label>
+                </div>
+
+                {/* 칩 영역 */}
+                <div style={{
+                  display:"flex", gap:6, flexWrap:"wrap",
+                  padding:"8px 10px", marginBottom:6,
+                  background:"rgba(15,23,42,0.4)",
+                  border:`1px solid ${patternsDateChips.length === 0 && !patternsUseAll ? "rgba(245,158,11,0.5)" : "rgba(124,58,237,0.25)"}`,
+                  borderRadius:6, minHeight:36, alignItems:"center",
+                  opacity: patternsUseAll ? 0.4 : 1,
+                  transition: "opacity 0.2s",
+                }}>
+                  {patternsDateChips.length === 0 ? (
+                    <span style={{fontSize:10, color: patternsUseAll ? "#64748b" : "#fbbf24"}}>
+                      {patternsUseAll
+                        ? "전체 분석 모드 — 누적 open gap 전부 분석"
+                        : "⚠️ 분석할 일자가 없습니다 — 아래 인풋으로 일자 추가 또는 전체 분석으로 전환"}
+                    </span>
+                  ) : (
+                    [...patternsDateChips].sort().map(d => (
+                      <span key={d} style={{
+                        display:"inline-flex", alignItems:"center", gap:4,
+                        padding:"3px 4px 3px 10px", fontSize:10, fontFamily:"monospace",
+                        background:"rgba(124,58,237,0.18)", color:"#c4b5fd",
+                        border:"1px solid rgba(124,58,237,0.35)", borderRadius:14,
+                        fontWeight:600,
+                      }}>
+                        {d}
+                        <button
+                          onClick={() => setPatternsDateChips(prev => prev.filter(x => x !== d))}
+                          disabled={patternsLoading || patternsUseAll}
+                          title="이 일자 제거"
+                          style={{
+                            width:18, height:18, padding:0, marginLeft:2,
+                            background:"rgba(0,0,0,0.2)", color:"#c4b5fd",
+                            border:"none", borderRadius:9,
+                            cursor: (patternsLoading || patternsUseAll) ? "default" : "pointer",
+                            fontSize:11, lineHeight:"18px", fontWeight:700,
+                          }}
+                        >×</button>
+                      </span>
+                    ))
+                  )}
+                </div>
+
+                {/* + 일자 추가 인풋 */}
+                <div style={{
+                  display:"flex", gap:6, marginBottom:10, alignItems:"center",
+                  opacity: patternsUseAll ? 0.4 : 1,
+                }}>
                   <input
                     type="text"
-                    value={patternsDateFilter}
-                    onChange={(e) => setPatternsDateFilter(e.target.value)}
-                    placeholder="2026-05-25, 2026-05-26, 2026-05-28 (또는 'all' = 전체)"
-                    disabled={patternsLoading}
+                    value={patternsAddInput}
+                    onChange={(e) => setPatternsAddInput(e.target.value)}
+                    onKeyDown={(e) => {
+                      if (e.key === "Enter") {
+                        e.preventDefault();
+                        const v = patternsAddInput.trim();
+                        if (/^\d{4}-\d{2}-\d{2}$/.test(v) && !patternsDateChips.includes(v)) {
+                          setPatternsDateChips(prev => [...prev, v]);
+                          setPatternsAddInput("");
+                        }
+                      }
+                    }}
+                    placeholder="YYYY-MM-DD (예: 2026-05-19)"
+                    disabled={patternsLoading || patternsUseAll}
                     style={{
-                      flex:1, minWidth:200, padding:"5px 8px", fontSize:10,
+                      flex:1, padding:"5px 8px", fontSize:10,
                       background:"rgba(15,23,42,0.6)", border:"1px solid rgba(124,58,237,0.3)",
                       borderRadius:5, color:"#cbd5e1", fontFamily:"monospace",
                     }}
                   />
-                </div>
-                <div style={{fontSize:9, color:"#64748b", marginBottom:10, lineHeight:1.5, paddingLeft:6}}>
-                  ※ YYYY-MM-DD 형식 콤마 구분 · 기본값: 오늘 기준 최근 7일 · 'all' 입력 시 전체 gap 분석
+                  <button
+                    onClick={() => {
+                      const v = patternsAddInput.trim();
+                      if (/^\d{4}-\d{2}-\d{2}$/.test(v) && !patternsDateChips.includes(v)) {
+                        setPatternsDateChips(prev => [...prev, v]);
+                        setPatternsAddInput("");
+                      }
+                    }}
+                    disabled={patternsLoading || patternsUseAll || !/^\d{4}-\d{2}-\d{2}$/.test(patternsAddInput.trim()) || patternsDateChips.includes(patternsAddInput.trim())}
+                    style={{
+                      padding:"5px 12px", fontSize:10,
+                      background:"rgba(124,58,237,0.15)", border:"1px solid rgba(124,58,237,0.4)",
+                      borderRadius:5, color:"#c4b5fd", cursor:"pointer", fontWeight:700,
+                      whiteSpace:"nowrap",
+                    }}
+                  >+ 일자 추가</button>
                 </div>
 
                 <div style={{display:"flex", gap:8, marginBottom: patternsExpanded ? 10 : 0}}>
-                  <button onClick={()=>runPatternAnalysis()} disabled={patternsLoading} style={{
+                  <button
+                    onClick={()=>runPatternAnalysis()}
+                    disabled={patternsLoading || (!patternsUseAll && patternsDateChips.length === 0)}
+                    style={{
                     flex:1, padding:"9px 14px",
-                    background: patternsLoading ? "rgba(100,116,139,0.4)" : "linear-gradient(135deg,#7c3aed,#a78bfa)",
+                    background: patternsLoading ? "rgba(100,116,139,0.4)"
+                              : (!patternsUseAll && patternsDateChips.length === 0) ? "rgba(100,116,139,0.3)"
+                              : "linear-gradient(135deg,#7c3aed,#a78bfa)",
                     border:"none", borderRadius:7, color:"#fff",
                     fontSize:12, fontWeight:800,
                     cursor: patternsLoading ? "wait" : "pointer",

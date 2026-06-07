@@ -7,6 +7,24 @@ const APPS_SCRIPT_URL = "https://script.google.com/macros/s/AKfycbwE9ZyopUTxEEXp
 const WHAPI_APPS_SCRIPT_URL = "https://script.google.com/macros/s/AKfycbxx_VojUcIZCyNlk6hfsaJf0IBmli2JJ4NF5jBHvBqpM0pIqNmN3dx4X4PDXW_pQNsfHA/exec";
 const MAX_ISSUES = 10;
 
+// ─── 큐 #22 Phase B-1: 모듈 레벨 인증 토큰 (모든 Apps Script 호출에 자동 첨부) ───
+// App 컴포넌트에서 setCurrentIdToken(token)으로 갱신
+// 모듈 레벨 fetch 함수(saveToSheets/loadKnowledge/appendGapLogRow/...)에서 _currentIdToken 직접 참조
+let _currentIdToken = "";
+function setCurrentIdToken(t) { _currentIdToken = t || ""; }
+function getCurrentIdToken() { return _currentIdToken; }
+
+// body가 있는 POST 호출에 id_token 자동 첨부 (JSON.stringify 전 객체 단계에서 주입)
+function withAuthBody(payload) {
+  return Object.assign({}, payload || {}, {
+    id_token: _currentIdToken || "",
+  });
+}
+// URL 쿼리스트링용 id_token 파라미터 (GET 호출용)
+function authQueryParam() {
+  return _currentIdToken ? `&id_token=${encodeURIComponent(_currentIdToken)}` : "";
+}
+
 // ─── 보고서 종류 ───────────────────────────────────────────────────────────────
 const REPORT_TYPES = [
   { id:"daily",   icon:"📋", label:"일일 생산 보고서",  desc:"당일 생산 실적·이슈·KPI 요약" },
@@ -356,7 +374,7 @@ async function saveToSheets(data) {
     await fetch(APPS_SCRIPT_URL, {
       method: "POST", mode: "no-cors",
       headers: { "Content-Type": "text/plain" },
-      body: JSON.stringify({ action: "save_minutes", ...data }),
+      body: JSON.stringify(withAuthBody({ action: "save_minutes", ...data })),
     });
     return true;
   } catch { return false; }
@@ -364,7 +382,7 @@ async function saveToSheets(data) {
 
 async function loadKnowledge(role) {
   try {
-    const res = await fetch(`${APPS_SCRIPT_URL}?action=get_knowledge&role=${role}`);
+    const res = await fetch(`${APPS_SCRIPT_URL}?action=get_knowledge&role=${role}${authQueryParam()}`);
     const data = await res.json();
     return data.success ? data.data.map(k => `[${k.category}] ${k.content}`).join("\n") : "";
   } catch { return ""; }
@@ -930,7 +948,8 @@ async function fetchMessagesFromTab(startDate, endDate, chatName) {
   });
   if (chatName) params.set("chatName", chatName);
 
-  const url = `${WHAPI_APPS_SCRIPT_URL}?${params.toString()}`;
+  // ★ 큐 #22: id_token URL 쿼리 자동 첨부 (Phase B-2 게이트 활성화 시 검증)
+  const url = `${WHAPI_APPS_SCRIPT_URL}?${params.toString()}${authQueryParam()}`;
   console.log(`[12-AZ] messages 탭 조회 시작: ${startDate} ~ ${endDate} (${chatName || "전체"})`);
 
   // ★ 영역 12-BK: 45초 timeout (응답 없을 때 무한 대기 방지)
@@ -4632,7 +4651,7 @@ async function appendGapLogRow(gapData) {
       method: "POST",
       // ★ Apps Script CORS 회피: text/plain으로 preflight 우회 (서버는 e.postData.contents 그대로 JSON.parse)
       headers: { "Content-Type": "text/plain;charset=utf-8" },
-      body: JSON.stringify({ data: gapData }),
+      body: JSON.stringify(withAuthBody({ data: gapData })),
       redirect: "follow",
     });
   } catch (e) {
@@ -4814,7 +4833,7 @@ async function fetchGapLogList(filter = {}) {
     res = await fetch(url, {
       method: "POST",
       headers: { "Content-Type": "text/plain;charset=utf-8" },
-      body: JSON.stringify({ filter }),
+      body: JSON.stringify(withAuthBody({ filter })),
       redirect: "follow",
     });
   } catch (e) {
@@ -4854,10 +4873,10 @@ async function updateGapLogStatus({ ids, status, resolved_in_cycle = "" }) {
     res = await fetch(url, {
       method: "POST",
       headers: { "Content-Type": "text/plain;charset=utf-8" },
-      body: JSON.stringify({
+      body: JSON.stringify(withAuthBody({
         filter: { id: ids },                          // ★ Apps Script: filter.id 배열 허용
         updates: { status, resolved_in_cycle },       // ★ Apps Script: 허용 컬럼만
-      }),
+      })),
       redirect: "follow",
     });
   } catch (e) {
@@ -5108,6 +5127,136 @@ const MODE_STYLE = {
 
 // ─── 메인 앱 ──────────────────────────────────────────────────────────────────
 export default function App() {
+  // ─── 큐 #22 Phase B-1: Google OAuth 인증 state ───
+  // authStatus: 'loading' (초기 마운트) | 'unauthenticated' (로그인 필요)
+  //           | 'authenticated' (로그인 완료, 정상 진입)
+  //           | 'forbidden' (백엔드 401/403, 미등록 또는 apps 미허용)
+  const [authStatus, setAuthStatus] = useState("loading");
+  const [authIdToken, setAuthIdToken] = useState("");
+  const [authUserEmail, setAuthUserEmail] = useState("");
+  const [authUserName, setAuthUserName] = useState("");
+  const [authError, setAuthError] = useState("");
+  const [authExpiresAt, setAuthExpiresAt] = useState(0);  // ms epoch — 토큰 exp(초) × 1000
+
+  // 토큰 갱신 시 모듈 레벨에도 반영 (모든 fetch 함수가 사용)
+  useEffect(() => { setCurrentIdToken(authIdToken); }, [authIdToken]);
+
+  // ─── 마운트 시 localStorage 복원 + 토큰 만료 확인 ───
+  useEffect(() => {
+    try {
+      const saved = localStorage.getItem("azs_auth_v1");
+      if (!saved) { setAuthStatus("unauthenticated"); return; }
+      const obj = JSON.parse(saved);
+      if (!obj || !obj.idToken || !obj.expiresAt) { setAuthStatus("unauthenticated"); return; }
+      if (Date.now() >= obj.expiresAt) {
+        // 만료됨 — localStorage 클리어 후 재로그인
+        console.log("[큐 #22] 저장된 토큰 만료 — 재로그인 필요");
+        localStorage.removeItem("azs_auth_v1");
+        setAuthStatus("unauthenticated");
+        return;
+      }
+      // 유효 — state 복원
+      setAuthIdToken(obj.idToken);
+      setAuthUserEmail(obj.email || "");
+      setAuthUserName(obj.name || "");
+      setAuthExpiresAt(obj.expiresAt);
+      setAuthStatus("authenticated");
+      console.log(`[큐 #22] 저장된 토큰 복원: ${obj.email} (만료까지 ${Math.round((obj.expiresAt - Date.now())/60000)}분)`);
+    } catch (e) {
+      console.error("[큐 #22] localStorage 복원 실패:", e);
+      setAuthStatus("unauthenticated");
+    }
+  }, []);
+
+  // ─── Google Identity Services 콜백 (window.handleGoogleLogin로 노출) ───
+  const handleGoogleLogin = (credentialResponse) => {
+    try {
+      const idToken = credentialResponse?.credential;
+      if (!idToken) {
+        setAuthError("Google 응답에 토큰 없음");
+        return;
+      }
+      // JWT payload 디코딩 (검증은 Apps Script가 함 — 여기선 만료/이름만 추출)
+      const parts = idToken.split(".");
+      if (parts.length !== 3) {
+        setAuthError("올바르지 않은 토큰 형식");
+        return;
+      }
+      const payload = JSON.parse(atob(parts[1].replace(/-/g, "+").replace(/_/g, "/")));
+      const email = String(payload.email || "").toLowerCase();
+      const name = payload.name || "";
+      const expMs = (parseInt(payload.exp, 10) || 0) * 1000;
+
+      if (!email || !expMs || Date.now() >= expMs) {
+        setAuthError("토큰 만료 또는 이메일 없음");
+        return;
+      }
+
+      setAuthIdToken(idToken);
+      setAuthUserEmail(email);
+      setAuthUserName(name);
+      setAuthExpiresAt(expMs);
+      setAuthStatus("authenticated");
+      setAuthError("");
+      // localStorage 저장
+      localStorage.setItem("azs_auth_v1", JSON.stringify({
+        idToken, email, name, expiresAt: expMs,
+      }));
+      console.log(`[큐 #22] ✅ 로그인 성공: ${email} (만료: ${new Date(expMs).toLocaleString("ko-KR")})`);
+
+      // Audit 적재 (모듈 레벨 변수 반영 후 호출 — 한 틱 대기)
+      setTimeout(() => {
+        fetch(`${WHAPI_APPS_SCRIPT_URL}?action=discussion_login`, {
+          method: "POST",
+          headers: { "Content-Type": "text/plain;charset=utf-8" },
+          body: JSON.stringify({ id_token: idToken, _meta: { name, email } }),
+        }).catch(e => console.warn("[큐 #22] discussion_login audit 실패:", e?.message));
+      }, 100);
+    } catch (e) {
+      console.error("[큐 #22] handleGoogleLogin 예외:", e);
+      setAuthError(e?.message || "로그인 처리 실패");
+    }
+  };
+
+  // ─── 로그아웃 ───
+  const handleLogout = () => {
+    const email = authUserEmail;
+    const token = authIdToken;
+    // Audit 적재 (state 클리어 전에 호출)
+    if (token && email) {
+      fetch(`${WHAPI_APPS_SCRIPT_URL}?action=discussion_logout`, {
+        method: "POST",
+        headers: { "Content-Type": "text/plain;charset=utf-8" },
+        body: JSON.stringify({ id_token: token, _meta: { email } }),
+      }).catch(e => console.warn("[큐 #22] discussion_logout audit 실패:", e?.message));
+    }
+    localStorage.removeItem("azs_auth_v1");
+    setAuthIdToken(""); setAuthUserEmail(""); setAuthUserName("");
+    setAuthExpiresAt(0); setAuthError("");
+    setAuthStatus("unauthenticated");
+    console.log("[큐 #22] 로그아웃 완료");
+  };
+
+  // ─── 백엔드 401/403 응답 시 호출 (미등록 또는 apps 미허용) ───
+  // 추후 모든 fetch 호출의 결과 처리에서 사용 가능
+  const handleAuthDeny = (reason) => {
+    setAuthError(reason || "접근 권한 없음");
+    setAuthStatus("forbidden");
+  };
+
+  // window에 노출 — GIS 버튼 콜백 + 디버깅용
+  useEffect(() => {
+    window.handleGoogleLogin = handleGoogleLogin;
+    window.azsAuthLogout = handleLogout;
+    window.azsAuthState = () => ({ authStatus, email: authUserEmail, expiresAt: authExpiresAt });
+    return () => {
+      delete window.handleGoogleLogin;
+      delete window.azsAuthLogout;
+      delete window.azsAuthState;
+    };
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [authStatus, authIdToken, authUserEmail, authExpiresAt]);
+
   const [step, setStep]           = useState(1);  // ★ 12-AZ-6: 첫 페이지를 STEP 1 (날짜 선택)으로
   const [allMsgs, setAllMsgs]     = useState([]);
   const [dates, setDates]         = useState([]);
@@ -6134,7 +6283,7 @@ ${sorted.map((p,i) => `
         method: "POST",
         // Apps Script Web App: text/plain로 전송 (CORS preflight 우회)
         headers: { "Content-Type": "text/plain;charset=utf-8" },
-        body: JSON.stringify(payload),
+        body: JSON.stringify(withAuthBody(payload)),
       });
       const data = await res.json().catch(() => ({}));
       if (res.ok && data.ok) {
@@ -7466,6 +7615,31 @@ ${userText}
     handleEnterTabMode();
   };
 
+  // ─── 큐 #22 Phase B-1: 인증 분기 (authenticated 외 모두 별도 화면) ───
+  if (authStatus === "loading") {
+    return (
+      <div style={{
+        minHeight:"100vh", display:"flex", alignItems:"center", justifyContent:"center",
+        background:"linear-gradient(150deg,#03060d,#060d1c 55%,#040810)",
+        color:"#94a3b8", fontFamily:"'Noto Sans KR','Malgun Gothic',sans-serif",
+      }}>
+        <div style={{textAlign:"center"}}>
+          <div style={{fontSize:14, marginBottom:8}}>인증 상태 확인 중...</div>
+          <Spinner/>
+        </div>
+      </div>
+    );
+  }
+
+  if (authStatus === "unauthenticated") {
+    return <LoginScreen authError={authError} />;
+  }
+
+  if (authStatus === "forbidden") {
+    return <ForbiddenScreen email={authUserEmail} reason={authError} onLogout={handleLogout} />;
+  }
+
+  // 이하 인증 통과 — 기존 UI 진입
   return (
     <div style={{
       minHeight:"100vh",
@@ -7495,6 +7669,22 @@ ${userText}
             borderRadius:6, color:"#64748b", fontSize:11, cursor:"pointer",
           }}>처음으로</button>
         )}
+        {/* ★ 큐 #22: 우측 상단 사용자 정보 + 로그아웃 */}
+        <div style={{
+          marginLeft: step > 0 ? 6 : "auto",
+          display:"flex", alignItems:"center", gap:6,
+          fontSize:10, color:"#94a3b8",
+        }}>
+          <div style={{display:"flex", flexDirection:"column", alignItems:"flex-end", lineHeight:1.3}}>
+            <span style={{color:"#cbd5e1", fontWeight:700}}>{authUserName || authUserEmail.split("@")[0]}</span>
+            <span style={{fontSize:9, color:"#64748b"}}>{authUserEmail}</span>
+          </div>
+          <button onClick={handleLogout} style={{
+            padding:"4px 10px", fontSize:10,
+            background:"rgba(239,68,68,0.08)", border:"1px solid rgba(239,68,68,0.3)",
+            borderRadius:5, color:"#fca5a5", cursor:"pointer", fontWeight:700,
+          }} title="로그아웃">로그아웃</button>
+        </div>
       </div>
 
       <StepBar step={step}/>
@@ -10742,6 +10932,185 @@ function DetailRow({ label, value, highlight }) {
         {highlight && "★ "}{label}
       </span>
       <span style={{fontSize:10,color:"#cbd5e1"}}>{value || "-"}</span>
+    </div>
+  );
+}
+
+// ─── 큐 #22 Phase B-1: 로그인 화면 ────────────────────────────────────────────
+// Google Identity Services(GIS) 동적 로드 (index.html 수정 불필요).
+// 컴포넌트 마운트 시 자동으로 https://accounts.google.com/gsi/client 스크립트 추가.
+// OAuth Client ID는 plc-drive(-poc) 프로젝트 (학습앱과 공유):
+//   830951335500-mr71tivgr98at2ovvqcv16rdd8gvbi9n.apps.googleusercontent.com
+function LoginScreen({ authError }) {
+  const btnRef = useRef(null);
+  const [gisLoaded, setGisLoaded] = useState(false);
+  const [renderError, setRenderError] = useState("");
+
+  useEffect(() => {
+    // ★ 큐 #22: GIS 스크립트 동적 로드 (index.html 수정 불필요)
+    // 이미 로드돼 있으면 추가 안 함, 없으면 head에 script 태그 삽입
+    if (!document.querySelector('script[src*="accounts.google.com/gsi/client"]')) {
+      const script = document.createElement("script");
+      script.src = "https://accounts.google.com/gsi/client";
+      script.async = true;
+      script.defer = true;
+      document.head.appendChild(script);
+    }
+
+    const tryRender = () => {
+      if (!window.google || !window.google.accounts || !window.google.accounts.id) {
+        return false;
+      }
+      try {
+        window.google.accounts.id.initialize({
+          client_id: "830951335500-mr71tivgr98at2ovvqcv16rdd8gvbi9n.apps.googleusercontent.com",
+          callback: (resp) => window.handleGoogleLogin && window.handleGoogleLogin(resp),
+          auto_select: false,
+          cancel_on_tap_outside: false,
+        });
+        if (btnRef.current) {
+          window.google.accounts.id.renderButton(btnRef.current, {
+            theme: "filled_black",
+            size: "large",
+            type: "standard",
+            text: "signin_with",
+            shape: "rectangular",
+            logo_alignment: "left",
+            width: 280,
+          });
+        }
+        setGisLoaded(true);
+        return true;
+      } catch (e) {
+        setRenderError(e?.message || "GIS 초기화 실패");
+        return false;
+      }
+    };
+
+    if (tryRender()) return;
+    // GIS 스크립트 로드 대기 (최대 10초 폴링)
+    const interval = setInterval(() => {
+      if (tryRender()) clearInterval(interval);
+    }, 300);
+    const timeout = setTimeout(() => {
+      clearInterval(interval);
+      if (!window.google) {
+        setRenderError("Google Identity Services 스크립트 로드 실패 — 네트워크 연결을 확인하세요");
+      }
+    }, 10000);
+
+    return () => { clearInterval(interval); clearTimeout(timeout); };
+  }, []);
+
+  return (
+    <div style={{
+      minHeight:"100vh", display:"flex", alignItems:"center", justifyContent:"center",
+      background:"linear-gradient(150deg,#03060d,#060d1c 55%,#040810)",
+      fontFamily:"'Noto Sans KR','Malgun Gothic',sans-serif", color:"#e2e8f0",
+      padding:"20px",
+    }}>
+      <div style={{
+        maxWidth:420, width:"100%",
+        background:"rgba(15,23,42,0.6)", border:"1px solid rgba(34,211,238,0.18)",
+        borderRadius:12, padding:"32px 28px", textAlign:"center",
+      }}>
+        {/* 로고 */}
+        <div style={{
+          width:60, height:60, margin:"0 auto 18px", borderRadius:14,
+          background:"linear-gradient(135deg,#3b82f6,#22d3ee)",
+          display:"flex", alignItems:"center", justifyContent:"center", fontSize:30,
+        }}>🏭</div>
+
+        <div style={{fontSize:18, fontWeight:800, color:"#f1f5f9", marginBottom:6}}>
+          AZS 논의 시스템
+        </div>
+        <div style={{fontSize:11, color:"#22d3ee", letterSpacing:2, fontWeight:700, marginBottom:24}}>
+          Cell · Elec · FA · Vision
+        </div>
+
+        <div style={{fontSize:12, color:"#94a3b8", marginBottom:20, lineHeight:1.6}}>
+          접속하려면 Google 계정으로 로그인하세요.<br/>
+          <span style={{fontSize:10, color:"#64748b"}}>등록되지 않은 계정은 접근이 차단됩니다.</span>
+        </div>
+
+        {/* GIS 로그인 버튼이 여기에 렌더됨 */}
+        <div ref={btnRef} style={{display:"flex", justifyContent:"center", minHeight:50}}></div>
+
+        {!gisLoaded && !renderError && (
+          <div style={{fontSize:10, color:"#64748b", marginTop:14}}>
+            <Spinner/> Google 로그인 모듈 로드 중...
+          </div>
+        )}
+
+        {renderError && (
+          <div style={{
+            fontSize:10, color:"#fca5a5",
+            background:"rgba(239,68,68,0.08)", border:"1px solid rgba(239,68,68,0.3)",
+            borderRadius:6, padding:"8px 12px", marginTop:14,
+          }}>⚠️ {renderError}</div>
+        )}
+
+        {authError && (
+          <div style={{
+            fontSize:10, color:"#fbbf24",
+            background:"rgba(251,191,36,0.08)", border:"1px solid rgba(251,191,36,0.3)",
+            borderRadius:6, padding:"8px 12px", marginTop:14,
+          }}>{authError}</div>
+        )}
+
+        <div style={{fontSize:9, color:"#475569", marginTop:24, lineHeight:1.5}}>
+          HLI Green Power Indonesia · AZS Cell PE 도구<br/>
+          문의: 김지호 (potato2509@gmail.com)
+        </div>
+      </div>
+    </div>
+  );
+}
+
+// ─── 큐 #22 Phase B-1: 접근 거부 화면 (forbidden — 미등록 또는 apps 미허용) ──
+function ForbiddenScreen({ email, reason, onLogout }) {
+  const reasonText = {
+    "not_registered": "이 계정은 등록되지 않았습니다.",
+    "inactive": "이 계정은 비활성화 상태입니다.",
+    "discussion_not_allowed": "이 계정은 학습앱은 가능하지만 논의앱 접근 권한이 없습니다.",
+  }[reason] || reason || "접근 권한 없음";
+
+  return (
+    <div style={{
+      minHeight:"100vh", display:"flex", alignItems:"center", justifyContent:"center",
+      background:"linear-gradient(150deg,#03060d,#060d1c 55%,#040810)",
+      fontFamily:"'Noto Sans KR','Malgun Gothic',sans-serif", color:"#e2e8f0",
+      padding:"20px",
+    }}>
+      <div style={{
+        maxWidth:420, width:"100%",
+        background:"rgba(15,23,42,0.6)", border:"1px solid rgba(239,68,68,0.3)",
+        borderRadius:12, padding:"32px 28px", textAlign:"center",
+      }}>
+        <div style={{fontSize:38, marginBottom:16}}>🚫</div>
+        <div style={{fontSize:16, fontWeight:800, color:"#fca5a5", marginBottom:6}}>
+          접근 권한이 없습니다
+        </div>
+        <div style={{fontSize:11, color:"#94a3b8", marginBottom:18, fontFamily:"monospace"}}>
+          {email}
+        </div>
+        <div style={{
+          fontSize:12, color:"#cbd5e1", marginBottom:20, lineHeight:1.6,
+          background:"rgba(239,68,68,0.08)", border:"1px solid rgba(239,68,68,0.2)",
+          borderRadius:6, padding:"12px 16px",
+        }}>
+          {reasonText}
+        </div>
+        <div style={{fontSize:11, color:"#94a3b8", marginBottom:18, lineHeight:1.7}}>
+          이 시스템 사용을 원하시면 관리자에게 등록을 요청하세요.<br/>
+          <b style={{color:"#cbd5e1"}}>김지호 (potato2509@gmail.com)</b>
+        </div>
+        <button onClick={onLogout} style={{
+          padding:"8px 20px", fontSize:11,
+          background:"rgba(100,116,139,0.2)", border:"1px solid rgba(100,116,139,0.4)",
+          borderRadius:6, color:"#cbd5e1", cursor:"pointer", fontWeight:700,
+        }}>다른 계정으로 로그인</button>
+      </div>
     </div>
   );
 }

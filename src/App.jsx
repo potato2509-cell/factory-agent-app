@@ -10947,15 +10947,9 @@ function LoginScreen({ authError }) {
   const [renderError, setRenderError] = useState("");
 
   useEffect(() => {
-    // ★ 큐 #22: GIS 스크립트 동적 로드 (index.html 수정 불필요)
-    // 이미 로드돼 있으면 추가 안 함, 없으면 head에 script 태그 삽입
-    if (!document.querySelector('script[src*="accounts.google.com/gsi/client"]')) {
-      const script = document.createElement("script");
-      script.src = "https://accounts.google.com/gsi/client";
-      script.async = true;
-      script.defer = true;
-      document.head.appendChild(script);
-    }
+    const t0 = Date.now();
+    // ★ 큐 #22 핫픽스: 진단 정보 (실패 시 화면에 표시)
+    const diag = { scriptAdded: false, scriptLoaded: false, scriptError: false };
 
     const tryRender = () => {
       if (!window.google || !window.google.accounts || !window.google.accounts.id) {
@@ -10982,24 +10976,76 @@ function LoginScreen({ authError }) {
         setGisLoaded(true);
         return true;
       } catch (e) {
-        setRenderError(e?.message || "GIS 초기화 실패");
+        setRenderError("GIS 초기화 실패: " + (e?.message || "(unknown)"));
         return false;
       }
     };
 
+    // 이미 로드돼 있으면 즉시 렌더
     if (tryRender()) return;
-    // GIS 스크립트 로드 대기 (최대 10초 폴링)
+
+    // ★ 큐 #22 핫픽스: 스크립트 태그 + onload/onerror 이벤트 핸들러
+    let script = document.querySelector('script[src*="accounts.google.com/gsi/client"]');
+    if (!script) {
+      script = document.createElement("script");
+      script.src = "https://accounts.google.com/gsi/client";
+      script.async = true;
+      script.defer = true;
+      document.head.appendChild(script);
+    }
+    diag.scriptAdded = true;
+
+    const onLoadHandler = () => {
+      diag.scriptLoaded = true;
+      // onload 직후 google.accounts.id 준비 시간 100ms 여유 (드물게 race condition)
+      setTimeout(() => {
+        if (!tryRender()) {
+          const sec = Math.round((Date.now() - t0) / 1000);
+          setRenderError(
+            "GIS 스크립트는 로드됐지만 google.accounts.id 사용 불가 — " +
+            "브라우저 호환성 문제일 수 있습니다 (경과 " + sec + "초). " +
+            "Chrome 모바일 또는 PC 브라우저로 다시 시도해보세요."
+          );
+        }
+      }, 150);
+    };
+    const onErrorHandler = () => {
+      diag.scriptError = true;
+      const sec = Math.round((Date.now() - t0) / 1000);
+      setRenderError(
+        "GIS 스크립트 로드 실패 (경과 " + sec + "초) — " +
+        "광고 차단기, VPN, 또는 브라우저 보안 설정이 accounts.google.com을 차단했을 가능성. " +
+        "다른 브라우저(Chrome 등)로 시도해보세요."
+      );
+    };
+    script.addEventListener("load", onLoadHandler);
+    script.addEventListener("error", onErrorHandler);
+
+    // 폴링 (백업) — onload 이벤트가 발동 안 한 경우 대비
     const interval = setInterval(() => {
       if (tryRender()) clearInterval(interval);
     }, 300);
+    // ★ 큐 #22 핫픽스: timeout 10초 → 30초 (모바일 느린 환경 대응)
     const timeout = setTimeout(() => {
       clearInterval(interval);
-      if (!window.google) {
-        setRenderError("Google Identity Services 스크립트 로드 실패 — 네트워크 연결을 확인하세요");
+      if (!window.google && !diag.scriptError) {
+        setRenderError(
+          "Google Identity Services 로드 시간 초과 (30초) — " +
+          "script태그=" + (diag.scriptAdded ? "✓" : "✗") + " " +
+          "로드=" + (diag.scriptLoaded ? "✓" : "✗") + " " +
+          "google객체=✗. 네트워크 또는 브라우저 차단 가능성."
+        );
       }
-    }, 10000);
+    }, 30000);
 
-    return () => { clearInterval(interval); clearTimeout(timeout); };
+    return () => {
+      clearInterval(interval);
+      clearTimeout(timeout);
+      if (script) {
+        script.removeEventListener("load", onLoadHandler);
+        script.removeEventListener("error", onErrorHandler);
+      }
+    };
   }, []);
 
   return (

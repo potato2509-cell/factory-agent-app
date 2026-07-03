@@ -1,0 +1,11318 @@
+import { useState, useRef, useEffect } from "react";
+
+// ─── 설정 ─────────────────────────────────────────────────────────────────────
+const APPS_SCRIPT_URL = "https://script.google.com/macros/s/AKfycbwE9ZyopUTxEEXpt3UjWjfgDljEiGodgbunj_UnXYc-1RlrXgNiDzAiikXoEP4g9_E/exec";
+// ★ 영역 12-AZ: AZS_WhatsApp_Webhook 프로젝트 URL (messages 탭 자동연동 데이터 조회용)
+// 위 APPS_SCRIPT_URL과는 별도 프로젝트 (역할 분리: KB/큐레이션 vs Whapi/messages)
+const WHAPI_APPS_SCRIPT_URL = "https://script.google.com/macros/s/AKfycbxx_VojUcIZCyNlk6hfsaJf0IBmli2JJ4NF5jBHvBqpM0pIqNmN3dx4X4PDXW_pQNsfHA/exec";
+const MAX_ISSUES = 10;
+
+// ─── 큐 #22 Phase B-1: 모듈 레벨 인증 토큰 (모든 Apps Script 호출에 자동 첨부) ───
+// App 컴포넌트에서 setCurrentIdToken(token)으로 갱신
+// 모듈 레벨 fetch 함수(saveToSheets/loadKnowledge/appendGapLogRow/...)에서 _currentIdToken 직접 참조
+let _currentIdToken = "";
+function setCurrentIdToken(t) { _currentIdToken = t || ""; }
+function getCurrentIdToken() { return _currentIdToken; }
+
+// body가 있는 POST 호출에 id_token 자동 첨부 (JSON.stringify 전 객체 단계에서 주입)
+function withAuthBody(payload) {
+  return Object.assign({}, payload || {}, {
+    id_token: _currentIdToken || "",
+  });
+}
+// URL 쿼리스트링용 id_token 파라미터 (GET 호출용)
+function authQueryParam() {
+  return _currentIdToken ? `&id_token=${encodeURIComponent(_currentIdToken)}` : "";
+}
+
+// ─── §7-A: 과거 조치이력 자동조회 (lookup_history — 게이트 밖 액션, 무세션 호출 OK) ───
+// 이슈 1건 → 백엔드 lookup_history 호출 → { matched, results:[...] } 반환 (없으면 null)
+// ★ 호기에 +·() 포함 시 GET에서 +가 공백으로 깨지므로 반드시 POST(JSON body)로만 호출
+function _histIsRealAlarm(a) {
+  const s = String(a == null ? "" : a).trim();
+  if (!s) return false;
+  if (/no\s*alarm|없음|n\/?a/i.test(s)) return false;  // "No Alarm"류 제외
+  return /\d/.test(s);  // 숫자 포함해야 실제 알람코드로 간주
+}
+async function lookupHistory(issue) {
+  const eq = String(issue?.eq || "").trim();
+  if (!eq) return null;  // 호기 필수
+  const tags = issue?.tags || [];
+  const payload = {
+    action: "lookup_history",
+    호기: eq,                                   // 필수 (POST body라 +·() 안전)
+    증상: String(issue?.prob || "").slice(0, 200), // 자연어 그대로 (백엔드가 키워드 매칭)
+    품질결함: tags.includes("QUALITY_NG"),        // 5-카테고리 태그에서 품질 여부
+    topN: 3,
+  };
+  if (_histIsRealAlarm(issue?._alarm)) payload.알람코드 = String(issue._alarm).trim();  // 실제 코드일 때만
+  try {
+    const res = await fetch(APPS_SCRIPT_URL, {
+      method: "POST",
+      headers: { "Content-Type": "text/plain;charset=utf-8" },  // CORS preflight 우회 (앱 표준 패턴)
+      body: JSON.stringify(withAuthBody(payload)),
+    });
+    const data = await res.json().catch(() => ({}));
+    if (data && data.success && data.data && data.data.matched) return data.data;  // { matched, results }
+    return null;
+  } catch (e) {
+    console.error("[lookup_history]", eq, e?.message || e);
+    return null;
+  }
+}
+
+// §7-A: 과거 조치이력 패널 — HTML 내보내기용 (light theme, 레포트 본문/Teams 발송본 삽입)
+function buildHistoryPanelHtml(history) {
+  if (!history || !history.matched || !Array.isArray(history.results) || history.results.length === 0) return "";
+  const esc = (s) => String(s == null ? "" : s).replace(/&/g, "&amp;").replace(/</g, "&lt;").replace(/>/g, "&gt;");
+  const blocks = history.results.map((r) => {
+    const root = Array.isArray(r.근본조치) ? r.근본조치 : [];
+    const temp = Array.isArray(r.임시조치) ? r.임시조치 : [];
+    const fallbackTag = r._fallback ? ` · <span style="color:#8e44ad;font-weight:700;">동일 라인 참고</span>` : "";
+    const habit = r.상습도 ? ` · <span style="color:#c0392b;">상습도 ${esc(r.상습도)}</span>` : "";
+    const meta = `${esc(r.호기)}${r.증상유형 ? " · " + esc(r.증상유형) : ""} · 발생 ${esc(r.발생횟수)}회 (${esc(r.최초)}~${esc(r.최근)})${habit}${fallbackTag}`;
+    let rootHtml = "";
+    if (root.length > 0) {
+      const items = root.map(a =>
+        `<li style="margin:3px 0;"><b>${esc(a.조치)}</b> — 적용 ${esc(a.적용일)} · <span style="color:#27ae60;font-weight:700;">이후 ${esc(a.이후무재발일수)}일 무재발</span>${a.부품 ? ` · 부품:${esc(a.부품)}` : ""}${a.신뢰 ? ` · 신뢰:${esc(a.신뢰)}` : ""}${a.횟수 ? ` · ${esc(a.횟수)}회` : ""}</li>`
+      ).join("");
+      rootHtml = `<div style="margin-top:6px;"><b style="color:#27ae60;">✅ 근본조치 (재발 없이 종결)</b><ul style="margin:4px 0;padding-left:20px;">${items}</ul></div>`;
+    }
+    let tempHtml = "";
+    if (temp.length > 0) {
+      const items = temp.map(a =>
+        `<li style="margin:3px 0;"><b>${esc(a.조치)}</b> — 적용 ${esc(a.적용일)} · <span style="color:#e67e22;font-weight:700;">${esc(a.N일후재발)}일 후 재발</span>${a.횟수 ? ` · ${esc(a.횟수)}회` : ""}</li>`
+      ).join("");
+      tempHtml = `<div style="margin-top:6px;"><b style="color:#e67e22;">⚠️ 임시조치 (재발함 — 답습 주의)</b><ul style="margin:4px 0;padding-left:20px;">${items}</ul></div>`;
+    }
+    const notEstablished = (root.length === 0 && temp.length > 0)
+      ? `<div style="margin-top:6px;padding:6px 10px;background:#fff5f5;border-left:4px solid #c0392b;color:#c0392b;font-weight:700;">🚫 아직 근본조치 미확립 — 임시조치 답습 주의</div>`
+      : "";
+    const causeHtml = r.대표원인 ? `<div style="margin-top:4px;color:#555;font-size:0.9em;">대표원인: ${esc(r.대표원인)}</div>` : "";
+    const warnHtml = r.경고 ? `<div style="margin-top:4px;color:#c0392b;font-size:0.9em;">⚠️ ${esc(r.경고)}</div>` : "";
+    return `<div style="margin:8px 0;padding:8px 10px;background:#fff;border:1px solid #d5dee8;border-radius:6px;">
+      <div style="font-size:0.9em;color:#1a3a5c;font-weight:700;">${meta}</div>
+      ${rootHtml}${tempHtml}${notEstablished}${causeHtml}${warnHtml}
+    </div>`;
+  }).join("");
+  return `
+    <div style="margin-top:12px;padding:12px 16px;background:#f0f6ff;border:1px solid #2980b9;border-left:5px solid #2980b9;border-radius:8px;">
+      <div style="color:#1a3a5c;font-weight:700;margin-bottom:6px;">🔧 과거 동일이슈 조치이력</div>
+      ${blocks}
+    </div>`;
+}
+
+// ─── 보고서 종류 ───────────────────────────────────────────────────────────────
+const REPORT_TYPES = [
+  { id:"daily",   icon:"📋", label:"일일 생산 보고서",  desc:"당일 생산 실적·이슈·KPI 요약" },
+  { id:"meeting", icon:"🗂️", label:"회의록",           desc:"논의 내용·결정사항·액션아이템" },
+  { id:"defect",  icon:"⚠️", label:"불량/이슈 보고서", desc:"불량 내역·원인분석·대책 수립" },
+  { id:"weekly",  icon:"📊", label:"주간 요약 보고서",  desc:"주간 트렌드·KPI·개선 과제" },
+];
+
+const REPORT_FOCUS = {
+  daily:   "당일 생산 실적과 이슈 전반을 검토하고 내일 계획을 수립하는 관점으로",
+  meeting: "결정사항과 액션아이템 도출에 집중하는 관점으로",
+  defect:  "불량 원인 파악·4M 분석·재발 방지 대책 수립에 집중하는 관점으로",
+  weekly:  "주간 트렌드·KPI 달성 현황·개선 과제 도출에 집중하는 관점으로",
+};
+
+// ─── 키워드 화이트리스트 (즉시 DEEP 강제) ───────────────────────────────────────
+const DEEP_FORCE_KEYWORDS = {
+  안전: ["부상", "사고", "화재", "감전", "추락", "응급", "구급", "injury", "fire"],
+  환경: ["누유", "누수", "유출", "분진", "악취", "spill"],  // 영역 12-X1: AZS 미사용 유해물질로 영문 leak 제외 (단순 공압 LEAK은 DEEP 제외)
+  품질통제: ["SAR", "NCR", "HOLD", "Special Action Request", "Non-Conformance"],
+  출하고객: ["고객 클레임", "반품", "출하 정지", "납품 지연", "claim"],
+  라인정지: ["라인 정지", "가동 중단", "전 라인 멈춤", "올스톱", "full_stop"],
+};
+
+// ─── 영역 9-B: 5-카테고리 분류 키워드 (명세서 §4 + 부록 A 기반) ─────────────
+// 한 이슈가 여러 카테고리에 속할 수 있음 (tags 배열로 다중 분류)
+const QUALITY_KEYWORDS = [
+  // 명세서 §4.3: NG / 품질
+  "불량", "defect", "NG", "수율", "yield", "Cpk",
+  "코팅 불량", "두께", "정렬", "외관", "치수",
+  "SAR", "NCR", "HOLD", "스크랩", "scrap", "리젝",
+  // 명세서 §10.2 QUALITY_NG 패턴
+  "tab width", "sepa fold", "electrode expose", "vision NG", "appearance",
+  "tab fold", "tab widht",  // tab widht는 명세서 부록 A 그대로 (오타 유지)
+];
+
+const PROCESS_CHANGE_KEYWORDS = [
+  "변경", "조정", "change", "set", "setpoint",
+  "recipe", "셋업", "조건", "오프셋", "offset",
+  "Gap", "압력", "온도", "속도", "tuning", "튜닝",
+  "파라미터", "parameter",
+  // 명세서 §10.2 CONDITION_CHANGE 패턴
+  "setting", "adjust",
+  // ★ 영역 12-AB1: 4월 데이터 패턴 추가
+  "Overhang", "overhang", "spec 초과", "Splicing", "splicing",
+  "Stack NG", "stack ng", "Sepa Wrinkle", "sepa wrinkle",
+  "Vision F/I check", "vision f/i", "monitoring 진행",
+  "Tab guide", "tab guide", "Z cut", "z cut",
+  "Magazine lift", "magazine lift", "Idle mandrel", "idle mandrel",
+  "Sepa dancer", "sepa dancer", "Ejector blow", "ejector blow",
+  "Down Loading", "down loading", "Down Unloading", "down unloading",
+  "Set Point", "set point", "Vacuum Set", "vacuum set",
+  "PnP", "Anode X", "anode x", "X value", "Y value",
+  "PIC:", "pic:",  // PIC 명시 메시지 (일반적으로 setting 변경 보고)
+];
+
+const TEST_KEYWORDS = [
+  "테스트", "test", "시험", "검증", "validation",
+  "trial", "trial run", "샘플", "sample", "DOE",
+  "양산외", "비정상 생산", "특별 생산", "엔지니어링 런",
+  "engineering run", "pilot",
+  // 명세서 §10.2 TEST_PM 패턴
+  "swap", "swab", "calibration", "PM", "monitoring",
+  // ★ 영역 12-AB2: 4월 데이터 패턴 추가
+  "UBM", "ubm", "UBM Limit", "ubm limit", "Irregular Maintenance", "irregular maintenance",
+  "Cleaning", "cleaning", "Check DE", "check de",
+  "Cutter Sear", "cutter sear", "Top Cutter", "top cutter", "Bottom Cutter", "bottom cutter",
+  "Bottom flip", "bottom flip", "Cutter 교체", "cutter 교체",
+  "Sepa Run", "sepa run", "JXT",  // JXT는 lot ID prefix
+  "Line PM", "line pm", "PM 일정", "pm 일정",
+  "1AB", "1-AB", "Stacking 1", "stacking 1",
+  "CPC 이상", "cpc 이상", "CPC monitoring", "cpc monitoring",
+  "Stack vision", "stack vision", "F/I check", "f/i check",
+];
+
+// ─── 영역 12-AU: Critical 카테고리 (라인 정지/매니저 직접 개입/주요 부품 교체 등) ───
+// 일반 메시지(general)로 빠지던 핵심 사건들을 별도 분류 → 6번 인사이트에 강제 포함
+const CRITICAL_KEYWORDS = [
+  // 라인/공정 정지 (가장 큰 신호)
+  "Sudden Trip", "sudden trip", "Sudden trip", "Trip occur", "trip occur",
+  "All Line", "all line", "전 라인", "전라인", "all machine stop", "All machine stop",
+  "Assembly Line", "assembly line",
+  "All Stop", "all stop",
+  // 인프라 (CDA/BCU/Main Power)
+  "Main CDA", "main CDA", "main cda",
+  "BCU", "bcu",
+  "Main Power", "main power",
+  "blinking",
+  // 자재 부족 / WIP 통제
+  "Cathode Shortage", "cathode shortage", "Material Shortage", "material shortage",
+  "Stop Empty", "stop empty",
+  "WIP 통제", "wip 통제",
+  // 핵심 부품 교체 (Critical part)
+  "Cable profinet", "cable profinet", "profinet",
+  "Servo Drive", "servo drive 교체",
+  // 매니저 직접 개입
+  "주임", "직접 개입", "Manager direct", "manager direct",
+  // 사고 강도
+  "Critical", "critical event", "Urgent", "urgent",
+  "Emergency", "emergency",
+  "horizontal deployment",
+  // 알람 클리어 / 재가동 지시
+  "clear errors", "clear alarm", "restart operation",
+];
+
+// ─── 영역 12-AW: 한국 책임자 명단 (점수 가중치 + escalation timeline 강조용) ───
+// 정답 레포트 격차 분석 결과: 한국 책임자 직접 개입 신호가 점수에 반영되지 않아
+// Magazine Crack 같은 critical 사건이 P1로 떨어지는 문제 해결.
+// 매칭 대상: 본문 메시지 text 필드 (extractCriticalIssues가 본문을 보존함)
+// 추후 보강: config화 / Sheets 동적 로드 등 (현재는 hardcoding)
+const KOREAN_MANAGER_NAMES = [
+  "Heri Bagus", "Heri Bagus Setiawan",
+  "Hafizh",
+  "Bagus",
+  "유강열", "유강열 주임",
+  "Agam", "Agam Kurniawan",
+  "강철", "강철 책임",
+];
+
+// 명세서 §5.2 키워드 가중치 매트릭스 (점수 보너스)
+const SCORE_KEYWORD_MATRIX = {
+  safety_env: {
+    bonus: 10,
+    keywords: ["emergency", "EMO", "safety", "환경", "부상", "사고", "화재",
+               "감전", "추락", "응급", "구급", "injury", "fire",
+               "누유", "누수", "유출", "분진", "악취", "spill"],  // 영역 12-X1: 영문 leak 제외 (AZS 단순 공압 LEAK)
+    fields: ["problem", "cause"],
+  },
+  quality_critical: {
+    bonus: 7,
+    keywords: ["NG", "defect", "품질", "vision NG"],
+    fields: ["problem", "alarm"],
+  },
+  full_stop: {
+    bonus: 5,
+    keywords: ["full_stop"],
+    fields: ["stop_status"],
+  },
+  unresolved: {
+    bonus: 5,
+    keywords: ["OPEN", "ToBeInformedLater", "monitoring", "not solved", "unsolved"],
+    fields: ["duration", "status", "result"],
+  },
+  spare_missing: {
+    bonus: 3,
+    keywords: ["no spare", "spare 없음", "spare 부족"],
+    fields: ["action"],
+  },
+  // ─── 영역 12-AW: 한국 책임자 escalation 신호 (+12) ───
+  // 매니저 이름이 본문에 등장하면 critical 사건으로 격상
+  // text field 매칭이 핵심 (기존 5종은 problem/cause/alarm 등 BM bot 필드만 봤음)
+  manager_escalation: {
+    bonus: 12,
+    keywords: KOREAN_MANAGER_NAMES,
+    fields: ["text", "problem", "cause"],  // text가 핵심, problem/cause는 보조
+  },
+  // ─── 영역 12-AW: 다중 hold 신호 (+8) ───
+  // "6 EA hold" 같은 다수 hold 패턴 — 정규식 처리 (scoreIssueMatrix에서 분기)
+  // _regex / _minCount 메타 필드는 scoreIssueMatrix가 인식
+  multi_hold: {
+    bonus: 8,
+    keywords: [],  // 정규식 별도 처리
+    fields: ["text"],
+    _regex: /(\d+)\s*(EA|개)\s*hold/i,
+    _minCount: 2,  // N >= 2 일 때만 점수 부여
+  },
+  // ─── 영역 12-AW: 라인 이전 / 운전 변경 신호 (+5) ───
+  // "Line 1B → Line 1C" 같은 운전 이전 신호 = critical 영향도 큼
+  line_transfer: {
+    bonus: 5,
+    keywords: [
+      "Line 이전", "임시 운전", "Line transfer",
+      "→ Line", "->Line",
+      "임시 이전", "임시운전",
+      "운전 이전", "운전이전",
+    ],
+    fields: ["text", "result"],
+  },
+  // ★ 큐 #19 ⑧: 전극 조각 미회수 (혼입 리스크) — 안전 승격 (bonus 8, full_stop 5 ~ safety 10 사이)
+  // "조각/electrode + 미회수(tidak ketemu/lengkap·belum ketemu·미발견·not found·hilang)" 조합만 매칭
+  // 단순 "potongan"(조각)은 정상 맥락에도 흔해 과매칭 → 조합 정규식 사용. _minCount 없음 → 매칭만으로 bonus
+  electrode_fragment_lost: {
+    bonus: 8,
+    keywords: [],  // 정규식 별도 처리
+    fields: ["problem", "cause", "text"],
+    _regex: /(potongan|electrode|elektroda|조각|fragment|partikel)[\s\S]{0,40}(tidak\s*(ketemu|lengkap)|belum\s*ketemu|미발견|못\s*찾|not\s*found|hilang)/i,
+  },
+};
+
+// 명세서 §4.3: High Frequency 원인 카테고리 키워드 매트릭스 (부록 A)
+const CAUSE_CATEGORIES = {
+  ejector_suction: ["ejector", "suction", "vacuum", "PnP fail"],
+  sensor: ["sensor", "limit", "detection", "cable loose"],
+  servo: ["servo", "fault code", "over run", "31137"],
+  regulator_coil: ["regulator", "coil", "BMREG"],
+  ng_tab: ["tab width", "tab fold", "tab widht"],
+  heat_press: ["heat press", "heatpress", "pressure result"],
+  hang_error: ["hang error", "magazine lifter"],
+  pulling: ["pulling drag", "pulling grip"],
+  mandrel: ["mandrel"],
+  splicing: ["splice", "splicing"],
+};
+// 우선순위 (이중 카테고리화 방지) — 위에서 아래로 우선
+const CAUSE_PRIORITY = ["ng_tab", "mandrel", "ejector_suction", "servo", "regulator_coil",
+                        "heat_press", "hang_error", "pulling", "splicing", "sensor"];
+
+// ─── 모델 설정 (Function이 model 파라미터 지원하도록 수정됨) ─────────────────────
+const MODEL_FAST = "claude-haiku-4-5";       // 라우터/분류기
+const MODEL_REASONING = "claude-sonnet-4-5"; // 본 논의/사회자
+
+// ─── 페르소나 정의 (8종: Cell 3 + Elec 3 + 공통 FA/Vision) ────────────────────
+const PERSONAS = {
+  // ── Cell 공정 ──
+  Cell_PE: {
+    label: "Cell 생산", process: "Cell",
+    color: "#3b82f6", bg: "rgba(59,130,246,0.12)", icon: "🔵",
+    role: "PE (Production Engineer) - Cell 공정",
+    priority: "생산목표 달성(무리한 가동 지양) → 작업자 안전 → SOP → 납기",
+    focus: "일일/주간 생산목표, 가동률, 작업자 숙련도, SOP, 자재 공급",
+    stance: "TE의 임시조치/근본조치 요구에 적극 협조 (가동정지 감수 가능). ME 정비 시간과 일정 조율. 안전·품질 앞에서는 가동 고집 금지.",
+  },
+  Cell_ME: {
+    label: "Cell 설비", process: "Cell",
+    color: "#f97316", bg: "rgba(249,115,22,0.12)", icon: "🟠",
+    role: "ME (Maintenance Engineer) - Cell 공정",
+    priority: "설비 신뢰성(MTBF·MTTR) → 예지보전 → 설비 수명 → 정비비용",
+    focus: "BM 빈도/패턴, 설비 노후도, 부품 수명, 진동·온도·소음, 예비부품",
+    stance: "TE 원인 분석에 설비 데이터/이력으로 적극 협력. PE 가동요구 시 설비 부하 한계 명시.",
+  },
+  Cell_TE: {
+    label: "Cell 기술 ★", process: "Cell",
+    color: "#22d3ee", bg: "rgba(34,211,238,0.12)", icon: "🟢",
+    role: "TE (Technical Engineer) - Cell 공정 — 근본원인 규명 주도자",
+    priority: "수율 개선(가장 중요) → 불량 발생 공정 신속 규명 → RCA 임시/항구 대책 → Cpk 안정화",
+    focus: "불량 패턴, 공정 변수(온도·압력·속도), 수율 추이, Cpk, 유사 불량 이력",
+    stance: "이슈 발생 시 ① 어느 공정에서 발생했는지 진단 ② 임시조치/근본조치 구분 제시 ③ 데이터 근거 제시. PE/ME는 TE 진단을 우선 검토.",
+  },
+  Cell_PLC: {
+    label: "Cell PLC", process: "Cell",
+    color: "#fbbf24", bg: "rgba(251,191,36,0.12)", icon: "⚡",
+    role: "PLC Program Engineer - Cell 공정 (Stacker, Press 등)",
+    priority: "시퀀스 로직 안정성 → 안전 인터록 무결성 → PLC 통신 신뢰성 → 알람 처리 → 프로그램 유지보수성",
+    focus: "Cell 공정 설비(Stacker, Press) PLC 시퀀스, 전기 제어, 안전 인터록, 알람 누락/오작동, MES·Vision·Robot 인터페이스",
+    stance: "설비 정지 시 ME(하드웨어)와 협력하여 PLC 측 원인 분석. 신규 알람 발생 시 시퀀스 로직 점검 우선. TE 근본원인 분석에 제어 신호 흐름 정보 제공.",
+  },
+  // ── Elec 공정 ──
+  Elec_PE: {
+    label: "Elec 생산", process: "Elec",
+    color: "#60a5fa", bg: "rgba(96,165,250,0.12)", icon: "🔷",
+    role: "PE (Production Engineer) - Elec 공정",
+    priority: "생산목표 달성(무리한 가동 지양) → 작업자 안전 → SOP → 납기",
+    focus: "Elec 공정의 일일/주간 생산목표, 가동률, 작업자 숙련도, SOP, 자재 공급",
+    stance: "TE의 임시조치/근본조치 요구에 적극 협조. ME 정비 시간과 일정 조율. 안전·품질 앞에서는 가동 고집 금지.",
+  },
+  Elec_ME: {
+    label: "Elec 설비", process: "Elec",
+    color: "#fb923c", bg: "rgba(251,146,60,0.12)", icon: "🟧",
+    role: "ME (Maintenance Engineer) - Elec 공정",
+    priority: "설비 신뢰성(MTBF·MTTR) → 예지보전 → 설비 수명 → 정비비용",
+    focus: "Elec 설비 BM 빈도/패턴, 노후도, 부품 수명, 진동·온도·소음, 예비부품",
+    stance: "TE 원인 분석에 설비 데이터/이력으로 적극 협력. PE 가동요구 시 설비 부하 한계 명시.",
+  },
+  Elec_TE: {
+    label: "Elec 기술 ★", process: "Elec",
+    color: "#67e8f9", bg: "rgba(103,232,249,0.12)", icon: "🟦",
+    role: "TE (Technical Engineer) - Elec 공정 — 근본원인 규명 주도자",
+    priority: "수율 개선(가장 중요) → 불량 발생 공정 신속 규명 → RCA 임시/항구 대책 → Cpk 안정화",
+    focus: "Elec 공정 불량 패턴, 공정 변수, 수율 추이, Cpk, 유사 불량 이력",
+    stance: "이슈 발생 시 ① 어느 공정에서 발생했는지 진단 ② 임시조치/근본조치 구분 제시 ③ 데이터 근거 제시. PE/ME는 TE 진단을 우선 검토.",
+  },
+  Elec_PLC: {
+    label: "Elec PLC", process: "Elec",
+    color: "#f59e0b", bg: "rgba(245,158,11,0.12)", icon: "⚡",
+    role: "PLC Program Engineer - Elec 공정 (Notching, Coater 등)",
+    priority: "시퀀스 로직 안정성 → 안전 인터록 무결성 → PLC 통신 신뢰성 → 알람 처리 → 프로그램 유지보수성",
+    focus: "Elec 공정 설비(Notching, Coater) PLC 시퀀스, 전기 제어, 안전 인터록, 알람 누락/오작동, MES·Vision·Robot 인터페이스",
+    stance: "설비 정지 시 ME(하드웨어)와 협력하여 PLC 측 원인 분석. 신규 알람 발생 시 시퀀스 로직 점검 우선. TE 근본원인 분석에 제어 신호 흐름 정보 제공.",
+  },
+  // ── 공통 (Cell/Elec 모두 지원) ──
+  FA: {
+    label: "FA (반송)", process: "공통",
+    color: "#a78bfa", bg: "rgba(167,139,250,0.12)", icon: "🟣",
+    role: "FA (Factory Automation) Engineer — 자동 반송 시스템 (전 공정 공통)",
+    priority: "반송 흐름 안정성 → 반송 설비 가동률 → WIP 적정 수준 → MES 통신",
+    focus: "C/V 잼·정렬, Stocker 처리능력, OHT 충돌·경로, AGV 배터리·통신, MES 통신, WIP 누적, 반송 중 손상",
+    stance: "이슈가 공정인가 반송인가 검토. TE 분석 시 반송 중 발생 가능성(낙하·충격·대기) 제시.",
+  },
+  Vision: {
+    label: "Vision (검사)", process: "공통",
+    color: "#ec4899", bg: "rgba(236,72,153,0.12)", icon: "🔴",
+    role: "Vision Engineer — 외관검사 (전 공정 공통)",
+    priority: "외관 불량 검출 정확도 → Vision 시스템 안정성 → 알고리즘 최적화 → 신규 불량 모드 학습",
+    focus: "검사 통과율, 오검/미검률, 조명·카메라 컨디션, 신규 불량 패턴, 검사 기준",
+    stance: "검출 정확도 관점에서 의견. 오검·미검 가능성, 신규 불량 모드 여부 검토.",
+  },
+  FA_PLC: {
+    label: "FA PLC", process: "공통",
+    color: "#eab308", bg: "rgba(234,179,8,0.12)", icon: "⚡",
+    role: "PLC Program Engineer — 반송 시스템 (Conveyor, OHT, Stocker, AGV 등)",
+    priority: "반송 시퀀스 안정성 → 충돌·정체 방지 인터록 → 통신 신뢰성 (MES/AGV) → 알람 처리 → 경로 최적화",
+    focus: "반송 PLC 시퀀스 (C/V, OHT, Stocker), 충돌 방지 인터록, AGV 경로 제어, 통신 에러, 알람 패턴",
+    stance: "반송 이상 발생 시 FA(하드웨어/경로)와 협력하여 PLC 측 시퀀스 점검. 신규 통신 에러 시 인터페이스 코드 우선 검토.",
+  },
+};
+
+// ─── 공정 정의 ─────────────────────────────────────────────────────────────────
+const PROCESSES = {
+  Cell: {
+    label: "Cell 공정",
+    icon: "🔵",
+    // ★ 큐 #21: PLC 자동참여 제거 — Cell_PLC는 PLC 그룹에서 수동 선택
+    auto: ["Cell_PE", "Cell_ME", "Cell_TE"],
+    otherProcess: "Elec",
+  },
+  Elec: {
+    label: "Elec 공정",
+    icon: "🔷",
+    // ★ 큐 #21: PLC 자동참여 제거 — Elec_PLC는 PLC 그룹에서 수동 선택
+    auto: ["Elec_PE", "Elec_ME", "Elec_TE"],
+    otherProcess: "Cell",
+  },
+};
+
+const COMMON_AGENTS = ["FA", "Vision"];  // ★ 큐 #21: FA_PLC 이동 — PLC 그룹에서 관리
+const PLC_AGENTS = ["Cell_PLC", "Elec_PLC", "FA_PLC"];  // ★ 큐 #21: PLC 그룹 (수동 선택)
+
+// 공장 운영 철학 (모든 페르소나 공통)
+const FACTORY_PHILOSOPHY = `
+[공장 운영 철학 - 절대 원칙]
+현재 공장은 최대 CAPA 대비 생산량이 부족한 상태입니다.
+"생산 목표만 달성 가능한 수준"이라면 굳이 불량을 감수하며 가동할 이유가 없습니다.
+→ 품질·근본조치 우선, 무리한 가동 지양이 운영 철학입니다.
+`.trim();
+
+// ★ 큐 #19 ⑥: 구체 수치 출처 검증 규칙 — 큐레이션 Part1~3 sys에 삽입 (71EA 같은 환각 방지)
+const NUMERIC_SOURCE_RULE = `
+
+[★ 수치 출처 검증 — 환각 금지]
+- EA·시간·%·건수 등 구체 수치는 입력 raw 데이터 또는 첨부 이미지 분석에 명시된 값만 사용하라.
+- 출처 없는 정량 수치를 새로 만들지 마라 (예: 근거 없는 "71EA 불량", "12시간 드리프트" 금지).
+- 계산·추정값은 반드시 "추정"·"약" 등으로 명시하라.
+- 부동 시작은 본문 Start Time 기준 — 보고시각(메시지 수신)과 혼동하지 마라.`;
+
+// ─── Google Sheets ─────────────────────────────────────────────────────────────
+async function saveToSheets(data) {
+  try {
+    await fetch(APPS_SCRIPT_URL, {
+      method: "POST", mode: "no-cors",
+      headers: { "Content-Type": "text/plain" },
+      body: JSON.stringify(withAuthBody({ action: "save_minutes", ...data })),
+    });
+    return true;
+  } catch { return false; }
+}
+
+async function loadKnowledge(role) {
+  try {
+    const res = await fetch(`${APPS_SCRIPT_URL}?action=get_knowledge&role=${role}${authQueryParam()}`);
+    const data = await res.json();
+    return data.success ? data.data.map(k => `[${k.category}] ${k.content}`).join("\n") : "";
+  } catch { return ""; }
+}
+
+async function loadSelectedKnowledge(agentCodes) {
+  // 선택된 에이전트의 학습 데이터만 로드 (효율)
+  // ★ 페르소나 코드 → Apps Script TAB_MAP 키 매핑
+  // FA, Vision은 그대로, Cell_*/Elec_*도 그대로
+  const results = await Promise.allSettled(agentCodes.map(c => loadKnowledge(c)));
+  const kb = {};
+  const stats = { failed: 0 };
+  agentCodes.forEach((code, i) => {
+    const r = results[i];
+    if (r.status === "fulfilled") {
+      kb[code] = r.value;
+      stats[code] = r.value ? r.value.split("\n").filter(Boolean).length : 0;
+    } else {
+      kb[code] = "";
+      stats[code] = 0;
+      stats.failed++;
+    }
+  });
+  return { kb, stats };
+}
+
+// ─── Claude API ────────────────────────────────────────────────────────────────
+// ★ model 파라미터 추가
+async function callClaudeRaw(system, userMsg, opts = {}) {
+  const { model = MODEL_REASONING, max_tokens = 1000 } = opts;
+  let res;
+  try {
+    res = await fetch("/.netlify/functions/claude", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ system, userMsg, max_tokens, model }),
+    });
+  } catch (e) { throw new Error(`네트워크 오류: ${e.message}`); }
+  if (!res.ok) {
+    const t = await res.text().catch(() => "");
+    throw new Error(`HTTP ${res.status}: ${t.slice(0, 100)}`);
+  }
+  const data = await res.json();
+  if (data.error) throw new Error(`API 오류: ${data.error}`);
+  return (data.content || []).map(i => i.text || "").join("").trim();
+}
+
+// ─── 영역 12-AQ: Background Function 호출 헬퍼 (504 timeout 영구 회피) ────────
+// Netlify Pro Background Function (15분 timeout) + Blobs로 결과 폴링
+// 사용처: 6/7번 인사이트+액션, PE Part 1 (가장 무거운 호출)
+async function callClaudeBackground(system, userMsg, opts = {}) {
+  const {
+    model = MODEL_REASONING,
+    max_tokens = 3500,
+    onProgress = null,
+    initialDelayMs = 25000,  // 첫 25초 대기 (Sonnet 평균 30초+)
+    pollIntervalMs = 5000,   // 5초 간격 폴링
+    maxWaitMs = 300000,      // 최대 5분 대기
+  } = opts;
+
+  // 1. jobId 생성 (클라이언트 UUID — Q7=b)
+  const jobId = `bg-${Date.now()}-${Math.random().toString(36).slice(2, 12)}`;
+
+  // 2. Background function 트리거 — 즉시 202 받고 분리
+  onProgress?.(`🚀 Background 호출 시작 (jobId: ${jobId.slice(-10)})`);
+  try {
+    const triggerRes = await fetch("/.netlify/functions/claude-bg-background", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ jobId, system, userMsg, max_tokens, model }),
+    });
+    if (!triggerRes.ok && triggerRes.status !== 202) {
+      const errText = await triggerRes.text().catch(() => "");
+      throw new Error(`Background 트리거 실패: HTTP ${triggerRes.status} - ${errText.slice(0, 200)}`);
+    }
+  } catch (e) {
+    throw new Error(`Background 트리거 네트워크 오류: ${e.message}`);
+  }
+
+  // 3. 첫 25초 대기 (Q2=c — Sonnet 평균 응답 시간 전에는 폴링 무의미)
+  onProgress?.(`⏳ Background 처리 중... (25초 대기 후 결과 조회 시작)`);
+  await new Promise(r => setTimeout(r, initialDelayMs));
+
+  // 4. 5초 간격 폴링
+  const t0 = Date.now() - initialDelayMs;  // 시작 시점 보정
+  let pollCount = 0;
+  while (Date.now() - t0 < maxWaitMs) {
+    pollCount++;
+    const elapsedSec = Math.round((Date.now() - t0) / 1000);
+    onProgress?.(`🔍 결과 조회 중... (${elapsedSec}초 경과, ${pollCount}회)`);
+
+    try {
+      const res = await fetch(`/.netlify/functions/claude-result?jobId=${encodeURIComponent(jobId)}`);
+      if (res.ok) {
+        const data = await res.json();
+        if (data.status === "done") {
+          const elapsedFinal = Math.round((Date.now() - t0) / 1000);
+          onProgress?.(`✅ Background 완료 (총 ${elapsedFinal}초)`);
+          return data.text || "";
+        }
+        if (data.status === "failed") {
+          throw new Error(`Background 실패: ${data.error || "unknown"}`);
+        }
+        // pending: 계속 폴링
+      } else if (res.status === 404) {
+        // 아직 Blobs에 기록 안 됨 (드물지만 가능 — 계속 폴링)
+      } else {
+        const errText = await res.text().catch(() => "");
+        console.warn(`[Background polling] HTTP ${res.status}: ${errText.slice(0, 100)}`);
+      }
+    } catch (e) {
+      // 폴링 한 번 실패는 계속 — 네트워크 일시 문제 가능
+      console.warn(`[Background polling] 폴링 ${pollCount}회 실패:`, e.message);
+    }
+
+    await new Promise(r => setTimeout(r, pollIntervalMs));
+  }
+
+  // 5. 최대 대기 초과
+  throw new Error(`Background 응답 대기 초과 (${maxWaitMs / 1000}초): jobId ${jobId}`);
+}
+
+// ─── 영역 12-AN: safeJSON 강화 (raw 정보 보존 + 정규식 추출 + 빈 객체 거부) ─────
+function safeJSON(raw) {
+  const rawStr = String(raw || "");
+  const rawLen = rawStr.length;
+
+  // 빈 응답
+  if (rawLen === 0) {
+    const err = new Error("JSON 없음 — raw 응답 빈 문자열 (LLM 무응답)");
+    err._rawSnippet = "";
+    err._rawLength = 0;
+    throw err;
+  }
+
+  // 1. 코드펜스 제거 (```json ... ``` 또는 ``` ... ```)
+  const cleaned = rawStr.replace(/```json|```/gi, "").trim();
+
+  // 2. 첫 { ~ 마지막 } 블록 추출 (기존 방식)
+  const s = cleaned.indexOf("{"), e = cleaned.lastIndexOf("}");
+  if (s === -1 || e === -1) {
+    // 중괄호 없음 — 정규식으로 한 번 더 시도 (혹시 escape된 것)
+    const reMatch = cleaned.match(/\{[\s\S]*\}/);
+    if (!reMatch) {
+      const err = new Error(`JSON 없음 — 중괄호 없음 (raw 길이=${rawLen})`);
+      err._rawSnippet = rawStr.slice(0, 8000);  // ★ 12-BH: 부분 복구용 — 8000자 보존
+      err._rawLength = rawLen;
+      throw err;
+    }
+    // 정규식 hit — 아래 경로로 진입
+    const jsonStr = reMatch[0];
+    try {
+      const parsed = JSON.parse(jsonStr);
+      if (!parsed || typeof parsed !== "object" || Object.keys(parsed).length === 0) {
+        const err = new Error("JSON 없음 — 빈 객체 또는 비객체");
+        err._rawSnippet = rawStr.slice(0, 8000);  // ★ 12-BH: 부분 복구용 — 8000자 보존
+        err._rawLength = rawLen;
+        throw err;
+      }
+      return parsed;
+    } catch (parseErr) {
+      const err = new Error(`JSON 파싱 실패 — ${parseErr.message}`);
+      err._rawSnippet = rawStr.slice(0, 8000);  // ★ 12-BH: 부분 복구용 — 8000자 보존
+      err._rawLength = rawLen;
+      throw err;
+    }
+  }
+
+  let jsonStr = cleaned.slice(s, e + 1);
+
+  // 3. 1차 파싱 시도
+  try {
+    const parsed = JSON.parse(jsonStr);
+    if (!parsed || typeof parsed !== "object" || Object.keys(parsed).length === 0) {
+      const err = new Error("JSON 없음 — 빈 객체 또는 비객체 (1차)");
+      err._rawSnippet = rawStr.slice(0, 8000);  // ★ 12-BH: 부분 복구용 — 8000자 보존
+      err._rawLength = rawLen;
+      throw err;
+    }
+    return parsed;
+  } catch (e1) {
+    // raw 정보 보존된 throw는 그대로 위로
+    if (e1._rawSnippet !== undefined) throw e1;
+
+    // 4. brace/bracket 자동 균형 맞추기 (잘림 응답 복구)
+    jsonStr = jsonStr.replace(/,\s*"[^"]*$/, "").replace(/,\s*\{[^}]*$/, "");
+    let ob = 0, cb = 0, oq = 0, cq = 0;
+    for (const c of jsonStr) {
+      if (c === "{") ob++; if (c === "}") cb++;
+      if (c === "[") oq++; if (c === "]") cq++;
+    }
+    for (let i = 0; i < oq - cq; i++) jsonStr += "]";
+    for (let i = 0; i < ob - cb; i++) jsonStr += "}";
+
+    try {
+      const parsed = JSON.parse(jsonStr);
+      if (!parsed || typeof parsed !== "object" || Object.keys(parsed).length === 0) {
+        const err = new Error("JSON 없음 — 빈 객체 또는 비객체 (균형 복구 후)");
+        err._rawSnippet = rawStr.slice(0, 8000);  // ★ 12-BH: 부분 복구용 — 8000자 보존
+        err._rawLength = rawLen;
+        throw err;
+      }
+      return parsed;
+    } catch (e2) {
+      if (e2._rawSnippet !== undefined) throw e2;
+      const err = new Error(`JSON 파싱 실패 — 균형 복구 후에도 실패: ${e2.message}`);
+      err._rawSnippet = rawStr.slice(0, 8000);  // ★ 12-BH: 부분 복구용 — 8000자 보존
+      err._rawLength = rawLen;
+      throw err;
+    }
+  }
+}
+
+// ═════════════════════════════════════════════════════════════════════════════
+// ★ 영역 12-BH (큐 #8): JSON 부분 복구 — Part 2b 등 큰 응답 안정성 강화
+// safeJSON 실패 시 호출 — top-level 키별 + 배열 안 객체별 부분 복구
+// ═════════════════════════════════════════════════════════════════════════════
+function tryPartialJSONRecovery(raw) {
+  const cleaned = String(raw || "").replace(/```json|```/gi, "").trim();
+  const startIdx = cleaned.indexOf("{");
+  if (startIdx === -1) return {};
+  const endIdx = cleaned.lastIndexOf("}");
+  const body = (endIdx > startIdx)
+    ? cleaned.slice(startIdx + 1, endIdx)
+    : cleaned.slice(startIdx + 1);
+
+  // top-level key/value 추출 (depth 추적, string 무시)
+  const pairs = [];
+  let depth = 0, inString = false, escape = false;
+  let currentKey = null, currentKeyStart = -1, valueStart = -1;
+  let i = 0;
+  while (i < body.length) {
+    const c = body[i];
+    if (escape) { escape = false; i++; continue; }
+    if (c === "\\") { escape = true; i++; continue; }
+    if (c === '"') {
+      if (depth === 0 && currentKey === null && !inString && valueStart === -1) {
+        currentKeyStart = i + 1;
+      }
+      if (depth === 0 && currentKey === null && inString && currentKeyStart !== -1) {
+        currentKey = body.slice(currentKeyStart, i);
+        currentKeyStart = -1;
+      }
+      inString = !inString;
+      i++; continue;
+    }
+    if (inString) { i++; continue; }
+
+    if (c === ":" && depth === 0 && currentKey !== null && valueStart === -1) {
+      let j = i + 1;
+      while (j < body.length && /\s/.test(body[j])) j++;
+      valueStart = j; i = j; continue;
+    }
+    if (c === "{" || c === "[") depth++;
+    if (c === "}" || c === "]") depth--;
+    if (c === "," && depth === 0 && currentKey !== null && valueStart !== -1) {
+      pairs.push({ key: currentKey, valueStr: body.slice(valueStart, i).trim() });
+      currentKey = null; valueStart = -1;
+    }
+    i++;
+  }
+  if (currentKey !== null && valueStart !== -1) {
+    pairs.push({ key: currentKey, valueStr: body.slice(valueStart).trim() });
+  }
+
+  const result = {};
+  for (const { key, valueStr } of pairs) {
+    let v = valueStr.replace(/,\s*$/, "");
+    // 배열/객체 자동 균형
+    if (v.startsWith("[") || v.startsWith("{")) {
+      let ob = 0, cb = 0, oq = 0, cq = 0, _inStr = false, _esc = false;
+      for (const c of v) {
+        if (_esc) { _esc = false; continue; }
+        if (c === "\\") { _esc = true; continue; }
+        if (c === '"') _inStr = !_inStr;
+        if (_inStr) continue;
+        if (c === "{") ob++; if (c === "}") cb++;
+        if (c === "[") oq++; if (c === "]") cq++;
+      }
+      for (let j = 0; j < oq - cq; j++) v += "]";
+      for (let j = 0; j < ob - cb; j++) v += "}";
+    }
+    try {
+      result[key] = JSON.parse(v);
+    } catch (e) {
+      // 배열이면 객체별 부분 복구 시도
+      if (v.startsWith("[")) {
+        const arr = tryArrayPartialRecovery(v);
+        if (arr.length > 0) {
+          result[key] = arr;
+          console.log(`[12-BH 부분복구] "${key}" 배열 부분 복구: ${arr.length}개`);
+        } else {
+          console.log(`[12-BH 부분복구] "${key}" 파싱 실패 — skip`);
+        }
+      } else {
+        console.log(`[12-BH 부분복구] "${key}" 파싱 실패 — skip (object)`);
+      }
+    }
+  }
+  return result;
+}
+
+// 배열 안 객체 1개씩 추출 (broken 객체 1개 skip)
+function tryArrayPartialRecovery(arrStr) {
+  const items = [];
+  let depth = 0, inString = false, escape = false, itemStart = -1;
+  for (let i = 1; i < arrStr.length - 1; i++) {
+    const c = arrStr[i];
+    if (escape) { escape = false; continue; }
+    if (c === "\\") { escape = true; continue; }
+    if (c === '"') { inString = !inString; continue; }
+    if (inString) continue;
+    if (c === "{" && depth === 0) itemStart = i;
+    if (c === "{") depth++;
+    if (c === "}") {
+      depth--;
+      if (depth === 0 && itemStart !== -1) {
+        const itemStr = arrStr.slice(itemStart, i + 1);
+        try {
+          items.push(JSON.parse(itemStr));
+        } catch (e) { /* skip broken item */ }
+        itemStart = -1;
+      }
+    }
+  }
+  return items;
+}
+
+// ─── WhatsApp 파서 (기존 그대로) ───────────────────────────────────────────────
+// ─── 영역 12-AY: WhatsApp 미디어 첨부 줄 정규식 ───
+// 한국어 WhatsApp export의 "‎IMG-YYYYMMDD-WAxxxx.jpg (파일 첨부됨)" 형식 매칭
+// 좌우 LRM/RLM 불가시 문자(U+200E/U+200F) 허용
+// 향후 PDF/영상 확장 시 이 정규식만 수정 (#2 결정에 따라 현재는 사진만)
+const MEDIA_ATTACH_RE = /^[\u200e\u200f\s]*(IMG-\d{8}-WA\d{4,5}\.(?:jpg|jpeg|png|JPG|JPEG|PNG))\s*\(파일\s*첨부됨\)\s*$/;
+
+function parseWhatsApp(text) {
+  const lines = text.split("\n");
+  // ★ 영역 9-A: 두 시간 형식 지원
+  //  (1) 24시간: "24/2/8 16:15 - 손영희: ..."
+  //  (2) AM/PM 한글 로케일: "24/2/8 PM 4:15 - ..." 또는 "24/2/8 오후 4:15 - ..."
+  const msgRe24   = /^(\d{2}\/\d{1,2}\/\d{1,2})\s+(\d{1,2}:\d{2})\s+-\s+([^:]+):\s*(.*)/;
+  const msgReAmPm = /^(\d{2}\/\d{1,2}\/\d{1,2})\s+(AM|PM|오전|오후)\s+(\d{1,2}):(\d{2})\s+-\s+([^:]+):\s*(.*)/;
+
+  // AM/PM → 24시간 변환
+  const to24h = (ampm, h, mm) => {
+    let hour = parseInt(h, 10);
+    const isPM = ampm === "PM" || ampm === "오후";
+    const isAM = ampm === "AM" || ampm === "오전";
+    if (isPM && hour < 12) hour += 12;
+    else if (isAM && hour === 12) hour = 0;
+    return { time: `${hour}:${mm}`, hour };
+  };
+
+  const msgs = [];
+  let cur = null;
+  for (const line of lines) {
+    let m = line.match(msgRe24);
+    if (m) {
+      if (cur) msgs.push(cur);
+      cur = { date: m[1], time: m[2], hour: parseInt(m[2].split(":")[0], 10), sender: m[3].trim(), text: m[4] };
+      continue;
+    }
+    m = line.match(msgReAmPm);
+    if (m) {
+      if (cur) msgs.push(cur);
+      const { time, hour } = to24h(m[2], m[3], m[4]);
+      cur = { date: m[1], time, hour, sender: m[5].trim(), text: m[6] };
+      continue;
+    }
+    if (cur && line.trim()) {
+      cur.text += "\n" + line;
+    }
+  }
+  if (cur) msgs.push(cur);
+
+  // ★ 영역 12-AY: 후처리 — 각 메시지에서 이미지 첨부 줄 분리
+  // 처리 결과:
+  //   text: 첨부 줄 제거된 깨끗한 본문 (캡션 또는 BM Bot 본문만)
+  //   attachedImages: ["IMG-...jpg", ...] (없으면 빈 배열)
+  // #5 결정 (a): caption 분리 / #6 결정 (a): 누락 허용 (.zip에 .jpg 없어도 파일명만 보존)
+  let attachedTotal = 0;
+  let captionOnlyCount = 0;  // 첨부분리 후 text가 빈 문자열 (이미지+캡션 없음)
+  let captionWithText = 0;   // 첨부분리 후 text 남음 (캡션 또는 BM Bot 본문)
+  msgs.forEach(m => {
+    const splitLines = (m.text || "").split("\n");
+    const attachedImages = [];
+    const cleanLines = [];
+    for (const ln of splitLines) {
+      const mm = ln.match(MEDIA_ATTACH_RE);
+      if (mm) {
+        attachedImages.push(mm[1]);
+      } else {
+        cleanLines.push(ln);
+      }
+    }
+    m.text = cleanLines.join("\n").trim();
+    m.attachedImages = attachedImages;
+    if (attachedImages.length > 0) {
+      attachedTotal += attachedImages.length;
+      if (m.text.length === 0) captionOnlyCount++;
+      else captionWithText++;
+    }
+  });
+
+  // 진단 로그
+  if (typeof console !== "undefined" && attachedTotal > 0) {
+    console.log(`[★ 12-AY 미디어 첨부 분리] 총 ${attachedTotal}개 첨부 / 본문 있는 메시지 ${captionWithText}건 / 첨부만 있는 메시지 ${captionOnlyCount}건`);
+  }
+
+  return msgs.filter(m =>
+    // 빈 메시지 (첨부도 본문도 없음) 제외 — 기존 시스템 메시지 필터와 함께
+    (m.text.length > 0 || (m.attachedImages || []).length > 0) &&
+    !m.text.includes("미디어 파일 제외됨") &&
+    !m.text.includes("메시지와 통화는 종단간") &&
+    !m.text.includes("그룹 만든이가") &&
+    !m.text.includes("그룹에 추가되었습니다") &&
+    !m.text.includes("이 메시지는 삭제되었습니다")
+  );
+}
+
+// ─── 영역 12-AY-2: JSZip CDN 동적 로드 (pdf.js 패턴과 동일) ─────────────────
+// .zip 처리 시점에만 로드하여 평소 빌드 무게 0
+let _jszipPromise = null;
+function loadJSZip() {
+  if (_jszipPromise) return _jszipPromise;
+  if (typeof window !== "undefined" && window.JSZip) {
+    _jszipPromise = Promise.resolve(window.JSZip);
+    return _jszipPromise;
+  }
+  _jszipPromise = new Promise((resolve, reject) => {
+    const script = document.createElement("script");
+    script.src = "https://cdnjs.cloudflare.com/ajax/libs/jszip/3.10.1/jszip.min.js";
+    script.onload = () => {
+      if (window.JSZip) {
+        console.log("[12-AY-2] JSZip CDN 로드 완료");
+        resolve(window.JSZip);
+      } else {
+        reject(new Error("JSZip 로드 후에도 window.JSZip 없음"));
+      }
+    };
+    script.onerror = () => reject(new Error("JSZip CDN 로드 실패 (네트워크/CSP 확인)"));
+    document.head.appendChild(script);
+  });
+  return _jszipPromise;
+}
+
+// ─── 영역 12-AY-2: .zip 백업 풀어 메시지 + 이미지 추출 ────────────────────────
+// 입력: File 객체 (.zip)
+// 처리:
+//   1. JSZip으로 .zip 풀기
+//   2. .txt 파일 자동 감지 → parseWhatsApp으로 파싱
+//   3. .jpg/.jpeg/.png 파일을 base64로 변환 → 파일명 매핑 (별도 객체, 메모리 효율)
+//   4. 메시지의 attachedImages 파일명과 실제 이미지 매칭 통계 산출
+// 출력: { messages: [...], images: { "IMG-...jpg": "base64..." }, stats: {...} }
+//   - messages: parseWhatsApp 결과 (attachedImages 포함)
+//   - images: 파일명 → base64 매핑 (3단계에서 Apps Script 호출 시 메시지 단위로 잘라서 전송)
+//   - stats: 진단용 통계
+async function extractZipBundle(file) {
+  const t0 = Date.now();
+  console.log(`[12-AY-2] .zip 처리 시작: ${file.name} (${(file.size / 1024 / 1024).toFixed(2)} MB)`);
+
+  // 1) JSZip 로드 + .zip 풀기
+  const JSZip = await loadJSZip();
+  const zip = await JSZip.loadAsync(file);
+
+  // 2) 파일 분류
+  const fileEntries = Object.entries(zip.files);
+  const txtFiles = fileEntries.filter(([name, entry]) => !entry.dir && /\.txt$/i.test(name));
+  const imageFiles = fileEntries.filter(([name, entry]) =>
+    !entry.dir && /\.(jpe?g|png)$/i.test(name)
+  );
+
+  console.log(`[12-AY-2] .zip 내용: 파일 ${fileEntries.length}개 (txt ${txtFiles.length}, 이미지 ${imageFiles.length})`);
+
+  if (txtFiles.length === 0) {
+    throw new Error(".zip 안에 .txt 파일이 없습니다. WhatsApp 채팅 내보내기 형식인지 확인해주세요.");
+  }
+
+  // 3) .txt 파싱 (여러 개면 모두 합침)
+  let allMessages = [];
+  for (const [txtName, entry] of txtFiles) {
+    const txtContent = await entry.async("string");
+    const parsed = parseWhatsApp(txtContent);
+    allMessages = allMessages.concat(parsed);
+    console.log(`[12-AY-2] ${txtName}: ${parsed.length} 메시지 파싱`);
+  }
+
+  // 4) 이미지를 base64로 변환 + 파일명 매핑 (#3 결정 b: 별도 객체)
+  // 파일명은 폴더 경로 제거 (예: "WhatsApp Chat/IMG-...jpg" → "IMG-...jpg")
+  const images = {};
+  for (const [imgPath, entry] of imageFiles) {
+    const baseName = imgPath.split("/").pop();
+    const base64 = await entry.async("base64");
+    images[baseName] = base64;
+  }
+  console.log(`[12-AY-2] 이미지 base64 변환 완료: ${Object.keys(images).length}개`);
+
+  // 5) 통계: 매칭/누락 분석
+  const allAttachedFilenames = new Set();
+  allMessages.forEach(m => (m.attachedImages || []).forEach(fn => allAttachedFilenames.add(fn)));
+  const matchedCount = [...allAttachedFilenames].filter(fn => images[fn]).length;
+  const missingFromZip = [...allAttachedFilenames].filter(fn => !images[fn]);
+  const orphanImages = Object.keys(images).filter(fn => !allAttachedFilenames.has(fn));
+
+  const elapsedSec = ((Date.now() - t0) / 1000).toFixed(1);
+  const stats = {
+    elapsedSec,
+    fileSizeMB: (file.size / 1024 / 1024).toFixed(2),
+    txtCount: txtFiles.length,
+    imageFileCount: imageFiles.length,
+    messageCount: allMessages.length,
+    attachedFilenameCount: allAttachedFilenames.size,
+    matchedCount,
+    missingFromZipCount: missingFromZip.length,
+    orphanImageCount: orphanImages.length,
+  };
+
+  // 진단 로그 (#3 결정 b: 통계 + 미리보기)
+  console.log(`[12-AY-2] ✅ 추출 완료 (${elapsedSec}초)`, stats);
+  console.log(`[12-AY-2] 첫 5개 메시지 미리보기:`);
+  allMessages.slice(0, 5).forEach((m, i) => {
+    const txtPrev = (m.text || "").slice(0, 80).replace(/\n/g, " | ");
+    const attached = (m.attachedImages || []).join(", ") || "(없음)";
+    console.log(`  [${i+1}] ${m.date} ${m.time} ${m.sender}: text="${txtPrev}" attached=[${attached}]`);
+  });
+  console.log(`[12-AY-2] 첫 3개 이미지 base64 길이:`);
+  Object.entries(images).slice(0, 3).forEach(([fn, b64]) => {
+    console.log(`  ${fn}: ${b64.length} 글자 (${(b64.length * 0.75 / 1024).toFixed(1)} KB 디코딩 추정)`);
+  });
+  if (missingFromZip.length > 0) {
+    console.warn(`[12-AY-2] ⚠️ .txt에 첨부 줄 있는데 .zip에 없는 이미지 ${missingFromZip.length}건 (#6 결정 a: 누락 허용)`);
+    console.warn(`  샘플: ${missingFromZip.slice(0, 5).join(", ")}`);
+  }
+  if (orphanImages.length > 0) {
+    console.warn(`[12-AY-2] ℹ️ .zip에 있는데 .txt 첨부 줄에 없는 이미지 ${orphanImages.length}건 (참조 안 됨, 무시)`);
+  }
+
+  return { messages: allMessages, images, stats };
+}
+
+// ─── 영역 12-AZ: messages 탭에서 자동연동 데이터 가져오기 ────────────────────
+// Whapi → Apps Script → messages 탭에 자동 적재된 데이터를 직접 조회.
+// 5/4 이후 자동연동 데이터 + 5/3 이전 .zip 일괄 import 데이터 모두 같은 탭에서 조회.
+//
+// 입력:
+//   startDate: "YYYY-MM-DD" (인니 시간 기준, 예: "2026-05-04")
+//   endDate:   "YYYY-MM-DD" (인니 시간 기준)
+//   chatName:  필터할 그룹명 (디폴트: "[Official] AZS Status Reports")
+//
+// 출력: parseWhatsApp과 호환되는 메시지 배열
+//   [{ date, time, hour, sender, text, attachedImages, ... }, ...]
+//
+// 매핑:
+//   timestamp(UTC) → +7시간(인니) → date/time/hour
+//   sender_name → sender (없으면 sender_phone)
+//   message_type=image → attachedImages = [drive_file_id] (Drive 파일 ID 그대로)
+async function fetchMessagesFromTab(startDate, endDate, chatName) {
+  const t0 = Date.now();
+  const params = new URLSearchParams({
+    action: "get_messages",
+    startDate,
+    endDate,
+  });
+  if (chatName) params.set("chatName", chatName);
+
+  // ★ 큐 #22: id_token URL 쿼리 자동 첨부 (Phase B-2 게이트 활성화 시 검증)
+  const url = `${WHAPI_APPS_SCRIPT_URL}?${params.toString()}${authQueryParam()}`;
+  console.log(`[12-AZ] messages 탭 조회 시작: ${startDate} ~ ${endDate} (${chatName || "전체"})`);
+
+  // ★ 영역 12-BK: 45초 timeout (응답 없을 때 무한 대기 방지)
+  const controller = new AbortController();
+  const timeoutId = setTimeout(() => controller.abort(), 45000);
+  let res;
+  try {
+    res = await fetch(url, { signal: controller.signal });
+    clearTimeout(timeoutId);
+  } catch (e) {
+    clearTimeout(timeoutId);
+    if (e.name === "AbortError") {
+      throw new Error(`Apps Script 응답 시간 초과 (45초) — 데이터 크기 또는 서버 부하`);
+    }
+    throw e;
+  }
+  if (!res.ok) {
+    throw new Error(`HTTP ${res.status}: ${res.statusText}`);
+  }
+
+  // ★ 영역 12-BK: 응답 본문 크기 + JSON 파싱 분리 진단
+  let json;
+  const t1 = Date.now();
+  try {
+    json = await res.json();
+  } catch (e) {
+    throw new Error(`응답 JSON 파싱 실패: ${e.message}`);
+  }
+  const parseSec = ((Date.now() - t1) / 1000).toFixed(1);
+  if (parseSec > 2) {
+    console.log(`[12-AZ] 응답 JSON 파싱 ${parseSec}초 (큰 응답)`);
+  }
+  if (!json.ok) {
+    throw new Error(json.error || "Apps Script 응답 오류");
+  }
+
+  const elapsedSec = ((Date.now() - t0) / 1000).toFixed(1);
+  const messages = json.messages || [];
+  console.log(`[12-AZ] ✅ messages 탭 조회 완료 (${elapsedSec}초): ${messages.length}건`);
+
+  // 통계
+  const withAttached = messages.filter(m => (m.attachedImages || []).length > 0).length;
+  const imageMsgs = messages.filter(m => m._messageType === "image").length;
+  console.log(`[12-AZ] 통계: 첨부 있는 메시지 ${withAttached}건 / image 타입 ${imageMsgs}건`);
+
+  if (messages.length > 0) {
+    console.log(`[12-AZ] 첫 3개 메시지 미리보기:`);
+    messages.slice(0, 3).forEach((m, i) => {
+      const txtPrev = (m.text || "").slice(0, 80).replace(/\n/g, " | ");
+      console.log(`  [${i+1}] ${m.date} ${m.time} ${m.sender}: "${txtPrev}" attached=${(m.attachedImages || []).length}`);
+    });
+  }
+
+  return messages;
+}
+
+// ─── 영역 12-AZ: drive_file_id → Drive 미리보기 URL 생성 (필요 시 사용) ─────
+// attachedImages 안의 값이 drive_file_id 형식이면 이 함수로 URL 생성.
+// .txt에서 온 IMG-...jpg 파일명은 변환 안 됨 (현재 분석 흐름엔 미사용).
+function driveFileIdToUrl(fileId) {
+  if (!fileId || fileId.startsWith("IMG-")) return null;  // 파일명 형식이면 패스
+  return `https://drive.google.com/uc?id=${fileId}`;
+}
+
+function getProductionDate(date, hour) {
+  if (hour < 6) {
+    const parts = date.split("/").map(Number);
+    const d = new Date(2000 + parts[0], parts[1] - 1, parts[2]);
+    d.setDate(d.getDate() - 1);
+    const yy = String(d.getFullYear()).slice(-2);
+    const mm = d.getMonth() + 1;
+    const dd = d.getDate();
+    return `${yy}/${mm}/${dd}`;
+  }
+  return date;
+}
+
+function getWeekDates(dateStr) {
+  const parts = dateStr.split("/").map(Number);
+  const d = new Date(2000 + parts[0], parts[1] - 1, parts[2]);
+  const day = d.getDay();
+  const monday = new Date(d);
+  monday.setDate(d.getDate() - (day === 0 ? 6 : day - 1));
+  const dates = [];
+  for (let i = 0; i < 7; i++) {
+    const cur = new Date(monday);
+    cur.setDate(monday.getDate() + i);
+    const yy = String(cur.getFullYear()).slice(-2);
+    const mm = cur.getMonth() + 1;
+    const dd = cur.getDate();
+    dates.push(`${yy}/${mm}/${dd}`);
+  }
+  return dates;
+}
+
+// ─── 영역 8-A: 생산일자(YY/M/D) ↔ Date 객체 변환 + 주/월 그룹핑 헬퍼 ─────────────
+// 생산일자 룰: 시작일자 06:00 ~ 종료일자+1일 06:00 (getProductionDate와 일치)
+function dateStrToDate(dateStr) {
+  const parts = dateStr.split("/").map(Number);
+  return new Date(2000 + parts[0], parts[1] - 1, parts[2]);
+}
+function dateToDateStr(d) {
+  return `${String(d.getFullYear()).slice(-2)}/${d.getMonth() + 1}/${d.getDate()}`;
+}
+function isoToDateStr(iso) {
+  // "2026-04-13" → "26/4/13"
+  const [y, m, d] = iso.split("-").map(Number);
+  return `${String(y).slice(-2)}/${m}/${d}`;
+}
+function dateStrToIso(dateStr) {
+  const parts = dateStr.split("/").map(Number);
+  const yyyy = 2000 + parts[0];
+  const mm = String(parts[1]).padStart(2, "0");
+  const dd = String(parts[2]).padStart(2, "0");
+  return `${yyyy}-${mm}-${dd}`;
+}
+// 시작/끝 생산일자 → 그 사이의 모든 생산일자 배열
+function expandRange(startStr, endStr) {
+  const s = dateStrToDate(startStr);
+  const e = dateStrToDate(endStr);
+  if (e < s) return [];
+  const result = [];
+  for (let cur = new Date(s); cur <= e; cur.setDate(cur.getDate() + 1)) {
+    result.push(dateToDateStr(cur));
+  }
+  return result;
+}
+// 주어진 생산일자가 속한 ISO week (월요일~일요일) 정보
+function getWeekInfo(dateStr) {
+  const d = dateStrToDate(dateStr);
+  const day = d.getDay(); // 0=일, 1=월, ...
+  const monday = new Date(d);
+  monday.setDate(d.getDate() - (day === 0 ? 6 : day - 1));
+  const sunday = new Date(monday);
+  sunday.setDate(monday.getDate() + 6);
+  // 4월 N주차 라벨: 그 주 목요일이 속한 월의 N주차로 계산 (ISO 표준)
+  const thursday = new Date(monday);
+  thursday.setDate(monday.getDate() + 3);
+  const month = thursday.getMonth() + 1;
+  const year = thursday.getFullYear();
+  // 해당 월의 첫 목요일 → 1주차
+  const firstThu = new Date(year, month - 1, 1);
+  while (firstThu.getDay() !== 4) firstThu.setDate(firstThu.getDate() + 1);
+  const weekNo = Math.floor((thursday.getDate() - firstThu.getDate()) / 7) + 1;
+  return {
+    start: dateToDateStr(monday),
+    end: dateToDateStr(sunday),
+    label: `${year}년 ${month}월 ${weekNo}주차`,
+    key: `${year}-${String(month).padStart(2, "0")}-W${weekNo}`,
+  };
+}
+// 주어진 일자 범위에 포함된 모든 주 정보 (중복 제거)
+function getWeeksInRange(startStr, endStr) {
+  const dates = expandRange(startStr, endStr);
+  const map = new Map();
+  for (const d of dates) {
+    const w = getWeekInfo(d);
+    if (!map.has(w.key)) map.set(w.key, w);
+  }
+  return Array.from(map.values());
+}
+// 주어진 일자 범위에 포함된 모든 월 정보 (중복 제거)
+function getMonthsInRange(startStr, endStr) {
+  const s = dateStrToDate(startStr);
+  const e = dateStrToDate(endStr);
+  const map = new Map();
+  for (let cur = new Date(s.getFullYear(), s.getMonth(), 1); cur <= e; cur.setMonth(cur.getMonth() + 1)) {
+    const y = cur.getFullYear();
+    const m = cur.getMonth() + 1;
+    const key = `${y}-${String(m).padStart(2, "0")}`;
+    map.set(key, {
+      year: y, month: m, label: `${y}년 ${m}월`, key,
+      // 그 월의 모든 일자 (해당 범위 내)
+      dates: [],
+    });
+  }
+  // 각 월에 속한 생산일자 채워넣기
+  for (const dateStr of expandRange(startStr, endStr)) {
+    const parts = dateStr.split("/").map(Number);
+    const key = `${2000 + parts[0]}-${String(parts[1]).padStart(2, "0")}`;
+    if (map.has(key)) map.get(key).dates.push(dateStr);
+  }
+  return Array.from(map.values());
+}
+// 빠른 선택 프리셋 (오늘 / 어제 / 이번 주 / 지난 주 / 이번 달 / 지난 달 / 최근 7일 / 최근 30일)
+// 모두 "생산일자" 기준 (06시 룰 적용은 메시지 필터 단계에서 처리)
+function getQuickRange(preset, todayDateStr) {
+  const today = dateStrToDate(todayDateStr);
+  const dayOfWeek = today.getDay() === 0 ? 7 : today.getDay(); // 월=1,...,일=7
+  const helpers = {
+    "today":      () => [todayDateStr, todayDateStr],
+    "yesterday":  () => {
+      const y = new Date(today); y.setDate(today.getDate() - 1);
+      const ys = dateToDateStr(y);
+      return [ys, ys];
+    },
+    "thisWeek":   () => {
+      const mon = new Date(today); mon.setDate(today.getDate() - (dayOfWeek - 1));
+      return [dateToDateStr(mon), todayDateStr];
+    },
+    "lastWeek":   () => {
+      const mon = new Date(today); mon.setDate(today.getDate() - (dayOfWeek - 1) - 7);
+      const sun = new Date(mon); sun.setDate(mon.getDate() + 6);
+      return [dateToDateStr(mon), dateToDateStr(sun)];
+    },
+    "thisMonth":  () => {
+      const first = new Date(today.getFullYear(), today.getMonth(), 1);
+      return [dateToDateStr(first), todayDateStr];
+    },
+    "lastMonth":  () => {
+      const first = new Date(today.getFullYear(), today.getMonth() - 1, 1);
+      const last  = new Date(today.getFullYear(), today.getMonth(), 0);
+      return [dateToDateStr(first), dateToDateStr(last)];
+    },
+    "last7":      () => {
+      const s = new Date(today); s.setDate(today.getDate() - 6);
+      return [dateToDateStr(s), todayDateStr];
+    },
+    "last30":     () => {
+      const s = new Date(today); s.setDate(today.getDate() - 29);
+      return [dateToDateStr(s), todayDateStr];
+    },
+  };
+  return helpers[preset] ? helpers[preset]() : null;
+}
+
+// ─── 영역 11-J: 06시 생산일자 룰 기반 분석 기간 라벨 ─────────────────────────
+// 예: ["26/4/28"] → "2026년 4월 28일 06:00 ~ 4월 29일 06:00"
+function buildProductionRangeLabel(selDates) {
+  if (!selDates || selDates.length === 0) return "";
+  // ★ 영역 12-BK-fix: 문자열 sort 버그 — Date 비교로 변경 (10일+ 자릿수 문제)
+  const sorted = [...selDates].sort(
+    (a, b) => dateStrToDate(a).getTime() - dateStrToDate(b).getTime()
+  );
+  const startStr = sorted[0];
+  const endStr = sorted[sorted.length - 1];
+
+  const startD = dateStrToDate(startStr);
+  const endD = dateStrToDate(endStr);
+  const endNext = new Date(endD);
+  endNext.setDate(endNext.getDate() + 1);
+
+  const fmt = (d, includeYear = false) => {
+    const y = d.getFullYear();
+    const m = d.getMonth() + 1;
+    const day = d.getDate();
+    return includeYear ? `${y}년 ${m}월 ${day}일` : `${m}월 ${day}일`;
+  };
+
+  const sameYear = startD.getFullYear() === endNext.getFullYear();
+  const startLabel = fmt(startD, true);
+  const endLabel = fmt(endNext, !sameYear);
+  const hours = Math.round((endNext - startD) / (1000 * 60 * 60));
+  const days = sorted.length;
+
+  return `${startLabel} 06:00 ~ ${endLabel} 06:00 (${days}일, 약 ${hours}시간)`;
+}
+
+// 보고서 헤더용 라벨 빌더
+function buildRangeLabel(selRange) {
+  if (!selRange || !selRange.start || !selRange.end) return "";
+  const { start, end, unit } = selRange;
+  if (unit === "month") {
+    const months = getMonthsInRange(start, end);
+    if (months.length === 1) return `${months[0].label} (월간)`;
+    if (months.length > 1) return `${months[0].label} ~ ${months[months.length-1].label} (${months.length}개월)`;
+  }
+  if (unit === "week") {
+    const weeks = getWeeksInRange(start, end);
+    if (weeks.length === 1) return `${weeks[0].label} (주간)`;
+    if (weeks.length > 1) return `${weeks[0].label} ~ ${weeks[weeks.length-1].label} (${weeks.length}주)`;
+  }
+  // day 단위
+  if (start === end) return `${start} (1일)`;
+  const days = expandRange(start, end).length;
+  return `${start} ~ ${end} (${days}일)`;
+}
+
+function getUniqueDates(msgs) {
+  const prodDates = msgs.map(m => getProductionDate(m.date, m.hour));
+  return [...new Set(prodDates)].sort((a, b) => {
+    const pa = a.split("/").map(Number);
+    const pb = b.split("/").map(Number);
+    for (let i = 0; i < 3; i++) if (pa[i] !== pb[i]) return pa[i] - pb[i];
+    return 0;
+  });
+}
+
+function filterByDates(msgs, dates) {
+  return msgs.filter(m => dates.includes(getProductionDate(m.date, m.hour)));
+}
+
+// ─── 이슈 파싱 (기존 그대로) ────────────────────────────────────────────────────
+function extractField(text, fieldName) {
+  // ★ 영역 12-BB: 한 줄 caption + 다중 줄 .txt 모두 호환
+  // 기존: ([^\n]+) — 줄바꿈 전까지만 캡처 → messages 탭 한 줄 caption에서는 다음 필드까지 다 캡처되는 버그
+  // 변경: (.*?) non-greedy + lookahead — 다음 *Field*: 패턴 또는 끝까지 매칭
+  // 's' flag로 .이 줄바꿈도 포함 (다중 줄 .txt 대응)
+  // 주의: colon 뒤 \\*? 제거 — 빈 필드(*Part Replacement*: *PIC*:) 케이스에서 다음 필드 별표를 먹지 않게
+  const re = new RegExp(
+    `\\*?${fieldName}\\*?[:\\s]+\\n?-?\\s*(.*?)(?=\\s*\\*[A-Z][^*]*\\*\\s*:|$)`,
+    "is"
+  );
+  const m = text.match(re);
+  if (!m) return "";
+  let val = m[1].replace(/\*/g, "").trim();
+  // BM Bot trailing 자동 메시지 제거 (예: "> _this is an automated message_")
+  val = val.replace(/>\s*_[^_]*_?\s*$/, "").trim();
+  return val;
+}
+
+// ★ 영역 12-BB: Countermeasure 단계 분리 헬퍼
+// .txt 다중 줄 형식 ("1. xxx\n2. yyy") + caption 한 줄 형식 ("1. xxx2. yyy") 모두 호환
+function splitActionSteps(action) {
+  if (!action || !action.trim()) return [];
+  // 1차 시도: 줄바꿈 기준 (다중 줄 .txt 형식)
+  const byNewline = action.split(/\n+/)
+    .map(s => s.trim())
+    .filter(s => /^\d+\.\s/.test(s));
+  if (byNewline.length > 1) return byNewline;
+  // 2차 시도: 한 줄 caption — \d+\.\s 패턴 직전에 split
+  // lookbehind 미지원 환경 대비 — 마커 삽입 후 split
+  const marked = action.replace(/(\D)(\d+\.\s)/g, '$1\u0001$2');
+  const bySplit = marked.split('\u0001').map(s => s.trim()).filter(Boolean);
+  if (bySplit.length > 1) return bySplit;
+  // 3차: 단계 분리 실패 — 한 덩어리로
+  return [action.trim()];
+}
+
+// ★ 영역 12-AD1: 키워드 정밀 매칭 — 짧은 영문 약어는 단어 경계 강제
+// 버그 사례: "NG" 키워드가 "tuangan", "barang", "yang" 등 인도네시아어/일반 단어 안의 "ng" 부분문자열에 잘못 매칭됨
+// 해결: 영문/숫자만으로 구성된 짧은 키워드(1~3자)는 \b 단어 경계로 매칭, 긴 키워드/한글은 부분문자열 그대로
+function matchKeyword(text, kw) {
+  const lowerKw = (kw || "").toLowerCase();
+  if (!lowerKw) return false;
+  const lowerText = (text || "").toLowerCase();
+  // 짧은 영문/숫자 약어 (1~3자) → 단어 경계 강제
+  if (lowerKw.length <= 3 && /^[a-z0-9]+$/.test(lowerKw)) {
+    const escaped = lowerKw.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
+    const re = new RegExp(`\\b${escaped}\\b`, 'i');
+    return re.test(text);
+  }
+  // 긴 키워드 또는 한글/특수문자 포함 → 부분문자열 매칭 (기존 로직)
+  return lowerText.includes(lowerKw);
+}
+
+function classifyMessages(msgs) {
+  const downtime = [], equipment = [], general = [];
+  // 영역 5: 큐레이션 이력 카테고리
+  const qualityMsgs = [], processChangeMsgs = [], testMsgs = [], ambiguousMsgs = [];
+  // ★ 영역 12-AU: critical 카테고리 (라인 정지/매니저 직접 개입/주요 부품 교체)
+  const criticalMsgs = [];
+
+  // ★ 영역 12-AC2: 안전망용 — 옛 형식 흡수된 sub-message 키워드 분류 헬퍼
+  const classifySubMessage = (subText, baseEntry) => {
+    if (!subText || subText.trim().length <= 5) return;
+    if (subText.includes("미디어 파일 제외됨")) return;
+
+    // ★ 12-AU: critical 우선 검사 (다른 분류보다 상위)
+    const isCritical = CRITICAL_KEYWORDS.some(kw => matchKeyword(subText, kw));
+    if (isCritical) {
+      criticalMsgs.push({ ...baseEntry, text: subText });
+      return;
+    }
+
+    const matched = [];
+    // ★ 12-AD1: matchKeyword (단어 경계 강제)
+    if (QUALITY_KEYWORDS.some(kw => matchKeyword(subText, kw))) matched.push("quality");
+    if (PROCESS_CHANGE_KEYWORDS.some(kw => matchKeyword(subText, kw))) matched.push("process_change");
+    if (TEST_KEYWORDS.some(kw => matchKeyword(subText, kw))) matched.push("test");
+    // 패턴 매칭
+    if (!matched.includes("process_change")) {
+      const settingPattern = /\d+(?:\.\d+)?\s*(?:→|->|=>|>>)\s*\d+(?:\.\d+)?/;
+      if (settingPattern.test(subText)) matched.push("process_change");
+    }
+    if (!matched.includes("quality")) {
+      const jxtPattern = /JXT\d{10,}/i;
+      if (jxtPattern.test(subText)) matched.push("quality");
+    }
+    const subEntry = { ...baseEntry, text: subText };
+    if (matched.length === 1) {
+      if (matched[0] === "quality") qualityMsgs.push(subEntry);
+      else if (matched[0] === "process_change") processChangeMsgs.push(subEntry);
+      else if (matched[0] === "test") testMsgs.push(subEntry);
+    } else if (matched.length >= 2) {
+      ambiguousMsgs.push({ ...subEntry, matched });
+    }
+  };
+
+  let absorbedSubCount = 0;  // 12-AC2 진단용
+  let i = 0;
+  while (i < msgs.length) {
+    const m = msgs[i];
+    if (m.text.includes("[BM Downtime Bot]")) {
+      let full = m.text;
+
+      // ★ 영역 12-AC1: 신 형식 BM Bot 감지 — Start Time / End Time이 모두 있으면 단일 메시지로 완결됨
+      // 옛 형식 (~2025): 한 메시지가 여러 줄로 분리됨 → multi-line 통합 필요
+      // 신 형식 (2026~): 한 메시지에 모든 필드 포함 → 통합 시 일반 메시지 흡수 부작용
+      const hasCompleteFields = m.text.includes("Start Time") && m.text.includes("End Time");
+
+      if (!hasCompleteFields) {
+        // 옛 형식 — multi-line 통합 (기존 로직 + 12-AC2 안전망)
+        let j = i + 1;
+        const absorbedTexts = [];  // 흡수된 sub-message 보관 (안전망)
+        while (j < msgs.length && !msgs[j].text.includes("[BM Downtime Bot]")) {
+          if (!msgs[j].text.includes("미디어 파일 제외됨")) {
+            full += "\n" + msgs[j].text;
+            absorbedTexts.push({ text: msgs[j].text, msg: msgs[j] });  // 흡수 시 보관
+          }
+          j++;
+          if (j - i > 15) break;
+        }
+        downtime.push({ time: m.time, text: full, date: m.date, hour: m.hour });
+
+        // ★ 12-AC2: 흡수된 sub-message 각각도 키워드 매칭 별도 실행 (PM/조건변경 누락 방지)
+        absorbedTexts.forEach(({ text, msg }) => {
+          classifySubMessage(text, {
+            time: msg.time, sender: msg.sender, date: msg.date, hour: msg.hour,
+          });
+          absorbedSubCount++;
+        });
+
+        i = j;
+      } else {
+        // ★ 12-AC1: 신 형식 — 단일 메시지로 처리, 다음 일반 메시지 흡수 안 함
+        downtime.push({ time: m.time, text: full, date: m.date, hour: m.hour });
+        i++;
+      }
+    } else if (m.text.match(/cutter|limit|⚠️|🟡|cathode|anode/i)) {
+      equipment.push({ time: m.time, sender: m.sender, text: m.text, date: m.date, hour: m.hour });
+      i++;
+    } else {
+      if (m.text.trim().length > 5) general.push({ time: m.time, sender: m.sender, text: m.text, date: m.date, hour: m.hour });
+      i++;
+    }
+
+    // ── 영역 5: 다운타임이 아닌 메시지에 대해 큐레이션 카테고리 키워드 매칭 ──
+    // (다운타임 메시지는 j까지 점프했으므로 위에서 분류되고 여기는 돌아오지 않음)
+    if (m.text.includes("[BM Downtime Bot]")) continue;
+    if (m.text.trim().length <= 5) continue;
+    if (m.text.includes("미디어 파일 제외됨")) continue;
+
+    // ★ 영역 12-AU: critical 우선 검사 — 매칭 시 criticalMsgs에 추가 + general에서 제거
+    // critical은 다른 분류보다 상위 우선순위 (라인 정지 같은 사건이 흩어지지 않도록)
+    if (CRITICAL_KEYWORDS.some(kw => matchKeyword(m.text, kw))) {
+      criticalMsgs.push({ time: m.time, sender: m.sender, text: m.text, date: m.date, hour: m.hour });
+      // 873줄에서 general에 이미 push됐으면 빼기
+      if (general.length > 0 &&
+          general[general.length - 1].time === m.time &&
+          general[general.length - 1].text === m.text) {
+        general.pop();
+      }
+      continue;
+    }
+
+    const matched = [];
+    // ★ 12-AD1: matchKeyword (단어 경계 강제) — "ng" 부분문자열 오매칭 차단
+    if (QUALITY_KEYWORDS.some(kw => matchKeyword(m.text, kw))) matched.push("quality");
+    if (PROCESS_CHANGE_KEYWORDS.some(kw => matchKeyword(m.text, kw))) matched.push("process_change");
+    if (TEST_KEYWORDS.some(kw => matchKeyword(m.text, kw))) matched.push("test");
+
+    // ★ 영역 12-AB3: 패턴 매칭 — "숫자 → 숫자" 또는 "숫자->숫자" 패턴 발견 시 process_change 자동 분류
+    // 예: "39.6 → 40.0", "70.2 -> 70.6", "180 → 200"
+    if (!matched.includes("process_change")) {
+      const settingPattern = /\d+(?:\.\d+)?\s*(?:→|->|=>|>>)\s*\d+(?:\.\d+)?/;
+      if (settingPattern.test(m.text)) {
+        matched.push("process_change");
+      }
+    }
+
+    // ★ 영역 12-AB3: JXT lot ID 패턴 (예: JXT11251121022J66103) — quality 자동 분류
+    if (!matched.includes("quality")) {
+      const jxtPattern = /JXT\d{10,}/i;
+      if (jxtPattern.test(m.text)) {
+        matched.push("quality");
+      }
+    }
+
+    const entry = { time: m.time, sender: m.sender, text: m.text, date: m.date, hour: m.hour };
+
+    if (matched.length === 1) {
+      // 1개 카테고리만 매칭 → 직접 할당
+      if (matched[0] === "quality") qualityMsgs.push(entry);
+      else if (matched[0] === "process_change") processChangeMsgs.push(entry);
+      else if (matched[0] === "test") testMsgs.push(entry);
+    } else if (matched.length >= 2) {
+      // 2개 이상 카테고리에 걸침 → 모호 (AI 분류 대상, 5-C에서 처리)
+      ambiguousMsgs.push({ ...entry, matched });
+    } else {
+      // matched.length === 0 → general 배열에만 남음 (AI 비용 절약)
+      general.push(entry);
+    }
+  }
+  // ★ 영역 12-AB4 + 12-AC2 + 12-AU: 분류 안 된 일반 메시지 진단 로그
+  if (typeof console !== "undefined") {
+    if (absorbedSubCount > 0) {
+      console.log(`[메시지 분류] 옛 형식 BM Bot이 흡수한 sub-message ${absorbedSubCount}건도 키워드 분류 별도 실행 (12-AC2)`);
+    }
+    // ★ 12-AU: critical 메시지 진단 출력
+    if (criticalMsgs.length > 0) {
+      console.log(`[★ Critical 분류] ${criticalMsgs.length}건 — 라인 정지/매니저 직접/주요 부품 교체 (6번 인사이트 강제 포함):`);
+      criticalMsgs.slice(0, 8).forEach((c, i) => {
+        const preview = (c.text || "").replace(/\n/g, " ").slice(0, 120);
+        console.log(`  [C${i+1}] ${c.date} ${c.time} ${c.sender || "?"}: ${preview}`);
+      });
+    } else {
+      console.log(`[Critical 분류] 0건 — 이번 윈도우에 라인 정지/매니저 직접 개입 사건 없음`);
+    }
+    if (general.length > 0) {
+      console.log(`[메시지 분류 진단] 분류 안 됨(general) ${general.length}건. 샘플 5건 (3,4번 누락 진단용):`);
+      general.slice(0, 5).forEach((g, i) => {
+        const preview = (g.text || "").replace(/\n/g, " ").slice(0, 150);
+        console.log(`  [${i+1}] ${g.sender || "?"}: ${preview}${g.text.length > 150 ? "..." : ""}`);
+      });
+    }
+    if (processChangeMsgs.length === 0 && testMsgs.length === 0 && general.length > 5) {
+      console.warn(`[⚠️ 분류 경고] process_change/test 모두 0건 — 키워드 매칭 부족 가능. 위 general 샘플 확인 필요`);
+    }
+  }
+  return { downtime, equipment, general, qualityMsgs, processChangeMsgs, testMsgs, ambiguousMsgs, criticalMsgs };
+}
+
+// ─── 영역 5-C: 모호 메시지 AI 분류 (2개 이상 카테고리에 걸친 메시지만 Haiku 호출) ──
+async function classifyAmbiguousMessages(ambiguousMsgs) {
+  if (!ambiguousMsgs || ambiguousMsgs.length === 0) {
+    return { quality: [], process_change: [], test: [], skip: [] };
+  }
+
+  const sys = `당신은 공장 메시지 분류기입니다. 각 메시지를 다음 카테고리 중 하나로 정확히 분류하세요:
+- quality: 품질 이슈 (불량, NG, 수율, 외관 등 결과 측면)
+- process_change: 설비/공정 조건 변경 (recipe/setpoint/gap/온도/속도 등 셋팅 변경)
+- test: 테스트/양산외 생산 (DOE, trial, 시험, 샘플 등)
+- skip: 위 어디에도 명확히 해당하지 않음
+
+여러 카테고리에 걸쳐 있다면 메시지의 주된 의도를 보고 1개만 선택하세요.
+출력은 JSON 객체만, 다른 텍스트 금지.`;
+
+  const userMsg = `[모호 메시지 ${ambiguousMsgs.length}건]
+${ambiguousMsgs.map((m, i) => `${i + 1}. ${m.text.slice(0, 200).replace(/\n/g, " ")}`).join("\n")}
+
+다음 형식으로 출력 (메시지 번호와 카테고리):
+{"items":[{"no":1,"category":"quality"},{"no":2,"category":"process_change"}]}`;
+
+  try {
+    const raw = await callClaudeRaw(sys, userMsg, { model: MODEL_FAST, max_tokens: 1500 });
+    const parsed = safeJSON(raw);
+    const result = { quality: [], process_change: [], test: [], skip: [] };
+    if (Array.isArray(parsed.items)) {
+      parsed.items.forEach(item => {
+        const idx = (item.no || 0) - 1;
+        const cat = item.category;
+        if (idx >= 0 && idx < ambiguousMsgs.length && result[cat]) {
+          result[cat].push(ambiguousMsgs[idx]);
+        }
+      });
+    }
+    return result;
+  } catch (e) {
+    console.error("[모호 메시지 AI 분류 실패]", e);
+    // 폴백: 모호 메시지를 첫 매칭 카테고리에 자동 할당
+    const result = { quality: [], process_change: [], test: [], skip: [] };
+    ambiguousMsgs.forEach(m => {
+      const first = m.matched?.[0];
+      if (first === "quality") result.quality.push(m);
+      else if (first === "process_change") result.process_change.push(m);
+      else if (first === "test") result.test.push(m);
+      else result.skip.push(m);
+    });
+    return result;
+  }
+}
+
+// ─── 영역 11-A: 다운타임 → 모든 이슈 추출 (priority 분류 폐기) ─────────────────
+// 기존 classifyPriority/scoreIssue/selectKeyIssues는 영역 11에서 폐기됨.
+// 모든 이슈는 동등하게 추출되고, tags(LONG_DOWNTIME/HIGH_FREQUENCY/...)로만 분류.
+// 자동 선정 = LONG_DOWNTIME 또는 HIGH_FREQUENCY tag 보유.
+// 사용자 추가 = STEP 3 체크박스로 자유롭게 선택.
+// ─── 영역 6: 이슈 안정 ID (체크박스 추적용) — 모듈 최상위 (모든 컴포넌트 공유) ─
+function getIssueId(issue) {
+  return `${issue.date || "?"}_${issue.time || "?"}_${issue.eq || "?"}_${(issue.prob || "").slice(0, 20)}`;
+}
+
+// ★ 큐 #19 ⑧(재작업): 전극 조각 미회수(혼입 의심) 메시지 직접 추출
+// crack은 BM Downtime Bot이 아니라 image caption 양식(*Machine* / *phenomenon: crack* / *Result: Potongan tidak lengkap*)
+// → 모호분류로 품질 카테고리(categoryMsgs.quality)로 감. tagged.issues(downtime)에 없으므로 메시지에서 직접 추출
+function extractFragmentLost(categoryMsgs = {}) {
+  const regex = SCORE_KEYWORD_MATRIX.electrode_fragment_lost._regex;
+  const pools = [
+    ...(categoryMsgs.quality || []),
+    ...(categoryMsgs.critical || []),
+    ...(categoryMsgs.process_change || []),
+    ...(categoryMsgs.test || []),
+  ];
+  const out = [];
+  const seen = new Set();
+  for (const m of pools) {
+    const txt = m.text || "";
+    if (!regex.test(txt)) continue;  // crack + 미회수(tidak ketemu/lengkap 등) 조합만 — "ditemukan"(발견)은 제외
+    const grab = (label) => {
+      const mm = txt.match(new RegExp(`\\*?\\s*${label}\\s*:?\\s*\\*?\\s*([^\\n*]+)`, "i"));
+      return mm ? mm[1].trim() : "";
+    };
+    const machine = grab("Machine") || grab("Mesin");
+    const phenom = grab("phenomenon") || grab("fenomena");
+    const result = grab("Result") || grab("Hasil");
+    const timeF = grab("Time") || String(m.time || "");
+    const key = `${machine}|${timeF}|${phenom}`;
+    if (seen.has(key)) continue;  // 동일 건 중복 제거
+    seen.add(key);
+    out.push({ machine: machine || "?", phenomenon: phenom, result, time: timeF });
+  }
+  return out;
+}
+
+function extractAllIssues(downtime, allMessages = []) {
+  // ★ 영역 12-BG-4 (큐 #6 단계 1-RC-1): 같은 호기 image_analyses 매칭 준비
+  // 호기별 image 메시지 인덱스 — BM Bot Image Attachment 또는 PE Tech 첨부 이미지
+  const imageMsgsByEq = {};
+  for (const m of allMessages) {
+    if (m._messageType !== "image") continue;
+    if (!m.image_analyses || m.image_analyses.length === 0) continue;
+    const analyses = m.image_analyses.filter(a => a && String(a).trim().length > 0);
+    if (analyses.length === 0) continue;
+    // BM Bot Image Attachment 형식: "[STK-3-B5/8/5/2026, 00.00 - ...]"
+    const bmEqMatch = (m.text || "").match(/\[([\w\-\(\)\+]+)\//);
+    if (bmEqMatch) {
+      const eq = bmEqMatch[1];
+      if (!imageMsgsByEq[eq]) imageMsgsByEq[eq] = [];
+      imageMsgsByEq[eq].push({ msg: m, analyses, isBmAttachment: true });
+      continue;
+    }
+    // PE Tech 메시지: text에서 호기 패턴 직접 추출 (예: "STK-1-B4", "1-B4", "Cutter 2C(-)")
+    const peEqMatch = (m.text || "").match(/(STK|CUT|FI|ULD)-?\s*(\d-?[A-Z]\d|\d-?\d|\d-?[A-Z]\(?[\+\-]?\)?)/i);
+    if (peEqMatch) {
+      const eq = peEqMatch[0].toUpperCase().replace(/\s+/g, "");
+      if (!imageMsgsByEq[eq]) imageMsgsByEq[eq] = [];
+      imageMsgsByEq[eq].push({ msg: m, analyses, isBmAttachment: false });
+    }
+  }
+
+  // ★ 큐 #19 ①: 봇 중복 제거 — Equipment+Start Time+End Time+Duration 완전일치 시 1건 병합
+  // (봇이 동일 다운타임을 수초~1분 간격으로 재전송하는 케이스. 예: 5/19 STK-4-A6 12:50/12:51, 5/22 STK-4-A2 14:55)
+  // 완전일치만 병합하므로 실제 재발(다른 Start/End)은 보존됨 → repeatCount 부풀림·중복 카운트 방지
+  let _dupMerged = 0;
+  {
+    const _seenKeys = new Set();
+    const _deduped = [];
+    for (const d of downtime) {
+      const _eqK = extractField(d.text, "Equipment") || "";
+      const _stK = extractField(d.text, "Start Time") || "";
+      const _enK = extractField(d.text, "End Time") || "";
+      const _duK = extractField(d.text, "Duration") || "";
+      // 키 구성요소가 전부 비면 dedup 판단 불가 → 그대로 유지 (보수적)
+      if (!_eqK && !_stK && !_enK && !_duK) { _deduped.push(d); continue; }
+      const _key = `${_eqK}|${_stK}|${_enK}|${_duK}`;
+      if (_seenKeys.has(_key)) { _dupMerged++; continue; }
+      _seenKeys.add(_key);
+      _deduped.push(d);
+    }
+    if (_dupMerged > 0) console.log(`[extractAllIssues] ★ 봇 중복 ${_dupMerged}건 병합 (${downtime.length}→${_deduped.length})`);
+    downtime = _deduped;
+  }
+
+  const equipCount = {}, partCount = {}, alarmCount = {};
+  // 사전 카운트 (반복 횟수 계산용)
+  downtime.forEach(d => {
+    const eq = extractField(d.text, "Equipment");
+    const part = extractField(d.text, "Part Replacement");
+    const alarmMatch = (d.text || "").match(/\*?Alarm\*?\s*[:：]\s*([^\n]+)/i);
+    const alarm = alarmMatch ? alarmMatch[1].trim() : "";
+    if (eq) equipCount[eq] = (equipCount[eq] || 0) + 1;
+    if (part && part !== "-" && part.length > 2) partCount[part] = (partCount[part] || 0) + 1;
+    if (alarm) alarmCount[alarm] = (alarmCount[alarm] || 0) + 1;
+  });
+
+  const _outIssues = downtime.map(d => {
+    const result = extractField(d.text, "Result");
+    // ★ 큐 #19 ④: 발생시각(본문 Start Time)을 보고시각(메시지 timestamp)과 별도로 보존
+    const occurredAt = extractField(d.text, "Start Time") || "";
+    const durStr = extractField(d.text, "Duration");
+    let durMin = parseInt(durStr) || 0;
+
+    // ★ 영역 12-AA: 신 형식 BM Bot 지원 — Duration 필드 없을 때 Start Time / End Time으로 계산
+    // 옛 형식 (~2025): *Duration*: 7 minutes
+    // 신 형식 (2026~): *Start Time*: 8/11/2025, 2:48:10 PM / *End Time*: 8/11/2025, 3:00:10 PM
+    if (durMin === 0) {
+      const startStr = extractField(d.text, "Start Time");
+      const endStr = extractField(d.text, "End Time");
+      if (startStr && endStr) {
+        try {
+          const startDate = new Date(startStr);
+          const endDate = new Date(endStr);
+          if (!isNaN(startDate.getTime()) && !isNaN(endDate.getTime())) {
+            const diffMin = Math.round((endDate.getTime() - startDate.getTime()) / 60000);
+            if (diffMin > 0 && diffMin < 24 * 60 * 7) {  // 0~1주일 사이만 유효 (방어)
+              durMin = diffMin;
+            }
+          }
+        } catch (e) {
+          // 파싱 실패 시 0 유지
+        }
+      }
+    }
+
+    const stopStatus = extractField(d.text, "Stop Status");
+    const eq = extractField(d.text, "Equipment");
+    const part = extractField(d.text, "Part Replacement");
+    const prob = extractField(d.text, "Problem");
+    const cause = extractField(d.text, "Cause");
+    // ★ 영역 12-BB: 실제 BM Bot 필드명은 *Countermeasure*: (Action 아님)
+    // legacy 데이터에 *Action*: 형식이 있을 수 있어 fallback 유지
+    const action = extractField(d.text, "Countermeasure") || extractField(d.text, "Action");
+    const pic = extractField(d.text, "PIC");
+    const alarmMatch = (d.text || "").match(/\*?Alarm\*?\s*[:：]\s*([^\n]+)/i);
+    const alarm = alarmMatch ? alarmMatch[1].trim() : "";
+    const repeatCount = Math.max(
+      eq ? (equipCount[eq] || 1) : 1,
+      (part && part !== "-" && part.length > 2) ? (partCount[part] || 1) : 1,
+    );
+    // ★ 영역 12-BG-4: 같은 호기의 image_analyses 매칭 (최대 5개)
+    const matchedImages = [];
+    if (eq && imageMsgsByEq[eq]) {
+      for (const entry of imageMsgsByEq[eq]) {
+        for (const a of entry.analyses) {
+          if (matchedImages.length < 5 && !matchedImages.includes(a)) {
+            matchedImages.push(a);
+          }
+        }
+      }
+    }
+
+    return {
+      ...d,
+      eq, prob, cause, result, action, pic, durMin,
+      occurredAt,  // ★ 큐 #19 ④: 발생시각 (보고시각과 구분)
+      stopStatus, repeatCount, _alarm: alarm,
+      reasons: [],
+      image_analyses: matchedImages,  // ★ 12-BG-4: 매칭된 이미지 분석 결과
+    };
+  });
+  // ★ 큐 #19 ①: 봇 중복 병합 건수를 배열 속성으로 보존 (generateReport 진단 배지에서 사용)
+  try { Object.defineProperty(_outIssues, "_dupMerged", { value: _dupMerged, enumerable: false }); } catch (e) {}
+  return _outIssues;
+}
+
+// ─── 영역 12-AW: Critical 메시지 → 가상 issue 변환 ─────────────────────────
+// 정답 레포트 격차 분석에 따라, criticalMsgs (라인 정지/매니저 직접/주요 부품 교체) 를
+// 점수 시스템 / 페르소나 논의 후보에 합류시켜 P0 우선순위로 올라가도록 함.
+//
+// 작동 흐름:
+//   1) 호기명 자동 추출 (STK/MGAD/CUT/Line 정규식)
+//   2) 시간 ±60분 + 호기 매칭으로 그룹화 (호기 못 찾으면 개별 issue)
+//   3) 그룹당 첫 메시지를 대표 issue로 변환
+//   4) durMin 추정: 라인 정지 키워드 → 60, 아니면 30
+//   5) _criticalGroup 멤버 보존 (escalation timeline용)
+//   6) issue.text에 그룹 전체 본문 보존 (scoreIssueMatrix 매니저 매칭용)
+function extractCriticalIssues(criticalMsgs) {
+  if (!criticalMsgs || criticalMsgs.length === 0) return [];
+
+  // 1) 호기명 추출 정규식 (우선순위 순)
+  const EQ_PATTERNS = [
+    /\b(STK-\d-[A-Z]\d+)\b/i,
+    /\b(MGAD[BN]\w*\d{4,})\b/i,
+    /\b(CUT-\d-?[A-Z]?\(?[+-]?\)?)\b/i,
+    /\b(Line\s*\d-?[A-Z]\d?)\b/i,
+    /\b(STK-\d-[A-Z])\b/i,  // STK-1-B 같은 짧은 형식
+  ];
+  const extractEquipment = (text) => {
+    const t = String(text || "");
+    for (const pattern of EQ_PATTERNS) {
+      const m = t.match(pattern);
+      if (m) return m[1].trim();
+    }
+    return null;
+  };
+
+  // 2) 라인 정지 키워드 (있으면 durMin=60, 없으면 30)
+  const LINE_STOP_KEYWORDS = [
+    "Sudden Trip", "sudden trip",
+    "All Line", "all line", "전 라인", "전라인",
+    "all machine stop", "All machine stop",
+    "All Stop", "all stop",
+    "Main CDA", "BCU", "Main Power",
+    "Line 정지", "라인 정지",
+    "Stop Empty", "stop empty",
+  ];
+  const isLineStop = (text) => {
+    const t = String(text || "").toLowerCase();
+    return LINE_STOP_KEYWORDS.some(kw => t.includes(kw.toLowerCase()));
+  };
+
+  // 3) 시간 비교 헬퍼 (date + time을 분 단위 정수로)
+  const toMinuteKey = (msg) => {
+    const dateParts = String(msg.date || "0/0/0").split("/").map(Number);
+    const timeParts = String(msg.time || "0:0").split(":").map(Number);
+    const dateNum = (dateParts[0] || 0) * 10000 + (dateParts[1] || 0) * 100 + (dateParts[2] || 0);
+    const minNum = (timeParts[0] || 0) * 60 + (timeParts[1] || 0);
+    return dateNum * 1440 + minNum;
+  };
+
+  // 4) 그룹화: 시간 ±60분 + 호기 매칭 (호기 못 찾으면 개별)
+  const sorted = [...criticalMsgs].sort((a, b) => toMinuteKey(a) - toMinuteKey(b));
+  const groups = [];
+
+  for (const msg of sorted) {
+    const eq = extractEquipment(msg.text);
+    const minKey = toMinuteKey(msg);
+
+    if (!eq) {
+      // 호기 못 찾음 → 개별 그룹 (그룹화 안 함, 안전)
+      groups.push({
+        equipment: null,
+        representative: msg,
+        members: [msg],
+        startMin: minKey,
+        endMin: minKey,
+      });
+      continue;
+    }
+
+    // 기존 그룹 중 매칭 시도 (같은 호기 + 60분 이내)
+    const matchedGroup = groups.find(g =>
+      g.equipment === eq &&
+      Math.abs(minKey - g.endMin) <= 60
+    );
+
+    if (matchedGroup) {
+      matchedGroup.members.push(msg);
+      matchedGroup.endMin = Math.max(matchedGroup.endMin, minKey);
+    } else {
+      groups.push({
+        equipment: eq,
+        representative: msg,
+        members: [msg],
+        startMin: minKey,
+        endMin: minKey,
+      });
+    }
+  }
+
+  // 5) 그룹 → 가상 issue 변환
+  const virtualIssues = groups.map((g, idx) => {
+    const rep = g.representative;
+    const allText = g.members.map(m => m.text || "").join(" | ");  // 그룹 전체 텍스트 (점수 계산용)
+    const eq = g.equipment;
+    const durMin = isLineStop(allText) ? 60 : 30;
+    const probText = (rep.text || "").slice(0, 200).replace(/\n/g, " ");
+
+    // 호기 못 찾고 매니저 멘션 있으면 prob에 표시
+    const hasManager = KOREAN_MANAGER_NAMES.some(n => allText.includes(n));
+    const probFinal = eq
+      ? probText
+      : (hasManager ? `매니저 개입 (호기 미특정) — ${probText.slice(0, 150)}` : probText);
+
+    return {
+      // BM bot issue 호환 필드
+      date: rep.date || "",
+      time: rep.time || "",
+      hour: rep.hour || 0,
+      eq: eq || "(critical)",
+      prob: probFinal,
+      cause: "",
+      result: "",
+      action: "",
+      pic: rep.sender || "",
+      durMin,
+      stopStatus: isLineStop(allText) ? "full_stop" : "",
+      repeatCount: g.members.length,
+      _alarm: "",
+      reasons: [],
+      // ★ 12-AW: 신규 메타 필드
+      text: allText,                    // 점수 계산용 본문 (모든 멤버 합침)
+      _criticalGroup: g.members,        // timeline 용 멤버 보존
+      _isCritical: true,                // 분기용 플래그
+      _criticalIdx: idx,                // 그룹 ID (디버깅용)
+      // 메시지 호환
+      sender: rep.sender || "",
+    };
+  });
+
+  // 진단 로그
+  if (typeof console !== "undefined" && virtualIssues.length > 0) {
+    console.log(`[★ Critical → 가상 issue] ${criticalMsgs.length}건 → ${virtualIssues.length}개 그룹`);
+    virtualIssues.slice(0, 5).forEach((vi, i) => {
+      const probPreview = (vi.prob || "").slice(0, 80);
+      console.log(`  [V${i+1}] ${vi.date} ${vi.time} ${vi.eq} (${vi._criticalGroup.length}명, ${vi.durMin}분): ${probPreview}`);
+    });
+  }
+
+  return virtualIssues;
+}
+
+// 점수 계산 (영역 11 기본 점수 함수 — 기존 scoreIssue 대체)
+// scoreIssueMatrix는 그대로 활용 (영역 9-C에 이미 정의됨).
+// 자동 선정 시 점수 내림차순으로 정렬 후 TOP MAX_ISSUES.
+function selectKeyIssuesV2(taggedIssues, maxIssues = MAX_ISSUES) {
+  const candidates = taggedIssues.filter(i =>
+    i.tags.includes("LONG_DOWNTIME") || i.tags.includes("HIGH_FREQUENCY")
+  );
+  const scored = candidates.map(issue => {
+    const s = scoreIssueMatrix(issue);
+    return { ...issue, score: s.total, scoreBreakdown: s.breakdown };
+  });
+  scored.sort((a, b) => {
+    if (b.score !== a.score) return b.score - a.score;
+    return (b.durMin || 0) - (a.durMin || 0);
+  });
+  return scored.slice(0, maxIssues);
+}
+
+// ═════════════════════════════════════════════════════════════════════════════
+// ★ 영역 9 (PoC) ★ 명세서 기반 5-카테고리 분류 + 다중 tags + 매트릭스 점수
+// ═════════════════════════════════════════════════════════════════════════════
+
+// ─── 9-B: 5-카테고리 분류 (명세서 §4) ───────────────────────────────────────
+// 한 이슈가 여러 카테고리(tags)에 속할 수 있음.
+// 입력: classifyPriority가 반환한 priority 객체 (urgent/important/normal 모두 활용)
+// 출력: 모든 이슈에 tags: [] 부착 + 카운트 정보
+// 입력: 평면 배열 (영역 11) 또는 priority 객체 (하위호환)
+function classifyIssues5Category(input, options = {}) {
+  const { longDowntimeThresholdMin = 60, repeatThreshold = 2 } = options;
+  const allIssues = Array.isArray(input)
+    ? input
+    : [...(input.urgent || []), ...(input.important || []), ...(input.normal || [])];
+
+  // (a) 설비별 카운트 (HIGH_FREQUENCY 판정용)
+  const eqCounts = {};
+  for (const i of allIssues) {
+    const eq = i.eq || "";
+    if (eq) eqCounts[eq] = (eqCounts[eq] || 0) + 1;
+  }
+  // (b) 알람별 카운트
+  const alarmCounts = {};
+  for (const i of allIssues) {
+    // alarm 필드: extractAllIssues가 _alarm 캐싱 → 우선 사용. 없으면 text에서 추출
+    let alarm = i._alarm || "";
+    if (!alarm) {
+      const alarmMatch = (i.text || "").match(/\*?Alarm\*?\s*[:：]\s*([^\n]+)/i);
+      alarm = alarmMatch ? alarmMatch[1].trim() : "";
+      i._alarm = alarm;
+    }
+    if (alarm) alarmCounts[alarm] = (alarmCounts[alarm] || 0) + 1;
+  }
+  // (c) 원인 카테고리 매칭 (이중 방지: CAUSE_PRIORITY 순서대로)
+  const matchCauseCategory = (issue) => {
+    const text = [issue.eq, issue.prob, issue.cause, issue.result, issue.text || ""]
+      .join(" ").toLowerCase();
+    for (const cat of CAUSE_PRIORITY) {
+      const kws = CAUSE_CATEGORIES[cat] || [];
+      if (kws.some(kw => text.includes(kw.toLowerCase()))) return cat;
+    }
+    return null;
+  };
+
+  // 각 이슈에 tags 부착
+  const tagged = allIssues.map(issue => {
+    const tags = [];
+    const fullText = [issue.eq, issue.prob, issue.cause, issue.result, issue.text || ""]
+      .join(" ").toLowerCase();
+
+    // LONG_DOWNTIME: 부동시간 ≥ threshold 또는 미해결
+    const isUnsolved = (issue.result || "").toLowerCase().match(/not solved|unsolved/) ||
+                       (issue.reasons || []).some(r => r.includes("미해결"));
+    if ((issue.durMin || 0) >= longDowntimeThresholdMin || isUnsolved) {
+      tags.push("LONG_DOWNTIME");
+    }
+
+    // HIGH_FREQUENCY: 동일 설비 N회+ 또는 동일 알람 N회+
+    const eq = issue.eq || "";
+    const alarm = issue._alarm || "";
+    if ((eq && eqCounts[eq] >= repeatThreshold) ||
+        (alarm && alarmCounts[alarm] >= repeatThreshold)) {
+      tags.push("HIGH_FREQUENCY");
+    }
+
+    // CONDITION_CHANGE: parameter change 패턴 (명세서 §10.2)
+    if (PROCESS_CHANGE_KEYWORDS.some(kw => fullText.includes(kw.toLowerCase())) ||
+        /(\d+(?:\.\d+)?)\s*(?:to|→|->|에서)\s*(\d+(?:\.\d+)?)/i.test(fullText)) {
+      tags.push("CONDITION_CHANGE");
+    }
+
+    // TEST_PM: 테스트 키워드
+    if (TEST_KEYWORDS.some(kw => fullText.includes(kw.toLowerCase()))) {
+      tags.push("TEST_PM");
+    }
+
+    // QUALITY_NG: 품질 키워드
+    if (QUALITY_KEYWORDS.some(kw => fullText.includes(kw.toLowerCase()))) {
+      tags.push("QUALITY_NG");
+    }
+
+    // 원인 카테고리 (서브 분류)
+    const causeCategory = matchCauseCategory(issue);
+
+    return { ...issue, tags, causeCategory };
+  });
+
+  // 카테고리별 카운트
+  const counts = {
+    LONG_DOWNTIME: tagged.filter(i => i.tags.includes("LONG_DOWNTIME")).length,
+    HIGH_FREQUENCY: tagged.filter(i => i.tags.includes("HIGH_FREQUENCY")).length,
+    CONDITION_CHANGE: tagged.filter(i => i.tags.includes("CONDITION_CHANGE")).length,
+    TEST_PM: tagged.filter(i => i.tags.includes("TEST_PM")).length,
+    QUALITY_NG: tagged.filter(i => i.tags.includes("QUALITY_NG")).length,
+    UNTAGGED: tagged.filter(i => i.tags.length === 0).length,
+  };
+
+  return { issues: tagged, counts, eqCounts, alarmCounts };
+}
+
+// ─── 9-C: 명세서 §5.2 매트릭스 기반 점수 (기존 scoreIssue 대체) ─────────────────
+// 영역 12-AW: text field + 정규식 처리 추가 (manager_escalation/multi_hold/line_transfer)
+function scoreIssueMatrix(issue) {
+  const dur = issue.durMin || 0;
+  const breakdown = {
+    downtime: dur / 30,
+    repeat: ((issue.repeatCount || 1) >= 2) ? (issue.repeatCount * 3) : 0,
+    // ★ 영역 12-X2 (6): 장기부동 별도 보너스 — 부동시간 누락 방지
+    long_downtime_bonus: dur >= 60 ? 8 : 0,
+    very_long_downtime_bonus: dur >= 120 ? 5 : 0,
+  };
+
+  // ★ 영역 12-AW: text 필드 추가 — critical 가상 issue + manager 이름 매칭용
+  const fieldMap = {
+    problem: issue.prob || "",
+    cause: issue.cause || "",
+    alarm: issue._alarm || "",
+    stop_status: issue.stopStatus || ((issue.reasons || []).join(" ").includes("Full Stop") ? "full_stop" : ""),
+    duration: issue.durMin == null ? "ToBeInformedLater" : "",
+    status: issue.result || "",
+    result: issue.result || "",
+    action: issue.action || "",
+    text: issue.text || "",  // ★ 신규: 본문 (critical 가상 issue가 본문 보존)
+  };
+
+  // 매트릭스 8종 적용 (기존 5종 + 12-AW 신규 3종)
+  for (const [key, def] of Object.entries(SCORE_KEYWORD_MATRIX)) {
+    const text = (def.fields || []).map(f => fieldMap[f] || "").join(" ");
+    const textLower = text.toLowerCase();
+
+    // ★ 영역 12-AW: 정규식 처리 분기 (multi_hold 같은 패턴 매칭)
+    if (def._regex) {
+      const match = text.match(def._regex);
+      if (match) {
+        // ★ 큐 #19 ⑧: _minCount 미지정 시 매칭만으로 bonus (조각 미회수 등 count 무관 패턴)
+        if (def._minCount != null) {
+          const count = parseInt(match[1] || "0", 10);
+          breakdown[key] = count >= def._minCount ? def.bonus : 0;
+        } else {
+          breakdown[key] = def.bonus;
+        }
+      } else {
+        breakdown[key] = 0;
+      }
+      continue;
+    }
+
+    // 기존 키워드 매칭 (5종 + manager_escalation/line_transfer)
+    if ((def.keywords || []).some(kw => textLower.includes(String(kw).toLowerCase()))) {
+      breakdown[key] = def.bonus;
+    } else {
+      breakdown[key] = 0;
+    }
+  }
+
+  const total = Object.values(breakdown).reduce((a, b) => a + b, 0);
+  return { total: Math.round(total * 10) / 10, breakdown };
+}
+
+// ─── 9-B: 명세서 기반 신규 selectKeyIssues (LONG_DOWNTIME tag 기반) ────────────
+function selectKeyIssuesFromTags(taggedIssues, maxIssues = MAX_ISSUES) {
+  // LONG_DOWNTIME 또는 HIGH_FREQUENCY tag가 있는 이슈만 후보
+  const candidates = taggedIssues.filter(i =>
+    i.tags.includes("LONG_DOWNTIME") || i.tags.includes("HIGH_FREQUENCY")
+  );
+  const scored = candidates.map(issue => {
+    const s = scoreIssueMatrix(issue);
+    return { ...issue, score: s.total, scoreBreakdown: s.breakdown };
+  });
+  scored.sort((a, b) => {
+    if (b.score !== a.score) return b.score - a.score;
+    return (b.durMin || 0) - (a.durMin || 0);
+  });
+  return scored.slice(0, maxIssues);
+}
+
+// ═════════════════════════════════════════════════════════════════════════════
+// ★ 새로운 논의 시스템 ★
+// ═════════════════════════════════════════════════════════════════════════════
+
+// ─── 영역 12-BD: 그룹 종합 (카테고리/호기) ─────────────────────────────────
+// 발생빈도 섹션의 빈 안내("...상위 섹션에 표시되었습니다")를 의미 있는 정보로 교체
+// 입력: 그룹 이슈 배열 (이슈는 eq, time, prob, cause, durMin 필드)
+// 출력: { pattern, implication } — 공통 패턴 1줄 + 시사점 1줄
+// 모델: Haiku (단순 패턴 추출, 비용 절약)
+// 룰 백업: LLM 실패 시 카운트 + 대표 호기로 단순 종합
+async function runOneGroupSynthesis(items, groupKey, groupValue) {
+  if (!items || items.length < 2) {
+    return null;  // 2건 미만은 종합 안 함
+  }
+
+  // 입력 압축: 이슈당 핵심 6필드 (★ 12-BG-4 단계 1-RC-2: images 추가)
+  const compactItems = items.map(i => ({
+    eq: i.eq || i.equipment || "?",
+    time: `${i.date || ""} ${i.time || ""}`.trim(),
+    prob: (i.prob || i.problem || "").slice(0, 80),
+    cause: (i.cause || i.rootCause || "").slice(0, 80),
+    dur: i.durMin || i.durationMin || 0,
+    // ★ 영역 12-BG-4 (큐 #6 단계 1-RC-2): 같은 호기 image_analyses 최대 2개 (그룹 종합 패턴 식별용)
+    ...(i.image_analyses && i.image_analyses.length > 0
+      ? { images: i.image_analyses.slice(0, 2).map(a => String(a).slice(0, 80)) }
+      : {}),
+  }));
+
+  const sys = `너는 AZS 배터리 공장의 시니어 엔지니어다. 같은 ${groupKey === "category" ? "카테고리" : "호기"}에 속하는 이슈 ${items.length}건을 보고 공통 패턴과 시사점을 한국어로 요약한다.
+
+출력 형식 (JSON만, 다른 텍스트 금지):
+{
+  "pattern": "공통 패턴 1줄 (50자 내외, 핵심만)",
+  "implication": "시사점 또는 추가 액션 1줄 (50자 내외, 구체적으로)"
+}
+
+규칙:
+- pattern: 호기/시간/원인의 공통점 또는 반복 양상 (예: "STK-1-B4 Belt Mandrel loose 5회 반복, 야간대 집중")
+- implication: 시사점 또는 액션 (예: "Vision 팀 SLA 단축 + 1차 조치 강화 필요")
+- 데이터에 명확히 보이는 패턴만 작성 — 추측·과장 금지
+- 50자 초과 금지
+- ★ images 필드가 있는 이슈가 다수면, pattern에 "이미지 분석상 ..." 형태로 시각 정보 활용 (예: "이미지 분석상 PCB 보드 교체 반복 확인")`;
+
+  const userMsg = `[${groupKey === "category" ? "카테고리" : "호기"}: ${groupValue}] 이슈 ${items.length}건:
+${JSON.stringify(compactItems, null, 0)}
+
+위 이슈들의 공통 패턴과 시사점을 JSON으로 반환.`;
+
+  const t0 = Date.now();
+  try {
+    const raw = await callClaudeRaw(sys, userMsg, {
+      model: MODEL_FAST,
+      max_tokens: 300,
+    });
+    const parsed = safeJSON(raw);
+    if (!parsed || typeof parsed !== "object") throw new Error("JSON 파싱 실패");
+    const pattern = String(parsed.pattern || "").trim();
+    const implication = String(parsed.implication || "").trim();
+    if (!pattern && !implication) throw new Error("빈 응답");
+    const elapsed = ((Date.now() - t0) / 1000).toFixed(1);
+    console.log(`[그룹 종합 ${groupKey}=${groupValue}] ${elapsed}초 — pattern: "${pattern.slice(0, 30)}..."`);
+    return { pattern: pattern.slice(0, 80), implication: implication.slice(0, 80) };
+  } catch (e) {
+    console.error(`[그룹 종합 ${groupKey}=${groupValue}] 실패 → 룰 백업:`, e?.message?.slice(0, 100));
+    // 룰 백업: 단순 카운트 + 대표 호기
+    const eqCount = {};
+    items.forEach(i => {
+      const eq = i.eq || i.equipment || "?";
+      eqCount[eq] = (eqCount[eq] || 0) + 1;
+    });
+    const topEq = Object.entries(eqCount).sort((a, b) => b[1] - a[1])[0];
+    return {
+      pattern: `${items.length}건 발생, 주요 호기: ${topEq[0]} (${topEq[1]}회)`,
+      implication: "추가 분석 필요 — 원본 데이터 확인 권장",
+      _ruleBackup: true,
+    };
+  }
+}
+
+// 그룹 배열 → 모두 병렬 호출, { groupValue: synthesis } 객체 반환
+async function runGroupSyntheses(groups, groupKey, allIssues) {
+  if (!groups || groups.length === 0) return {};
+
+  // 각 그룹의 이슈 배열 매핑
+  const tasks = groups.map(g => {
+    const groupValue = groupKey === "category" ? g.category : g.equipment;
+    let items = [];
+    if (groupKey === "category") {
+      // 카테고리에 속하는 모든 이슈 (cat에 매칭되는 것)
+      const eqSet = new Set((g.equipments || []).map(e =>
+        String(e || "").replace(/\s*\(×\d+\)/g, "").trim()
+      ).filter(Boolean));
+      items = allIssues.filter(i => eqSet.has(i.eq || ""));
+    } else {
+      // 호기에 속하는 모든 이슈
+      items = allIssues.filter(i => i.eq === groupValue);
+    }
+    return { groupValue, items };
+  });
+
+  // 2건 이상만 필터 후 병렬 호출
+  const eligibleTasks = tasks.filter(t => t.items.length >= 2);
+  if (eligibleTasks.length === 0) return {};
+
+  console.log(`[그룹 종합] ${groupKey} ${eligibleTasks.length}개 그룹 병렬 호출 시작`);
+  const t0 = Date.now();
+  const results = await Promise.all(
+    eligibleTasks.map(t => runOneGroupSynthesis(t.items, groupKey, t.groupValue))
+  );
+  const elapsed = ((Date.now() - t0) / 1000).toFixed(1);
+  console.log(`[그룹 종합] ${groupKey} ${eligibleTasks.length}개 완료 (${elapsed}초)`);
+
+  // { groupValue: synthesis } 객체로 변환
+  const map = {};
+  eligibleTasks.forEach((t, i) => {
+    if (results[i]) map[t.groupValue] = results[i];
+  });
+  return map;
+}
+
+// ─── 0. PE 사전 큐레이션 — 영역 12-X3 (7): Sonnet 3분할 병렬 호출 ─────────────
+// 각 호출 max_tokens 2000 / Sonnet (MODEL_REASONING) / 504 시 Haiku fallback
+// Promise.all로 동시 실행 → 전체 시간 = 가장 느린 1건 (~8~10초)
+async function runPreCuration(allIssues, kbPE, reportType, categoryMsgs = {}) {
+  _curationDiag = [];  // ★ 큐 #19 ⑦: 진단 수집 리셋 (레포트 생성마다 새로)
+  const qualityList = categoryMsgs.quality || [];
+  const processChangeList = categoryMsgs.process_change || [];
+  const testList = categoryMsgs.test || [];
+
+  if (!allIssues || allIssues.length === 0) {
+    return emptyBriefing();
+  }
+
+  // 이슈 데이터 변환
+  const issuesData = allIssues.map((issue, idx) => ({
+    no: idx + 1,
+    date: issue.date || "",
+    time: issue.time,
+    equipment: issue.eq,
+    problem: (issue.prob || "").slice(0, 150),
+    cause: (issue.cause || "").slice(0, 150),
+    action: (issue.action || "").slice(0, 200),
+    result: (issue.result || "").slice(0, 100),
+    pic: (issue.pic || "").slice(0, 60),
+    duration_min: issue.durMin,
+    stop_status: issue.stopStatus || "",
+    alarm: (issue._alarm || "").slice(0, 100),
+  }));
+
+  // ★ 영역 12-BG-4 (큐 #6 단계 1-RC-3): images 필드 조건부 추가 (PE 큐레이션 입력 강화)
+  const formatMsgs = (arr, max = 20) => arr.slice(0, max).map((m, i) => ({
+    no: i + 1,
+    date: m.date || "",
+    time: m.time || "",
+    sender: m.sender || "",
+    text: (m.text || "").slice(0, 200).replace(/\n/g, " "),
+    ...(m.image_analyses && m.image_analyses.filter(a => a && String(a).trim()).length > 0
+      ? { images: m.image_analyses.filter(a => a && String(a).trim()).slice(0, 3).map(a => String(a).slice(0, 80)) }
+      : {}),
+  }));
+
+  const qualityData = formatMsgs(qualityList);
+  const processChangeData = formatMsgs(processChangeList);
+  const testData = formatMsgs(testList);
+
+  const focus = REPORT_FOCUS[reportType] || REPORT_FOCUS.meeting;
+  const kbText = kbPE ? `\n\n[학습 내용 일부]\n${kbPE.slice(0, 300)}` : "";
+  const isWeekly = reportType === "weekly";
+  const longThreshold = isWeekly ? 60 : 30;
+
+  // ★ 영역 12-AE2: quality 메시지도 Part 2b 입력에 추가 (STK-4-B3 같은 NG+setting 메시지 누락 방지)
+  const qualityWithSetting = (categoryMsgs.quality || []).slice(0, 8).map((m, i) => ({
+    no: i + 1,
+    date: m.date || "",
+    time: m.time || "",
+    sender: m.sender || "",
+    text: (m.text || "").slice(0, 350).replace(/\n/g, " | "),
+    // ★ 12-BG-4 단계 1-RC-3: images 추가
+    ...(m.image_analyses && m.image_analyses.filter(a => a && String(a).trim()).length > 0
+      ? { images: m.image_analyses.filter(a => a && String(a).trim()).slice(0, 3).map(a => String(a).slice(0, 80)) }
+      : {}),
+  }));
+
+  // ★ 영역 12-AG1: Part 2b 전용 long format — Setting 항목 풀 추출 위해 10건 × 800자
+  // 기존 formatMsgs는 200자라 STK-3-B2 메시지 (1000자+)에서 Countermeasures 1~2개만 보임
+  const formatMsgsLong = (arr, max = 10) => arr.slice(0, max).map((m, i) => ({
+    no: i + 1,
+    date: m.date || "",
+    time: m.time || "",
+    sender: m.sender || "",
+    text: (m.text || "").slice(0, 800).replace(/\n/g, " | "),
+    // ★ 12-BG-4 단계 1-RC-3: images 추가
+    ...(m.image_analyses && m.image_analyses.filter(a => a && String(a).trim()).length > 0
+      ? { images: m.image_analyses.filter(a => a && String(a).trim()).slice(0, 3).map(a => String(a).slice(0, 80)) }
+      : {}),
+  }));
+  const processChangeDataLong = formatMsgsLong(processChangeList);
+  const qualityWithSettingLong = (categoryMsgs.quality || []).slice(0, 8).map((m, i) => ({
+    no: i + 1,
+    date: m.date || "",
+    time: m.time || "",
+    sender: m.sender || "",
+    text: (m.text || "").slice(0, 800).replace(/\n/g, " | "),
+    // ★ 12-BG-4 단계 1-RC-3: images 추가
+    ...(m.image_analyses && m.image_analyses.filter(a => a && String(a).trim()).length > 0
+      ? { images: m.image_analyses.filter(a => a && String(a).trim()).slice(0, 3).map(a => String(a).slice(0, 80)) }
+      : {}),
+  }));
+  // ★ 영역 12-AH1: Part 3 chronic1AB용 quality 메시지 long format (5건 × 600자)
+  // 1AB 라인 메시지 (Stacking 1-AB Sepa Run Problem)에 호기별 NG 정보 풍부 — 200자 슬라이스에선 잘림
+  const qualityDataLong = qualityList.slice(0, 5).map((m, i) => ({
+    no: i + 1,
+    date: m.date || "",
+    time: m.time || "",
+    sender: m.sender || "",
+    text: (m.text || "").slice(0, 600).replace(/\n/g, " | "),
+    // ★ 12-BG-4 단계 1-RC-3: images 추가
+    ...(m.image_analyses && m.image_analyses.filter(a => a && String(a).trim()).length > 0
+      ? { images: m.image_analyses.filter(a => a && String(a).trim()).slice(0, 3).map(a => String(a).slice(0, 80)) }
+      : {}),
+  }));
+
+  // ── ★ 영역 12-AF3: 4분할 병렬 호출 (Part 2를 2a/2b로 분할) ──
+  // Part 2b가 conditionChangeGroups 전용 — Sonnet이 짧고 정확하게 처리
+  console.log("[PE 큐레이션] Sonnet 4분할 병렬 호출 시작 (Part 2 → 2a + 2b)...");
+  const startTime = Date.now();
+
+  const [part1, part2a, part2b, part3] = await Promise.all([
+    curationPart1_LongDowntime(issuesData, allIssues.length, focus, kbText, longThreshold, categoryMsgs),
+    curationPart2a_RecurringSimple(issuesData, processChangeData, allIssues.length, focus, kbText, categoryMsgs),
+    // ★ AG1: Part 2b는 long format (10건×800자) 사용
+    curationPart2b_ConditionChangeGroups(processChangeDataLong, qualityWithSettingLong, focus, kbText),
+    // ★ AH1: Part 3에 qualityDataLong 추가 — chronic1AB 1AB 라인 풍부 추출용
+    curationPart3_TestPmQuality(testData, qualityData, focus, kbText, categoryMsgs, qualityDataLong),
+  ]);
+
+  // Part 2a + 2b 결과 병합 — conditionChangeGroups는 2b에서, 나머지는 2a에서
+  const part2 = {
+    recurringByCategory: part2a.recurringByCategory || [],
+    recurringSameEquipment: part2a.recurringSameEquipment || [],
+    conditionChanges: part2a.conditionChanges || { visionOffset: [], settingChange: [], cutter: [], other: [] },
+    conditionChangeGroups: part2b.conditionChangeGroups || [],
+  };
+
+  const elapsed = ((Date.now() - startTime) / 1000).toFixed(1);
+  console.log(`[PE 큐레이션] 4분할 병렬 완료 (${elapsed}초) — 2a: ${part2.recurringByCategory.length} 카테고리 / 2b: ${part2.conditionChangeGroups.length} 그룹`);
+
+  // ★ 영역 12-Z3 + 12-AB5: 룰 백업 — LLM 응답 누락 시 자동 보강
+  // 12-AB5: Haiku fallback이 max_tokens로 잘려서 일부만 응답한 경우(예: 4건 중 1건),
+  //         LLM 응답은 보존하고 누락된 30분+ 이슈만 추가 (LLM 결과 + 룰 보강)
+  let backupLongDowntime = part1.longDowntime || [];
+  const llmLongCount = backupLongDowntime.length;
+  const dataLongIssues = allIssues.filter(i => (i.durMin || 0) >= longThreshold);
+  const dataLongCount = dataLongIssues.length;
+
+  if (llmLongCount < dataLongCount) {
+    // LLM이 다룬 equipment 집합 (이미 응답한 건은 제외)
+    const llmCoveredEqs = new Set(
+      backupLongDowntime.map(d => (d.equipment || "").trim()).filter(Boolean)
+    );
+
+    // 누락된 30분+ 이슈 모두 추출 (부동시간 내림차순) — ★ AI2: 12건 cap 제거, 모든 30분+ 호기 표시
+    const missingIssues = dataLongIssues
+      .filter(i => i.eq && !llmCoveredEqs.has(i.eq.trim()))
+      .sort((a, b) => (b.durMin || 0) - (a.durMin || 0));
+
+    if (missingIssues.length > 0) {
+      const ruleBackupItems = missingIssues.map((i, idx) => ({
+        isTop: false,  // 룰 백업으로 추가된 건 isTop=false
+        equipment: i.eq || "?",
+        title: `${i.eq || "?"} ${(i.prob || "").slice(0, 60)}${i.prob && i.prob.length > 60 ? "..." : ""} — ${i.durMin}분`,
+        occurrence: `${i.date || ""} ${i.time || ""}`,
+        alarm: i._alarm || "",
+        rootCause: (i.cause || "").slice(0, 200) || "데이터 부족 — 추가 분석 필요",
+        partReplaced: "",
+        pic: i.pic || "",
+        result: i.result || "Unknown",
+        durationMin: i.durMin || 0,
+        actionSequence: (() => {
+          const steps = splitActionSteps(i.action || "");
+          return steps.length > 0 ? steps : ["조치 정보 없음 — 원본 데이터 확인 필요"];
+        })(),
+        splitNote: "",
+        splitDetail: [],
+        recurrenceGap: "",
+        collateralDamage: "",
+        historyPattern: "",
+        actionAnalysis: "",
+        _ruleBackup: true,
+      }));
+
+      if (llmLongCount === 0) {
+        console.warn(`[PE 큐레이션 룰 백업] LLM 0건 → 데이터 ${dataLongCount}건 모두 자동 보정`);
+        // 0건이면 정렬 우선순위: 부동시간 ↓
+        backupLongDowntime = ruleBackupItems.map((item, idx) => ({ ...item, isTop: idx < 2 }));
+      } else {
+        console.warn(`[PE 큐레이션 룰 백업 강화] LLM ${llmLongCount}건 응답 + 데이터 ${dataLongCount}건 → 누락 ${missingIssues.length}건 자동 추가`);
+        backupLongDowntime = [...backupLongDowntime, ...ruleBackupItems];
+      }
+    }
+  } else if (llmLongCount > 0) {
+    console.log(`[PE 큐레이션] longDowntime 정상 (LLM ${llmLongCount}건, 데이터 기준 ${dataLongCount}건)`);
+  }
+
+  // criticalSummary도 빈 경우 룰 백업
+  let backupCriticalSummary = part1.criticalSummary || [];
+  if (backupCriticalSummary.length === 0 && backupLongDowntime.length > 0) {
+    const top = backupLongDowntime[0];
+    // ★ 큐 #19 ⑦: placeholder("데이터 분석 필요") 차단 — 룰로 산출 가능한 정보만 넣고, 없으면 줄 생략
+    const _topEqs = backupLongDowntime.slice(0, 3).map(d => `${d.equipment}(${d.durationMin}분)`).join(", ");
+    backupCriticalSummary = [
+      `최장 부동: ${top.equipment} ${top.durationMin}분 — ${(top.rootCause || "").slice(0, 100)}`,
+      `30분+ 부동 이슈 ${dataLongCount}건 발생`,
+      _topEqs ? `장기부동 상위: ${_topEqs}` : null,
+      `⚠️ 큐레이션 LLM 응답 미흡 — 룰 백업으로 생성됨 (주목 패턴·품질 추세 등 심층 분석 누락, 정밀도 주의)`,
+    ].filter(Boolean);
+  }
+
+  // ★ 영역 12-BD: 그룹 종합 병렬 호출 (카테고리/호기 각각 ≥2건 그룹만)
+  const [bySyntheses_cat, bySyntheses_eq] = await Promise.all([
+    runGroupSyntheses(part2.recurringByCategory || [], "category", allIssues),
+    runGroupSyntheses(part2.recurringSameEquipment || [], "equipment", allIssues),
+  ]);
+  const groupSyntheses = {
+    byCategory: bySyntheses_cat,
+    byEquipment: bySyntheses_eq,
+  };
+
+  // 결과 병합 — 영역 12-Y: 새 필드 (recordBreakdown, chronicIssues, conditionChangeGroups, chronic1AB, line3DCutterCpc) 보존
+  const _briefingOut = normalizeBriefing({
+    summary_text: part1.summary_text || (backupLongDowntime.length > 0
+      ? `총 ${allIssues.length}건 부동 이슈 발생, ${dataLongCount}건이 ${longThreshold}분 이상 장기부동`
+      : ""),
+    recordBreakdown: part1.recordBreakdown || { bmDowntime: 0, ubm: 0, pdDowntime: 0, other: 0 },
+    criticalSummary: backupCriticalSummary,
+    longDowntime: backupLongDowntime,
+    chronicIssues: part1.chronicIssues || [],  // ★ 12-Y4 만성 이슈 별도 섹션
+    recurringByCategory: part2.recurringByCategory || [],
+    recurringSameEquipment: part2.recurringSameEquipment || [],
+    conditionChangeGroups: part2.conditionChangeGroups || [],  // ★ 12-Y2 호기별 그룹
+    conditionChanges: part2.conditionChanges || { visionOffset: [], settingChange: [], cutter: [], other: [] },
+    testPm: part3.testPm || { linePM: [], fmvs: [], cutter: [], stackingSepa: [] },
+    chronic1AB: part3.chronic1AB || null,  // ★ 12-Y3 1AB 만성 라인
+    line3DCutterCpc: part3.line3DCutterCpc || null,  // ★ 12-Y3 Line 3D CPC
+    qualityNg: part3.qualityNg || { table: [], trend: "데이터 없음" },
+    groupSyntheses,  // ★ 12-BD 그룹 종합
+  });
+  // ★ 큐 #19 ⑦: 큐레이션 진단을 브리핑에 부착 (generateReport에서 GapLog 적재 + 배지)
+  try { _briefingOut._diagnostics = [..._curationDiag]; } catch (e) {}
+  return _briefingOut;
+}
+
+// ─── 분할 헬퍼: 공통 호출 (Sonnet 1차 → 504 시 Haiku fallback) ─────────────────
+// ★ 영역 12-AQ: Part 1처럼 무거운 호출은 useBackground:true로 504 영구 회피
+// ★ 큐 #19 ⑦: 큐레이션 실패/fallback 진단 수집 (모듈 레벨 — runPreCuration 시작 시 리셋)
+//   fatal=true → 빈 객체 반환(룰 백업 전환), fatal=false → 구제됨(부분복구/Haiku)이나 품질 저하 신호
+let _curationDiag = [];
+function _pushCurDiag(part, errorType, t0, fatal) {
+  try { _curationDiag.push({ part, errorType, elapsed: Number(((Date.now() - t0) / 1000).toFixed(1)), fatal: !!fatal }); } catch (e) {}
+}
+// ★ 큐 #19 ⑦: 큐레이션 진단을 GapLog에 적재 (dimension=curation_fail). 진단 없으면 no-op
+async function _logCurationDiag(curation, date) {
+  const _diags = (curation && curation._diagnostics) || [];
+  if (!_diags.length) return;
+  try {
+    const _fatal = _diags.filter(d => d.fatal);
+    const _parts = [...new Set(_diags.map(d => d.part))].join(", ");
+    const _types = [...new Set(_diags.map(d => d.errorType))].join(", ");
+    const _desc = _fatal.length > 0
+      ? `큐레이션 ${_fatal.map(d => d.part).join("/")} 실패(${[...new Set(_fatal.map(d => d.errorType))].join(",")}) → 룰 백업 전환`
+      : `큐레이션 ${_parts} fallback/부분복구(${_types}) — 정상 생성되나 품질 저하`;
+    await appendGapLogRow({
+      report_date: date,
+      section: 0,
+      dimension: "curation_fail",
+      gap_description: _desc.slice(0, 200),
+      severity: _fatal.length > 0 ? "high" : "mid",
+      raw_evidence: JSON.stringify(_diags).slice(0, 500),
+      current_value: _fatal.length > 0 ? "룰 백업 생성" : "fallback/부분복구",
+      ideal_value: "LLM 큐레이션 정상 출력",
+      status: "open",
+    });
+    console.log(`[generateReport] ★ 큐레이션 진단 GapLog 적재: ${_desc}`);
+  } catch (e) {
+    console.error(`[generateReport] 큐레이션 진단 GapLog 적재 실패:`, e?.message?.slice(0, 150));
+  }
+}
+
+async function callCurationPart(sys, userMsg, partLabel, allIssuesForFallback = [], categoryMsgsForFallback = {}, maxTokensOverride = null, useBackground = false) {
+  // ★ 영역 12-Z4: 응답 시간 측정용
+  // ★ 영역 12-AE1: maxTokensOverride — Part 2 강화 시 1800→2200 (conditionChangeGroups 풀 출력용)
+  const sonnetMaxTokens = maxTokensOverride || 1800;
+  const haikuMaxTokens = maxTokensOverride ? Math.min(maxTokensOverride - 400, 1500) : 1200;
+  const t0 = Date.now();
+
+  // ★ 12-AQ: Background 모드 — Part 1처럼 30초+ 호출에 사용
+  if (useBackground) {
+    try {
+      const raw = await callClaudeBackground(sys, userMsg, {
+        model: MODEL_REASONING,
+        max_tokens: sonnetMaxTokens,
+        onProgress: (msg) => console.log(`[PE 큐레이션 ${partLabel} BG] ${msg}`),
+      });
+      const elapsed = ((Date.now() - t0) / 1000).toFixed(1);
+      console.log(`[PE 큐레이션 ${partLabel}] Background 성공 (${elapsed}초, max_tokens ${sonnetMaxTokens})`);
+      console.log(`[PE 큐레이션 ${partLabel}] raw 응답 첫 200자:`, (raw || "").slice(0, 200));
+      return safeJSON(raw);
+    } catch (e) {
+      const elapsed = ((Date.now() - t0) / 1000).toFixed(1);
+      console.error(`[PE 큐레이션 ${partLabel} Background 실패] (${elapsed}초)`, e?.message?.slice(0, 200));
+      _pushCurDiag(partLabel, "background_fail", t0, true);
+      // Background 실패 시 빈 객체 반환 (룰 백업으로 보정)
+      return {};
+    }
+  }
+
+  // 기존 동기 호출 + Haiku fallback (Part 2a, 2b, 3 — 안전권 유지)
+  // ★ 12-BH (큐 #8): raw를 try 밖 변수로 보존 — 부분 복구 시 전체 응답 접근 가능
+  let rawForRecovery = "";
+  try {
+    await new Promise(r => setTimeout(r, 200));
+    const raw = await callClaudeRaw(sys, userMsg, {
+      model: MODEL_REASONING,  // ★ Sonnet (품질 우선)
+      max_tokens: sonnetMaxTokens,
+    });
+    rawForRecovery = raw;  // ★ 12-BH: 보존
+    const elapsed = ((Date.now() - t0) / 1000).toFixed(1);
+    console.log(`[PE 큐레이션 ${partLabel}] Sonnet 1차 성공 (${elapsed}초, max_tokens ${sonnetMaxTokens})`);
+    console.log(`[PE 큐레이션 ${partLabel}] raw 응답 첫 200자:`, (raw || "").slice(0, 200));
+    return safeJSON(raw);
+  } catch (e) {
+    const elapsed = ((Date.now() - t0) / 1000).toFixed(1);
+    console.error(`[PE 큐레이션 ${partLabel} 1차 실패] (${elapsed}초)`, e?.message?.slice(0, 200));
+
+    // ★ 영역 12-BH (큐 #8): JSON 부분 복구 시도 (Haiku fallback 호출 전)
+    // safeJSON 실패 케이스에만 시도 (504 timeout은 raw 자체가 없으므로 skip)
+    if (rawForRecovery && (e?._rawSnippet !== undefined || e?.message?.includes("JSON"))) {
+      console.log(`[PE 큐레이션 ${partLabel}] ★ 부분 복구 시도 (raw 길이=${rawForRecovery.length})`);
+      const recovered = tryPartialJSONRecovery(rawForRecovery);
+      if (recovered && Object.keys(recovered).length > 0) {
+        console.log(`[PE 큐레이션 ${partLabel}] ★ 부분 복구 성공 — 키: ${Object.keys(recovered).join(", ")}`);
+        _pushCurDiag(partLabel, "partial_recovery_sonnet", t0, false);
+        return recovered;
+      }
+      console.log(`[PE 큐레이션 ${partLabel}] ★ 부분 복구 실패 — Haiku fallback 진입`);
+    }
+
+
+    // 504 timeout 시 Haiku로 fallback
+    if (e?.message?.includes("504") || e?.message?.includes("Timeout") || e?.message?.includes("timeout")) {
+      const tFallback = Date.now();
+      let raw2ForRecovery = "";  // ★ 12-BH
+      try {
+        console.log(`[PE 큐레이션 ${partLabel}] Haiku로 fallback 재시도 (max_tokens ${haikuMaxTokens})...`);
+        await new Promise(r => setTimeout(r, 800));
+        const raw2 = await callClaudeRaw(sys, userMsg, {
+          model: MODEL_FAST,  // Haiku fallback
+          max_tokens: haikuMaxTokens,
+        });
+        raw2ForRecovery = raw2;  // ★ 12-BH: 보존
+        const elapsedFb = ((Date.now() - tFallback) / 1000).toFixed(1);
+        console.log(`[PE 큐레이션 ${partLabel}] Haiku fallback 성공 (${elapsedFb}초)`);
+        console.log(`[PE 큐레이션 ${partLabel}] fallback raw 응답 첫 200자:`, (raw2 || "").slice(0, 200));
+        _pushCurDiag(partLabel, "sonnet_timeout_haiku_fallback", t0, false);
+        return safeJSON(raw2);
+      } catch (e2) {
+        const elapsedFb = ((Date.now() - tFallback) / 1000).toFixed(1);
+        console.error(`[PE 큐레이션 ${partLabel} fallback도 실패] (${elapsedFb}초)`, e2?.message?.slice(0, 200));
+
+        // ★ 12-BH (큐 #8): Haiku fallback도 JSON 부분 복구 시도
+        if (raw2ForRecovery && (e2?._rawSnippet !== undefined || e2?.message?.includes("JSON"))) {
+          console.log(`[PE 큐레이션 ${partLabel}] ★ Haiku 응답 부분 복구 시도 (raw 길이=${raw2ForRecovery.length})`);
+          const recovered = tryPartialJSONRecovery(raw2ForRecovery);
+          if (recovered && Object.keys(recovered).length > 0) {
+            console.log(`[PE 큐레이션 ${partLabel}] ★ Haiku 응답 부분 복구 성공 — 키: ${Object.keys(recovered).join(", ")}`);
+            _pushCurDiag(partLabel, "partial_recovery_haiku", t0, false);
+            return recovered;
+          }
+        }
+      }
+    }
+    // ★ 큐 #19 ⑦: 진단 기록 (최종 실패 → 룰 백업). errorType 판별
+    {
+      const _msg = (e?.message || "").toLowerCase();
+      const _et = (_msg.includes("504") || _msg.includes("timeout")) ? "timeout_both_fail"
+        : (_msg.includes("json")) ? "json_parse_fail" : "unknown_fail";
+      _pushCurDiag(partLabel, _et, t0, true);
+    }
+    // 최종 실패 — 빈 객체 반환 (병합 시 룰 백업으로 보정)
+    return {};
+  }
+}
+
+// ─── Part 1: 1번 장기부동 (가장 중요) ─────────────────────────────────────────
+async function curationPart1_LongDowntime(issuesData, totalCount, focus, kbText, longThreshold, categoryMsgs) {
+  const sys = `${FACTORY_PHILOSOPHY}
+
+당신은 AZS 배터리 공장의 ${PERSONAS.Cell_PE.role.replace(" - Cell 공정", "")}입니다.
+이 작업은 일일 이슈 브리핑의 1번 섹션 (장기부동) 정리입니다.${kbText}${NUMERIC_SOURCE_RULE}
+
+${focus}
+
+[★ 최우선 지시 — 절대 누락 금지]
+입력 데이터의 부동 이슈 중 duration_min ≥ ${longThreshold} 인 모든 이슈를 longDowntime 배열에 반드시 포함하세요.
+빠짐없이 — 30분, 32분, 45분 같은 작은 건도 모두 포함. 30분 미만만 제외.
+
+[★ 첨부 이미지 분석 활용 — 필수]
+- ★ 첨부 이미지 분석 인용 필수: 입력 데이터에 첨부 이미지 분석 정보 ([첨부 이미지 분석] 섹션 또는 images 필드)가 있으면, 분석/발언에 명시적으로 인용하라. 예: "첨부 이미지에 따르면...", "BM Bot 보고서 이미지에서 X건 확인", "이미지 분석에서 PCB 보드 교체 확인". 추측 금지 — 명시된 image 정보만 인용.
+- 메시지의 "images" 필드 정보를 longDowntime 항목의 description, evidence, root_cause 등에 적극 인용하라
+
+[필수 출력 — JSON만, 다른 텍스트 금지]
+{
+  "summary_text": "전체 이슈 흐름 1~3문장 요약",
+  "recordBreakdown": {"bmDowntime": 숫자, "ubm": 숫자, "pdDowntime": 숫자, "other": 숫자},
+  "criticalSummary": [
+    "최장 부동: [설비] [부동시간] — [원인]",
+    "동일 호기 다발: [있으면 명시, 없으면 '없음']",
+    "주목 패턴: [있으면 명시, 없으면 '없음']",
+    "품질 추세: [핵심]",
+    "특이사항: [있으면 명시, 없으면 '없음']"
+  ],
+  "longDowntime": [
+    {
+      "isTop": true,
+      "equipment": "호기명",
+      "title": "[설비명] [문제 요약] — N분",
+      "occurrence": "발생 시간",
+      "alarm": "알람 메시지",
+      "rootCause": "근본 원인",
+      "partReplaced": "교체 부품 (있으면)",
+      "pic": "PIC",
+      "result": "Solved/Unsolved/Monitoring",
+      "durationMin": 부동분,
+      "actionSequence": ["1. 조치", "2. 조치"],
+
+      "splitNote": "(옵셔널) 분할 보고 통합 시만 작성, 단일 보고면 빈 문자열 ''",
+      "splitDetail": [
+        {"order": 1, "duration": 65, "time": "15:55", "description": "(옵셔널 짧은 설명)", "gapMin": 0}
+      ],
+      "recurrenceGap": "(옵셔널) 단발이면 빈 문자열 ''",
+      "collateralDamage": "(옵셔널) 부수 피해 있을 때만, 없으면 ''",
+      "historyPattern": "(옵셔널) KB에 단서 있을 때만, 없으면 ''",
+      "actionAnalysis": "(옵셔널) 1차 조치 미흡 분석, 해당 없으면 ''"
+    }
+  ],
+  "chronicIssues": []
+}
+
+[★ 옵셔널 필드 — 데이터에 명백한 단서 있을 때만 채우세요]
+splitDetail / recurrenceGap / collateralDamage / historyPattern / actionAnalysis / chronicIssues 등은
+데이터에 명백히 있을 때만 채우고, 없으면 빈 배열/빈 문자열로 빠르게 응답하세요.
+풍부함보다 응답 속도와 핵심 누락 방지가 우선입니다.
+
+[규칙]
+- 장기부동 임계값: ${longThreshold}분 이상 (이 임계값 절대 변경 금지)
+- isTop=true는 가장 큰 부동 1~2건만, 나머지는 isTop=false
+- chronicIssues는 24h+ open 또는 cross-day 반복일 때만 (KB에 단서 없으면 빈 배열)
+- 모든 수치는 숫자만`;
+
+  const userMsg = `[부동 이슈 데이터 - ${totalCount}건]
+${JSON.stringify(issuesData, null, 1)}
+
+위 데이터에서 duration_min >= ${longThreshold} 인 모든 부동 이슈를 longDowntime에 빠짐없이 정리하세요.
+옵셔널 필드(splitDetail, historyPattern 등)는 명백한 단서 있을 때만 채우고, 없으면 빈 값으로 응답해 응답 속도를 우선하세요.`;
+
+  // ★ 영역 12-AI2: Part 1 max_tokens 1500 → 1800 (호기 9개+ 풀 추출 위해)
+  // 이전 1500은 timeout 안전 마진 위해 줄였지만 호기 4개로 누락 多 (정답 9개)
+  // 1800은 timeout 위험 약간 있지만 Sonnet 30초 직전 마지노선, fallback도 있음
+  return await callCurationPart(sys, userMsg, "Part1-LongDowntime", [], {}, 1800, true);  // ★ 12-AQ: Background 모드 (Part 1 무거움)
+}
+
+// ─── ★ 영역 12-AF: Part 2 분할 (2a: recurring + simple changes, 2b: conditionChangeGroups 전용) ──
+// 이유: 기존 Part 2가 max_tokens 2200으로도 timeout (36.6초). 분할해서 각 부분 짧고 정확하게 처리.
+
+// ─── Part 2a: 2번 반복 + 3번 조건변경 (그룹 외 — 단순 변경 항목) ─────────────
+async function curationPart2a_RecurringSimple(issuesData, processChangeData, totalCount, focus, kbText, categoryMsgs) {
+  const sys = `${FACTORY_PHILOSOPHY}
+
+당신은 AZS 배터리 공장의 ${PERSONAS.Cell_PE.role.replace(" - Cell 공정", "")}입니다.
+이 작업은 일일 이슈 브리핑의 2번 (발생빈도) + 3번 (조건변경 단순 항목) 정리입니다.${kbText}${NUMERIC_SOURCE_RULE}
+
+${focus}
+
+[★ 최우선 지시]
+1) 부동 이슈 데이터에서 카테고리별/호기별 반복을 빠짐없이 집계
+2) 조건변경 메시지 중 단순 항목을 conditionChanges 4개 그룹에 분류
+   (※ 호기별 다중 파라미터 그룹은 별도 작업에서 처리하므로 여기선 제외)
+
+[★ 첨부 이미지 분석 활용 — 필수]
+- ★ 첨부 이미지 분석 인용 필수: 입력 데이터에 첨부 이미지 분석 정보 ([첨부 이미지 분석] 섹션 또는 images 필드)가 있으면, 분석/발언에 명시적으로 인용하라. 예: "첨부 이미지에 따르면...", "BM Bot 보고서 이미지에서 X건 확인", "이미지 분석에서 PCB 보드 교체 확인". 추측 금지 — 명시된 image 정보만 인용.
+- 같은 호기 반복 시 images 필드에 같은 부품 교체 패턴이 보이면 명시적으로 인용
+
+[필수 출력 — JSON만]
+{
+  "recurringByCategory": [
+    {"category":"Servo Fault","count":4,"equipments":["STK-4-B1 (×2)","STK-3-D5"]}
+  ],
+  "recurringSameEquipment": [
+    {"equipment":"호기","count":건수,
+     "detail":"★ 사건 단위 — 시각·분 명시 (예: '14:17 Servo Forward Over Run 38min + 15:42 Servo Total Fault 28min')",
+     "gapAnalysis":"★ 재발 간격 분석 (예: '47분 간격 재발', '8분 간격 연속 발생')",
+     "totalDuration":"누적 N분 (예: '누적 66분')",
+     "partsReplaced":"교체 부품 (예: 'Mandrel Y2 + Servo R 모두 교체')"}
+  ],
+  "conditionChanges": {
+    "visionOffset": [{"date":"YY/M/D","time":"HH:MM","equipment":"호기","change":"변경 내용","reason":"사유"}],
+    "settingChange": [{"equipment":"호기","parameter":"파라미터명","before":"변경 전","after":"변경 후"}],
+    "cutter": [{"date":"YY/M/D","time":"HH:MM","equipment":"호기","change":"변경 내용"}],
+    "other": [{"date":"YY/M/D","equipment":"호기","change":"기타 조건 변경","pic":"담당자"}]
+  }
+}
+
+[★ 영역 12-AI3 — recurringSameEquipment 풍부도 강조]
+같은 호기 2건 이상 재발한 경우 다음을 반드시 추출:
+1) **detail에 시각·분 명시** — 단순 "2회 발생" 아닌 "14:17 38min + 15:42 28min" 형식
+2) **gapAnalysis에 간격 명시** — "47분 간격 재발", "8분 간격 연속 발생"
+3) **totalDuration 누적 분 표기** — "누적 66분"
+4) **partsReplaced 교체 부품** — "Mandrel Y2 + Servo R 모두 교체"
+★ 이 4개 필드는 옵셔널이지만 가능한 한 풍부하게 채울 것 (사건 단위 분석 핵심)
+
+[규칙]
+- recurringByCategory: 모든 카테고리 빠짐없이 집계
+- recurringSameEquipment: 같은 호기 2건 이상 발생만 (★ detail에 시각·분, gap·누적·부품 풀로 추출)
+- conditionChanges 4개 하위 그룹 — 단발 변경/단순 항목만 (다중 파라미터 그룹은 제외)
+- 모든 수치는 숫자만`;
+
+  const userMsg = `[부동 이슈 데이터 - ${totalCount}건]
+${JSON.stringify(issuesData, null, 1)}
+
+[공정/설비 조건변경 메시지 - ${processChangeData.length}건]
+${processChangeData.length > 0 ? JSON.stringify(processChangeData, null, 1) : "(없음)"}
+
+위 데이터를 2번 반복 + 3번 조건변경 단순 항목으로 정리하세요. (다중 파라미터 그룹은 별도 처리)`;
+
+  return await callCurationPart(sys, userMsg, "Part2a-Recurring/Simple", [], {}, 1500);
+}
+
+// ─── Part 2b: 3번 조건변경 (conditionChangeGroups 전용) ──────────────────────
+// 호기별 다중 파라미터 변경 그룹만 집중 추출
+async function curationPart2b_ConditionChangeGroups(processChangeData, qualityWithSetting, focus, kbText) {
+  const sys = `${FACTORY_PHILOSOPHY}
+
+당신은 AZS 배터리 공장의 ${PERSONAS.Cell_PE.role.replace(" - Cell 공정", "")}입니다.
+이 작업은 호기별 조건변경 그룹 (다중 파라미터 변경) 정밀 추출 전용입니다.${kbText}${NUMERIC_SOURCE_RULE}
+
+${focus}
+
+[★ 핵심 작업 — 이 작업의 전부]
+입력 메시지에서 같은 호기에 대해 여러 파라미터를 변경한 그룹을 풀로 추출하세요.
+★★ 각 그룹의 **모든** 파라미터를 빠짐없이 parameters 배열에 포함하세요. **10개 이상도 가능합니다.** ★★
+★★ 메시지의 Countermeasures 섹션에 5개, 8개, 10개 항목이 있으면 그 모든 항목을 parameters에 풀로 넣으세요. ★★
+★★ 절대 1~2개만 추출하고 끝내지 마세요. 메시지에 명시된 모든 항목을 끝까지 처리하세요. ★★
+
+[★ 첨부 이미지 분석 활용 — 필수]
+- ★ 첨부 이미지 분석 인용 필수: 입력 데이터에 첨부 이미지 분석 정보 ([첨부 이미지 분석] 섹션 또는 images 필드)가 있으면, 분석/발언에 명시적으로 인용하라. 예: "첨부 이미지에 따르면...", "BM Bot 보고서 이미지에서 X건 확인", "이미지 분석에서 PCB 보드 교체 확인". 추측 금지 — 명시된 image 정보만 인용.
+- 메시지의 images 필드는 setting/measurement 시각 정보를 줄 수 있다 (예: 게이지 수치, 정렬 상태) — 적극 인용
+
+[★ 인식 패턴]
+1) "Machine: Stack 3B2 / Problem: Issue Overhang / Caused: ... / Countermeasures: - Setting Gap ... - Setting Gap ..." 형식
+   → 하나의 conditionChangeGroup으로 묶고, **Countermeasures의 모든 항목을 빠짐없이** parameters 배열에 포함
+2) Countermeasures 안의 "- Setting Gap 2nd PnP (+) Down Loading 39.6 => 40.0" 같은 항목은
+   parameter="Gap 2nd PnP (+) Down Loading", before="39.6", after="40.0"으로 추출
+   ★ "=>", "->", "to" 모두 Before/After 구분 기호로 인식
+3) "- check vision f/i" "- check gap" 같이 값 없이 점검 항목인 경우
+   parameter="Vision f/i 점검", before="", after="Check"
+4) Stack NG / Stack Wrinkle 보고도 그룹으로 추출 (문제 호기 + Countermeasures)
+
+[★ Few-shot 예시 — 8개 파라미터 풀 추출]
+입력 메시지: "Machine: Stack 3B2 / Problem: Issue Overhang / Caused: anode X value exceeds the limit / Countermeasures: - Check Gap 2nd PnP (+) Down Loading & Unloading - Setting Gap 2nd PnP (+) Down Loading 39.6 => 40.0 - Setting Gap 2nd PnP (+) Down Unloading 32.9 => 33.0 - Check Gap 2nd PnP (-) Down Loading & Unloading - Setting Gap 2nd PnP (-) Down Loading 40.0 => 40.1 - Setting Gap 2nd PnP (-) Down unloading 33.0 => 33.2 - Setting Idle mandrel pressure 180 => 200 - Setting Sepa dancer static pressure 160 => 150 / Time: 08:10 / PIC: Group C / Result: 3 sample CT scan OK"
+
+출력 (★ 메시지의 모든 항목 빠짐없이 ★):
+{
+  "title": "STK-3-B2 Overhang 대응",
+  "equipment": "STK-3-B2",
+  "timeRange": "08:10",
+  "shift": "Shift 1",
+  "picReason": "PIC: Group C · 사유: anode X value exceeds the limit",
+  "parameters": [
+    {"parameter": "Gap 2nd PnP (+) Down Loading & Unloading 점검", "before": "", "after": "Check"},
+    {"parameter": "Gap 2nd PnP (+) Down Loading", "before": "39.6", "after": "40.0"},
+    {"parameter": "Gap 2nd PnP (+) Down Unloading", "before": "32.9", "after": "33.0"},
+    {"parameter": "Gap 2nd PnP (-) Down Loading & Unloading 점검", "before": "", "after": "Check"},
+    {"parameter": "Gap 2nd PnP (-) Down Loading", "before": "40.0", "after": "40.1"},
+    {"parameter": "Gap 2nd PnP (-) Down Unloading", "before": "33.0", "after": "33.2"},
+    {"parameter": "Idle mandrel pressure", "before": "180", "after": "200"},
+    {"parameter": "Sepa dancer static pressure", "before": "160", "after": "150"}
+  ],
+  "verification": "3 sample CT scan OK"
+}
+★ 위 예시처럼 — 메시지에 8개 항목이 있으면 8개를 모두 parameters에 풀로 채우세요. 절대 일부만 추출하지 마세요.
+
+[필수 출력 — JSON만, 다른 텍스트 금지]
+{
+  "conditionChangeGroups": [
+    {
+      "title": "호기별 그룹 제목",
+      "equipment": "호기명 (정규화: Stack 3B2 → STK-3-B2)",
+      "timeRange": "발생 시각 (예: '08:10')",
+      "shift": "Shift 정보",
+      "picReason": "PIC + 사유",
+      "parameters": [
+        {"parameter": "파라미터명", "before": "값 또는 빈 문자열", "after": "값 또는 'Check'"}
+      ],
+      "verification": "검증 결과 또는 빈 문자열"
+    }
+  ]
+}
+
+[★ 호기명 정규화]
+- "Stack 3B2" → "STK-3-B2"
+- "Stack 4-B1" → "STK-4-B1"
+- "Stack 4B(-)" → "STK-4-B(-)"
+- "1B5" → "STK-1-B5"
+
+[규칙]
+- 그룹이 없으면 빈 배열 [] 반환
+- ★★ parameters는 메시지에 명시된 **모든** 항목 추출 — 풀로 (10개 이상도 가능, 절대 일부만 X) ★★
+- ★★ "Setting X => Y" 형식 항목이 5개 있으면 5개 모두, 8개 있으면 8개 모두 parameters에 포함 ★★
+- 단발 변경 (Vision Offset 1건)은 그룹 아님 — 제외
+- 모든 수치는 숫자/문자열로 정확히 표기`;
+
+  const userMsg = `[조건변경 메시지 - ${processChangeData.length}건]
+${processChangeData.length > 0 ? JSON.stringify(processChangeData, null, 1) : "(없음)"}
+
+[참고: quality 메시지 중 setting 정보 있을 수 있는 것 - ${qualityWithSetting.length}건]
+${qualityWithSetting.length > 0 ? JSON.stringify(qualityWithSetting, null, 1) : "(없음)"}
+※ "setting z cut", "Stack NG ... Countermeasures" 같은 메시지에 호기별 다중 파라미터 변경 정보가 있을 수 있음
+
+위 메시지에서 같은 호기에 대한 다중 파라미터 변경 그룹을 풀로 추출하세요.
+★★ 각 메시지의 Countermeasures **모든** 항목을 parameters 배열에 빠짐없이 포함하세요. ★★
+★★ "Setting X => Y" 형식 항목이 5개, 8개, 10개 있으면 그만큼 모두 parameters에 추출. 절대 1~2개만 추출 X. ★★
+★ 호기명은 정규화 (Stack 3B2 → STK-3-B2).`;
+
+  return await callCurationPart(sys, userMsg, "Part2b-ConditionChangeGroups", [], {}, 1800);
+}
+
+// ─── Part 3: 4번 테스트/PM + 5번 품질NG ───────────────────────────────────────
+async function curationPart3_TestPmQuality(testData, qualityData, focus, kbText, categoryMsgs, qualityDataLong = null) {
+  const sys = `${FACTORY_PHILOSOPHY}
+
+당신은 AZS 배터리 공장의 ${PERSONAS.Cell_PE.role.replace(" - Cell 공정", "")}입니다.
+이 작업은 일일 이슈 브리핑의 4번 (테스트/PM) + 5번 (품질 NG) 섹션 정리입니다.${kbText}${NUMERIC_SOURCE_RULE}
+
+${focus}
+
+[★ 최우선 지시 — 누락 금지]
+입력의 테스트 메시지와 품질 메시지를 빠짐없이 분류해 testPm 4개 그룹 + qualityNg에 정리하세요.
+
+[★ 첨부 이미지 분석 활용 — 필수]
+- ★ 첨부 이미지 분석 인용 필수: 입력 데이터에 첨부 이미지 분석 정보 ([첨부 이미지 분석] 섹션 또는 images 필드)가 있으면, 분석/발언에 명시적으로 인용하라. 예: "첨부 이미지에 따르면...", "BM Bot 보고서 이미지에서 X건 확인", "이미지 분석에서 PCB 보드 교체 확인". 추측 금지 — 명시된 image 정보만 인용.
+- 품질 NG는 시각 정보가 핵심: images 필드에 결함 사진/CT 스캔/검사 화면이 보이면 description/findings에 명시적 인용
+
+[필수 출력 — JSON만, 다른 텍스트 금지]
+{
+  "testPm": {
+    "linePM": [
+      {"date":"YY/M/D","line":"라인명","status":"상태",
+       "startTime":"(옵셔널) 시작 시각", "endTime":"(옵셔널) 완료 시각",
+       "details":[{"equipment":"호기","work":"PM/Cleaning 등","result":"✅/🔄/❌"}]}
+    ],
+    "fmvs": [{"date":"YY/M/D","action":"FMVS 작업","equipments":"대상 설비"}],
+    "cutter": [
+      {"date":"YY/M/D","time":"HH:MM","equipment":"설비 (있으면)","item":"테스트 항목","resultIcon":"✅/❌/🔄","note":"결과"}
+    ],
+    "stackingSepa": [{"date":"YY/M/D","equipment":"호기","issue":"문제","resultIcon":"❌"}]
+  },
+  "qualityNg": {
+    "table": [{"date":"YY/M/D","sepaFold":숫자,"electrodeExpose":숫자,"nonResponse":숫자,"dimOverkill":숫자,"contactNg":숫자}],
+    "trend": "비교 분석 텍스트 (예: 'Sepa Fold 17→18 증가, Electrode Expose 6→10 (+67%)')"
+  },
+  "chronic1AB": null,
+  "line3DCutterCpc": null
+}
+
+[★ chronic1AB — 1AB 만성 라인 NG 추출 (★ 핵심 작업)]
+
+1AB 라인 메시지 패턴 인식:
+- "Stacking 1 - AB Run sepa Problem" 또는 "Update Line 1AB" 시작 메시지
+- "1-A1, 1-A2, 1-A3..." 호기별 JXT lot ID + NG/OK 표시 (✅, ❌, 🔄)
+- "JXT11251121022J66103 ( NG ETC YCS 5X Sepa wrinkle Fist stack)" 형식
+
+★★ chronic1AB 추출 규칙 (정답 레포트 양식) ★★
+1) **NG 표시된 호기만 byEquipment에 포함** — ✅(OK)만 있는 호기는 제외
+2) **NG 패턴 강조** — "NG ETC YCS 5x Sepa wrinkle First stack ❌" 형태로 표기
+3) **반복 패턴 강조** — "이번 기간 최다 7X", "2 lot 연속" 같은 표현 추가
+4) **호기 6개 정도** 정상 (1-A2, 1-A3, 1-A5, 1-A6, 1-B2, 1-B4/5 등)
+5) ✅ 정상 cell은 ngList에서 제외 — 핵심 NG만 표기
+
+[★ Few-shot 예시 — chronic1AB]
+입력 메시지:
+"Stacking 1-AB Run sepa Problem | Update Line 1AB | 1-A1: JXT...J67103✅, JXT...J66103✅
+ 1-A2: JXT...J66103 (NG ETC YCS 5X Sepa wrinkle Fist stack) ❌, JXT...J66102
+ 1-A3: JXT...J66102 (NG ETC Y-CS Y-AS 5X Sepa wrinkle Fist stack) ❌, JXT...J66103 (NG ETC Y-CS Y-AS 5X Sepa wrinkle) ❌
+ 1-A6: JXT...J67102 (NG SEPA FOLD 3X) ❌
+ 1-B2: JXT...J67102 (NG YCS First stack 7X) ❌
+ 1-B4: NG Y-CS 2x Sepa wrinkle"
+
+출력:
+{
+  "title": "Stacking 1-AB Sepa Run Issues (지속 모니터링)",
+  "patternSummary": "Separator wrinkle / YCS / Sepa Fold 3 종류 NG 다발. 1-B2가 7X로 이번 기간 최다, 1-A3은 2 lot 연속 ❌.",
+  "byEquipment": [
+    {"equipment": "1-A2", "ngList": "JXT...J66103 - NG ETC YCS 5x Sepa wrinkle First stack ❌"},
+    {"equipment": "1-A3", "ngList": "JXT...J66102, JXT...J66103 - NG ETC Y-CS·Y-AS 5x Sepa wrinkle ❌ (2 lot 연속)"},
+    {"equipment": "1-A6", "ngList": "JXT...J67102 - NG SEPA FOLD 3X ❌"},
+    {"equipment": "1-B2", "ngList": "JXT...J67102 - NG YCS First stack 7X ❌ (이번 기간 최다)"},
+    {"equipment": "1-B4", "ngList": "NG Y-CS 2x Sepa wrinkle"}
+  ]
+}
+
+★ ✅(OK) cell은 byEquipment에서 제외, NG ❌ 표시된 호기만 포함하세요.
+★ 같은 호기에 NG가 여러 lot 있으면 "JXT-A, JXT-B (2 lot 연속)" 식으로 묶기.
+
+[line3DCutterCpc (옵셔널)]
+Line 3D Cutter CPC 모니터링 보고가 있을 때만:
+{"status":"내용", "details":["보고1","보고2"]}
+없으면 null.
+
+[★ 옵셔널 필드 — 데이터에 명백한 단서 있을 때만]
+line3DCutterCpc / linePM.startTime/endTime/details 등은
+데이터에 명백히 있을 때만 채우고, 없으면 null 또는 빈 값으로 빠르게 응답.
+
+[규칙]
+- testPm 4개 하위 그룹 — 데이터 없으면 빈 배열 []
+- qualityNg.table은 데이터에 있는 일자만 (3일치는 KB 활용 가능, 옵셔널)
+- qualityNg.trend는 비교 분석 형식, 1일치만 있으면 "1일치 데이터 — 비교 불가"
+- chronic1AB는 1AB 라인 메시지에서 NG ❌ 호기만 byEquipment에 포함 (★ 정상 cell 제외)
+- 모든 수치는 숫자만`;
+
+  // ★ AH3: qualityDataLong 있으면 chronic1AB 추출용으로 함께 전달 (1AB 메시지 풍부 데이터)
+  const qualityLongSection = qualityDataLong && qualityDataLong.length > 0
+    ? `\n\n[★ 1AB 만성 라인 분석용 quality 메시지 풀 본문 (chronic1AB 추출 전용) - ${qualityDataLong.length}건]
+${JSON.stringify(qualityDataLong, null, 1)}
+※ 위 메시지 중 "Stacking 1-AB" "Run sepa Problem" 같은 1AB 라인 보고가 있으면 chronic1AB에 풀로 추출.
+※ NG ❌ 표시된 호기만 byEquipment에 포함, ✅ 정상 cell은 제외.`
+    : "";
+
+  const userMsg = `[테스트/양산외 생산 메시지 - ${testData.length}건]
+${testData.length > 0 ? JSON.stringify(testData, null, 1) : "(없음)"}
+
+[품질 이슈 메시지 - ${qualityData.length}건]
+${qualityData.length > 0 ? JSON.stringify(qualityData, null, 1) : "(없음)"}${qualityLongSection}
+
+위 데이터를 4번 테스트/PM + 5번 품질NG 형식으로 정리하세요.
+★ 1AB 라인 메시지가 풍부하면 chronic1AB의 byEquipment에 NG 호기 6개 정도 풀로 추출 (✅ 제외, ❌만).
+옵셔널 필드(line3DCutterCpc 등)는 명백한 단서 있을 때만, 없으면 null로 빠르게 응답하세요.`;
+
+  return await callCurationPart(sys, userMsg, "Part3-TestPm/Quality");
+}
+
+// ─── 영역 11-C: 빈/정규화 헬퍼 ──────────────────────────────────────────────────
+function emptyBriefing() {
+  return {
+    summary_text: "분석 대상 이슈 없음",
+    criticalSummary: [],
+    longDowntime: [],
+    recurringByCategory: [],
+    recurringSameEquipment: [],
+    conditionChanges: { visionOffset: [], settingChange: [], cutter: [], other: [] },
+    testPm: { linePM: [], fmvs: [], cutter: [], stackingSepa: [] },
+    qualityNg: { table: [], trend: "데이터 없음" },
+    // 하위호환: 옛 필드명도 빈 배열 (일부 코드가 참조)
+    daily_table: [], long_downtime: [], recurring: [],
+    quality_issues: [], process_changes: [], tests_inspections: [],
+  };
+}
+
+function normalizeBriefing(parsed) {
+  const arr = (v) => Array.isArray(v) ? v : [];
+  const obj = (v) => (v && typeof v === "object" && !Array.isArray(v)) ? v : {};
+
+  const result = {
+    summary_text: parsed.summary_text || "",
+    // ★ 영역 12-Y1: 레코드 분류
+    recordBreakdown: obj(parsed.recordBreakdown),
+    criticalSummary: arr(parsed.criticalSummary),
+    longDowntime: arr(parsed.longDowntime),
+    // ★ 영역 12-Y4: 만성 이슈 별도
+    chronicIssues: arr(parsed.chronicIssues),
+    recurringByCategory: arr(parsed.recurringByCategory),
+    recurringSameEquipment: arr(parsed.recurringSameEquipment),
+    // ★ 영역 12-Y2: 호기별 조건변경 그룹
+    conditionChangeGroups: arr(parsed.conditionChangeGroups),
+    conditionChanges: {
+      visionOffset: arr(obj(parsed.conditionChanges).visionOffset),
+      settingChange: arr(obj(parsed.conditionChanges).settingChange),
+      cutter: arr(obj(parsed.conditionChanges).cutter),
+      other: arr(obj(parsed.conditionChanges).other),
+    },
+    testPm: {
+      linePM: arr(obj(parsed.testPm).linePM),
+      fmvs: arr(obj(parsed.testPm).fmvs),
+      cutter: arr(obj(parsed.testPm).cutter),
+      stackingSepa: arr(obj(parsed.testPm).stackingSepa),
+    },
+    // ★ 영역 12-Y3: 1AB 만성 라인 / Line 3D CPC
+    chronic1AB: parsed.chronic1AB && typeof parsed.chronic1AB === "object" ? parsed.chronic1AB : null,
+    line3DCutterCpc: parsed.line3DCutterCpc && typeof parsed.line3DCutterCpc === "object" ? parsed.line3DCutterCpc : null,
+    qualityNg: {
+      table: arr(obj(parsed.qualityNg).table),
+      trend: obj(parsed.qualityNg).trend || "데이터 없음",
+    },
+    // ★ 영역 12-BD 그룹 종합 (카테고리/호기별 LLM 종합)
+    groupSyntheses: parsed.groupSyntheses && typeof parsed.groupSyntheses === "object"
+      ? {
+          byCategory: parsed.groupSyntheses.byCategory || {},
+          byEquipment: parsed.groupSyntheses.byEquipment || {},
+        }
+      : { byCategory: {}, byEquipment: {} },
+  };
+
+  // 하위호환: 일부 코드가 옛 필드명으로 참조 (long_downtime, recurring 등)
+  result.long_downtime = result.longDowntime.map(d => ({
+    equipment: d.equipment, reason: d.rootCause || d.title, since: "",
+    status: d.result, duration_note: `${d.durationMin}분`,
+  }));
+  result.recurring = result.recurringByCategory.map(r => ({
+    item: r.category, lines: r.equipments || [], count: r.count, cause: "",
+  }));
+  result.daily_table = [];
+  result.quality_issues = [];
+  result.process_changes = [];
+  result.tests_inspections = [];
+
+  return result;
+}
+
+// PE 큐레이션 폴백 - 데이터 기반 자동 생성
+// ─── 영역 11-C: PE 큐레이션 폴백 (LLM 호출 실패 시 데이터 기반 자동 생성) ───
+function buildFallbackCuration(allIssues, categoryMsgs = {}) {
+  if (!allIssues || allIssues.length === 0) return emptyBriefing();
+
+  // 일자별 합계
+  const byDate = {};
+  for (const issue of allIssues) {
+    const d = issue.date || "?";
+    if (!byDate[d]) byDate[d] = { date: d, count: 0, totalMin: 0 };
+    byDate[d].count += 1;
+    byDate[d].totalMin += (issue.durMin || 0);
+  }
+
+  // 장기부동 (durMin 기준 내림차순 TOP 5, isTop은 가장 큰 1건)
+  const sorted = [...allIssues].sort((a, b) => (b.durMin || 0) - (a.durMin || 0));
+  const longDowntime = sorted.slice(0, 5).map((i, idx) => ({
+    isTop: idx === 0,
+    equipment: i.eq || "-",
+    title: `${i.eq || "?"} ${(i.prob || "").slice(0, 40)} — ${i.durMin || 0}분`,
+    occurrence: `${i.date || ""} ${i.time || ""}`,
+    alarm: i._alarm || "",
+    splitNote: "",
+    rootCause: (i.cause || "").slice(0, 80),
+    partReplaced: "",
+    pic: i.pic || "",
+    result: i.result || "",
+    durationMin: i.durMin || 0,
+    actionSequence: splitActionSteps(i.action || ""),
+  }));
+
+  // 반복 (설비별)
+  const eqCount = {};
+  for (const i of allIssues) {
+    if (i.eq) eqCount[i.eq] = (eqCount[i.eq] || 0) + 1;
+  }
+  const recurringSameEquipment = Object.entries(eqCount)
+    .filter(([, c]) => c >= 2)
+    .sort((a, b) => b[1] - a[1])
+    .slice(0, 10)
+    .map(([equipment, count]) => ({
+      equipment,
+      count,
+      detail: allIssues.filter(i => i.eq === equipment).slice(0, 2).map(i => (i.prob || "").slice(0, 30)).join(" / "),
+    }));
+
+  // 카테고리별 (단순화 — causeCategory 사용)
+  const catCount = {};
+  for (const i of allIssues) {
+    if (i.causeCategory) catCount[i.causeCategory] = (catCount[i.causeCategory] || 0) + 1;
+  }
+  const recurringByCategory = Object.entries(catCount)
+    .sort((a, b) => b[1] - a[1])
+    .slice(0, 10)
+    .map(([category, count]) => ({
+      category,
+      count,
+      equipments: [...new Set(allIssues.filter(i => i.causeCategory === category).map(i => i.eq).filter(Boolean))].slice(0, 5),
+    }));
+
+  return {
+    summary_text: `[큐레이션 폴백] 총 ${allIssues.length}건 부동 (LLM 호출 실패 — 데이터 기반 자동 정리)`,
+    criticalSummary: [],
+    longDowntime,
+    recurringByCategory,
+    recurringSameEquipment,
+    conditionChanges: { visionOffset: [], settingChange: [], cutter: [], other: [] },
+    testPm: { linePM: [], fmvs: [], cutter: [], stackingSepa: [] },
+    qualityNg: { table: [], trend: "데이터 없음" },
+    // 하위호환
+    daily_table: Object.values(byDate).map(d => ({ date: d.date, equipment: "(통합)", issue: `${d.count}건`, action: "", downtime: d.totalMin })),
+    long_downtime: longDowntime.map(d => ({ equipment: d.equipment, reason: d.rootCause, since: "", status: d.result, duration_note: `${d.durationMin}분` })),
+    recurring: recurringByCategory.map(r => ({ item: r.category, lines: r.equipments || [], count: r.count, cause: "" })),
+    quality_issues: [],
+    process_changes: [],
+    tests_inspections: [],
+  };
+}
+
+
+
+// ─── 1. 모드 분류 (키워드 → 우선순위 → 폴백) ───────────────────────────────────
+function classifyDiscussionMode(issue, isPriUrgent, isPriImportant) {
+  const fullText = [issue.eq, issue.prob, issue.cause, issue.result, issue.text].join(" ");
+
+  // STEP 1: 키워드 강제 체크
+  for (const [category, keywords] of Object.entries(DEEP_FORCE_KEYWORDS)) {
+    for (const kw of keywords) {
+      if (fullText.toLowerCase().includes(kw.toLowerCase())) {
+        return {
+          mode: "DEEP",
+          reason: `[${category}] 키워드 감지: "${kw}"`,
+          source: "keyword",
+        };
+      }
+    }
+  }
+
+  // STEP 2: 기존 우선순위 매핑
+  if (isPriUrgent) {
+    return { mode: "DEEP", reason: `긴급 이슈 (${issue.reasons?.join(", ")})`, source: "priority" };
+  }
+  if (isPriImportant) {
+    return { mode: "STANDARD", reason: `중요 이슈 (${issue.reasons?.join(", ")})`, source: "priority" };
+  }
+
+  // STEP 3: 일반 → LITE
+  return { mode: "LITE", reason: "일반 이슈 (완료/단순)", source: "default" };
+}
+
+// ─── 2. 라우터: 발언 순서 결정 (AI 호출 1회, Haiku) ────────────────────────────
+async function routeAgentOrder(issueCtx, allowedAgents) {
+  // allowedAgents: 사용자가 선택한 페르소나 풀 (자동 + 추가)
+  // 라우터는 이 풀 안에서만 발언 순서를 결정해야 함
+
+  const personaList = allowedAgents.map(code => {
+    const p = PERSONAS[code];
+    return `- ${code}: ${p.label} (${p.process}) - ${p.focus.slice(0, 40)}`;
+  }).join("\n");
+
+  const sys = `당신은 공장 이슈 논의의 발언 순서를 결정하는 라우터입니다.
+
+[참여 가능 페르소나 - 이 안에서만 선택]
+${personaList}
+
+[규칙]
+1. 불량·품질·수율 → TE 첫 발언 (선택 가능한 TE 중 관련 공정 우선)
+2. 설비 BM·정지 → ME 첫 발언
+3. 생산목표·가동률 → PE 첫 발언
+4. 반송·MES·WIP 이슈 + FA 참여 시 → FA 포함
+5. 외관·검사 이슈 + Vision 참여 시 → Vision 포함
+6. 위 [참여 가능 페르소나]에 없는 코드는 절대 사용 금지
+7. 모든 참여 가능 페르소나를 발언 순서에 포함시킬 것 (한 명도 빠지지 않게)
+
+JSON만 출력 (다른 텍스트 금지):
+{"order":["Cell_TE","Cell_ME","Cell_PE"],"reason":"불량 이슈로 TE 우선"}`;
+
+  try {
+    const raw = await callClaudeRaw(sys, `[이슈]\n${issueCtx}\n\n발언 순서 결정.`, {
+      model: MODEL_FAST,
+      max_tokens: 200,
+    });
+    const parsed = safeJSON(raw);
+    let order = Array.isArray(parsed.order) ? parsed.order : [];
+    // ★ 풀에 없는 페르소나는 자동 제거 (라우터가 잘못 추가한 경우 방어)
+    order = order.filter(p => allowedAgents.includes(p));
+    // ★ 풀에 있는데 빠진 페르소나는 끝에 추가 (라우터가 빠뜨린 경우 방어)
+    for (const a of allowedAgents) {
+      if (!order.includes(a)) order.push(a);
+    }
+    return { order, reason: parsed.reason || "라우터 판단", source: "router" };
+  } catch {
+    // 폴백: TE 우선 → ME → PE → 나머지
+    const fallbackPriority = (code) => {
+      if (code.endsWith("_TE")) return 0;
+      if (code.endsWith("_ME")) return 1;
+      if (code.endsWith("_PE")) return 2;
+      if (code === "FA") return 3;
+      if (code === "Vision") return 4;
+      return 5;
+    };
+    const order = [...allowedAgents].sort((a, b) => fallbackPriority(a) - fallbackPriority(b));
+    return {
+      order,
+      reason: "라우터 실패 - 기본 순서 (TE→ME→PE→FA→Vision)",
+      source: "fallback",
+    };
+  }
+}
+
+// ─── 3. 단일 페르소나 호출 (이전 의견 누적 + 대화체 + JSON 스키마) ─────────────
+async function callPersona(personaCode, issueCtx, prevOpinions, kbText, reportType, isPostAction = false, issueStatus = "unknown") {
+  // 영역 12-A/B: 새 필드 (근본원인 / 조치안_평가 / 개선안 / 재발방지책) + 이슈 상태별 차등
+  // issueStatus: "solved" / "unsolved" / "analyzing" / "unknown"
+  const p = PERSONAS[personaCode];
+  const focus = REPORT_FOCUS[reportType] || REPORT_FOCUS.meeting;
+  const kb = kbText ? `\n\n[학습 내용]\n${kbText.slice(0, 500)}` : "";
+
+  // 이전 발언자 의견 (Phase 1: 새 필드 표시. Phase 2에서 대화형 강화 예정)
+  const prevText = prevOpinions.length > 0
+    ? `\n\n[먼저 발언한 동료 의견]\n${prevOpinions.map(o => {
+        const op = o.opinion || {};
+        return `── ${PERSONAS[o.persona]?.label} (${o.persona}) [${op.stance || "-"}] ──
+[근본원인] ${op["근본원인"] || op["원인"] || "-"}
+[조치안 평가] ${op["조치안_평가"] || op["기존조치_평가"] || "-"}
+[개선안] ${op["개선안"] || op["대책"] || "-"}
+[재발방지책] ${op["재발방지책"] || "-"}`;
+      }).join("\n\n")}`
+    : "";
+
+  const conversationGuide = prevOpinions.length > 0
+    ? `\n\n[대화 진행 방식]
+- 위 동료 의견을 직접 언급/인용하며 대화체로 작성하세요 (예: "Cell_TE의 온도 분석에 동의하며...", "ME가 지적한 베어링 마모 외에...")
+- previous_reference 필드에 누구의 어떤 의견을 받아 답하는지 명시
+- stance 필드에 동의/부분동의/반대/추가의견 중 선택`
+    : `\n\n[첫 발언자 안내]\n- 당신이 첫 발언자입니다. previous_reference는 빈 문자열, stance는 "초기분석"`;
+
+  // 영역 12-B: 이슈 상태별 차등 가이드
+  let statusGuide = "";
+  if (issueStatus === "solved") {
+    statusGuide = `\n\n[★ Solved 이슈 - 회고 + 재발방지 강조]
+- 이미 해결된 이슈입니다. PE 큐레이션이 현상/조치결과를 이미 정리했습니다.
+- 당신의 역할: ① 기존 조치의 적절성을 회고 평가 ② 보완할 부분 ③ 재발방지책 제안
+- "조치안_평가" 필드에 적절/미흡/부적절 + 근거 명시
+- "개선안" 필드에 추가 보완책 제시 (예: 다른 라인 horizontal deployment, PM 항목 추가)`;
+  } else if (issueStatus === "unsolved") {
+    statusGuide = `\n\n[★ Unsolved 이슈 - 즉시 조치 + 재발방지 강조]
+- 미해결 이슈입니다. 즉시 조치가 필요합니다.
+- 당신의 역할: ① 근본원인 가설 ② 즉시 조치안 ③ 재발방지책
+- "조치안_평가" 필드는 "해당없음 (조치 미적용)" 또는 "진행중"
+- "개선안" 필드에 즉시 시도 가능한 조치 제안`;
+  } else if (issueStatus === "analyzing") {
+    statusGuide = `\n\n[★ Analyzing 이슈 - 가설 + 검증 강조]
+- 분석 중인 이슈입니다.
+- 당신의 역할: ① 근본원인 가설 (확실/의심) ② 검증 방법 ③ 잠정 조치안
+- "조치안_평가" 필드는 "진행중"
+- "근본원인" 필드는 "가설:" 접두어로 시작 (예: "가설: Z2 coupling 마모")`;
+  } else {
+    // unknown 또는 기본값
+    statusGuide = `\n\n[★ 이슈 상태 미상 - 일반 분석]
+- 이슈 상태가 명확하지 않으면 데이터 기반으로 판단
+- "조치안_평가"에 가용 정보 기반 평가
+- "개선안"에 권고 조치 제안`;
+  }
+
+  const sys = `${FACTORY_PHILOSOPHY}
+
+당신은 AZS 배터리 공장 ${p.role}입니다.
+
+[우선순위] ${p.priority}
+[관심 영역] ${p.focus}
+[입장] ${p.stance}${kb}
+
+${focus} 다음 이슈를 ${p.role.split(" ")[0]} 관점에서 분석하세요.
+
+★ 중요: PE 큐레이션이 이미 "현상" "조치결과"를 정리했습니다. 당신은 그 부분을 다시 설명하지 말고, 다음 3가지에 집중하세요:
+  1) 근본원인 (root cause) — 표면 증상이 아닌 진짜 원인
+  2) 조치안 평가 — 기조치는 적절했는지, 미흡한 부분
+  3) 개선안 / 재발방지책 — 향후 동일 이슈 방지 방법${conversationGuide}${statusGuide}
+
+[★ 첨부 이미지 분석 활용 — 필수]
+- ★ 첨부 이미지 분석 인용 필수: 입력 데이터에 첨부 이미지 분석 정보 ([첨부 이미지 분석] 섹션 또는 images 필드)가 있으면, 분석/발언에 명시적으로 인용하라. 예: "첨부 이미지에 따르면...", "BM Bot 보고서 이미지에서 X건 확인", "이미지 분석에서 PCB 보드 교체 확인". 추측 금지 — 명시된 image 정보만 인용.
+- 이슈 컨텍스트 끝부분에 [첨부 이미지 분석] 섹션이 있으면 say 필드 발언에서 직접 인용 (예: "첨부 이미지에서 보이는 PCB 교체 흔적으로 미루어...")
+- 이미지 정보가 없으면 자연스럽게 진행하되 강제로 인용 금지
+
+★ 발언 방식 (영역 12 Phase 2): 자연스러운 대화체로 발언하세요.
+  - "say" 필드에 자유 텍스트로 발언 (이전 동료 의견을 직접 언급/인용/반박, 자기 관점 설명, 100~200자)
+  - "quote" 필드에 인용한 동료 발언의 짧은 핵심 1줄 (60자 이내, 첫 발언자는 빈 문자열)
+  - "reply_to" 필드에 답변 대상 페르소나 코드 (예: "Cell_TE", 첫 발언자는 빈 문자열)
+  - 4축 구조화 필드(근본원인/조치안_평가/개선안/재발방지책)는 사회자 합의용으로 함께 채우되, 본 발언은 say에 자유롭게 풀어쓰세요.
+
+[필수 출력 - JSON만]
+{
+  "say": "자유 대화체 발언 (이전 동료 인용/반박 포함, 100~200자)",
+  "quote": "인용한 동료 발언 핵심 1줄 (60자 이내, 첫 발언자는 빈 문자열)",
+  "reply_to": "답변 대상 페르소나 코드 (예: Cell_TE, 첫 발언자는 빈 문자열)",
+  "previous_reference": "이전 동료 의견 인용 요약 (60자, 첫 발언자는 빈 문자열) — 호환용",
+  "stance": "동의/부분동의/반대/추가의견/초기분석 중 하나",
+  "근본원인": "표면 증상이 아닌 진짜 root cause (100자이내, 가설이면 '가설:' 접두어)",
+  "조치안_평가": "기조치 적절성 평가 (적절/미흡/부적절/진행중/해당없음 + 근거, 80자이내)",
+  "개선안": "구체적 개선 조치 (80자이내)",
+  "재발방지책": "장기 재발 방지 방법 (PM 항목 추가, horizontal deployment 등, 80자이내)"
+}`;
+
+  // ★ 영역 12-AT: 페르소나 호출 4단계 retry (Cell_TE 일관 실패 패턴 해결)
+  // 1차 정상 → 1초 retry 정상 → 3초 retry 단순 프롬프트 → 최종 실패 시 명확한 오류 객체
+  const userMsg = `[이슈]\n${issueCtx}${prevText}`;
+  const t0 = Date.now();
+  let rawForDebug = null;
+  let attemptLog = [];
+
+  // 1차: 정상 호출
+  try {
+    await new Promise(r => setTimeout(r, 600));
+    const tAttempt = Date.now();
+    rawForDebug = await callClaudeRaw(sys, userMsg, {
+      model: MODEL_REASONING,
+      max_tokens: 1200,
+    });
+    const parsed = safeJSON(rawForDebug);
+    if (!parsed || typeof parsed !== "object" || Object.keys(parsed).length === 0) {
+      throw new Error(`safeJSON returned empty (raw length=${String(rawForDebug || "").length})`);
+    }
+    return { ...parsed, _attempt: "primary", _elapsedMs: Date.now() - t0 };
+  } catch (e1) {
+    attemptLog.push(`1차: ${e1?.message?.slice(0, 100) || String(e1).slice(0, 100)}`);
+    console.warn(`[페르소나 ${personaCode}] 1차 실패 — 1초 후 retry: ${e1?.message?.slice(0, 100)}`);
+  }
+
+  // retry 1: 1초 대기 후 동일 정상 호출
+  await new Promise(r => setTimeout(r, 1000));
+  try {
+    rawForDebug = await callClaudeRaw(sys, userMsg, {
+      model: MODEL_REASONING,
+      max_tokens: 1200,
+    });
+    const parsed = safeJSON(rawForDebug);
+    if (!parsed || typeof parsed !== "object" || Object.keys(parsed).length === 0) {
+      throw new Error(`safeJSON returned empty (raw length=${String(rawForDebug || "").length})`);
+    }
+    console.log(`[페르소나 ${personaCode}] retry 1 (정상 재시도) 성공 — 1차 일시 실패 회복`);
+    return { ...parsed, _attempt: "retry_primary", _elapsedMs: Date.now() - t0 };
+  } catch (e2) {
+    attemptLog.push(`retry1: ${e2?.message?.slice(0, 100) || String(e2).slice(0, 100)}`);
+    console.warn(`[페르소나 ${personaCode}] retry 1 실패 — 3초 후 retry 2 (단순 프롬프트): ${e2?.message?.slice(0, 100)}`);
+  }
+
+  // retry 2: 3초 대기 후 단순 프롬프트 (max_tokens 800, 4축만 요청)
+  await new Promise(r => setTimeout(r, 3000));
+  try {
+    const sysSimple = `당신은 ${PERSONAS[personaCode]?.label || personaCode} 엔지니어입니다.
+다음 이슈에 대해 간단히 4축으로 분석하세요. JSON만 출력:
+{
+  "stance": "동의/부분동의/반대 중 하나",
+  "say": "한 문장 의견",
+  "근본원인": "root cause (60자)",
+  "조치안_평가": "기존 조치 평가 (40자)",
+  "개선안": "개선 권고 (60자)",
+  "재발방지책": "재발 방지 (60자)"
+}`;
+    rawForDebug = await callClaudeRaw(sysSimple, userMsg.slice(0, 800), {
+      model: MODEL_REASONING,
+      max_tokens: 800,
+    });
+    const parsed = safeJSON(rawForDebug);
+    if (!parsed || typeof parsed !== "object" || Object.keys(parsed).length === 0) {
+      throw new Error(`safeJSON returned empty (raw length=${String(rawForDebug || "").length})`);
+    }
+    console.log(`[페르소나 ${personaCode}] retry 2 (단순 프롬프트) 성공`);
+    return {
+      quote: "",
+      reply_to: "",
+      previous_reference: "",
+      ...parsed,
+      _attempt: "retry_simple",
+      _elapsedMs: Date.now() - t0,
+    };
+  } catch (e3) {
+    attemptLog.push(`retry2: ${e3?.message?.slice(0, 100) || String(e3).slice(0, 100)}`);
+    const elapsed = Date.now() - t0;
+    const issueShort = String(issueCtx || "").slice(0, 80).replace(/\n/g, " ");
+    console.error(`[페르소나 호출 최종 실패] ${personaCode} (${elapsed}ms, 3회 시도) | 이슈: ${issueShort}`);
+    console.error(`  ↳ 시도 로그: ${attemptLog.join(" | ")}`);
+    if (rawForDebug) {
+      console.error(`  ↳ 마지막 raw 첫 300자: ${String(rawForDebug).slice(0, 300)}`);
+    } else {
+      console.error(`  ↳ 마지막 raw: 없음 (API 단계 실패)`);
+    }
+    return {
+      say: "분석 중 오류 발생",
+      quote: "",
+      reply_to: "",
+      previous_reference: "",
+      stance: "분석 오류",
+      "근본원인": "분석 중 오류",
+      "조치안_평가": "-",
+      "개선안": "-",
+      "재발방지책": "-",
+      _error: `Final fail after 3 attempts: ${attemptLog.join(" | ")}`.slice(0, 300),
+      _rawSnippet: rawForDebug ? String(rawForDebug).slice(0, 150) : null,
+      _elapsedMs: elapsed,
+      _attempt: "final_failure",
+    };
+  }
+}
+
+// ─── 4. 사회자: DEEP — 영역 12-E 새 필드 분리 (근본원인_합의 / 조치안_평가_합의 / 개선안_합의) ───
+async function moderateDeep(issueCtx, opinions) {
+  const opinionsText = opinions.map(o => {
+    const p = PERSONAS[o.persona];
+    const op = o.opinion || {};
+    return `── ${p.label} (${o.persona}) [${op.stance || "-"}] ──
+[이전 발언 인용] ${op.previous_reference || "(첫 발언자)"}
+[근본원인] ${op["근본원인"] || op["원인"] || "-"}
+[조치안 평가] ${op["조치안_평가"] || op["기존조치_평가"] || "-"}
+[개선안] ${op["개선안"] || op["대책"] || "-"}
+[재발방지책] ${op["재발방지책"] || "-"}`;
+  }).join("\n\n");
+
+  const sys = `당신은 공장 이슈 논의의 중립 사회자입니다. 어느 한쪽 편들지 않고 객관적으로 종합하세요.
+공장 운영 철학: 품질·근본조치 우선, 무리한 가동 지양.
+
+★ 영역 12 새 형식: 페르소나는 "근본원인" "조치안 평가" "개선안" "재발방지책" 4개 축으로 발언합니다.
+사회자는 각 축별로 합의/이견을 정리하세요. PE 큐레이션이 이미 "현상" "조치결과"를 정리했으므로, 거기 다시 들어가지 마세요.
+
+JSON만 출력:
+{
+  "근본원인_합의":"다수가 동의한 root cause (없으면 '합의 없음 — N명 의견 분기')",
+  "조치안_평가_합의":"기존 조치의 적절성에 대한 합의 (적절/미흡/부적절 + N명 합의)",
+  "개선안_합의":"권고 개선안 (즉시 시도 가능한 행동)",
+  "재발방지책_합의":"장기 재발 방지 (PM 항목, horizontal deployment 등)",
+  "충돌점":"페르소나간 의견이 갈린 부분 1-3개 (없으면 '없음')",
+  "추가_논의_필요":"데이터 부족/검증 필요 사항 (없으면 '없음')",
+  "consensus":"위 합의 사항 한 문장 종합 요약 (보고서용)"
+}`;
+
+  await new Promise(r => setTimeout(r, 500));
+  // 영역 12-AN: max_tokens 1000 → 1500 (DEEP 7필드 안전 마진)
+  let rawForDebug = null;
+  try {
+    rawForDebug = await callClaudeRaw(sys, `[이슈]\n${issueCtx}\n\n[엔지니어 의견 — 4축]\n${opinionsText}\n\n4축 합의 형식으로 종합 정리하세요.`, {
+      model: MODEL_REASONING,
+      max_tokens: 1500,
+    });
+    return safeJSON(rawForDebug);
+  } catch (e) {
+    console.error(`[사회자 DEEP 실패] ${e?.message || e}`);
+    if (e._rawSnippet !== undefined) {
+      console.error(`  ↳ raw 길이: ${e._rawLength}`);
+      console.error(`  ↳ raw 첫 300자: ${e._rawSnippet}`);
+    } else if (rawForDebug) {
+      console.error(`  ↳ raw 길이: ${String(rawForDebug).length}`);
+      console.error(`  ↳ raw 첫 300자: ${String(rawForDebug).slice(0, 300)}`);
+    } else {
+      console.error(`  ↳ API 단계 실패 (네트워크/timeout/인증)`);
+    }
+    throw e;
+  }
+}
+
+// ─── 5. 사회자: STANDARD — 영역 12-E 새 필드 적용 ───────────────────────────────
+async function moderateStandard(issueCtx, opinions) {
+  const opinionsText = opinions.map(o => {
+    const p = PERSONAS[o.persona];
+    const op = o.opinion || {};
+    return `── ${p.label} (${o.persona}) [${op.stance || "-"}] ──
+[근본원인] ${op["근본원인"] || op["원인"] || "-"}
+[조치안 평가] ${op["조치안_평가"] || op["기존조치_평가"] || "-"}
+[개선안] ${op["개선안"] || op["대책"] || "-"}
+[재발방지책] ${op["재발방지책"] || "-"}`;
+  }).join("\n\n");
+
+  const sys = `당신은 공장 이슈 논의의 중립 사회자입니다. 의견을 받아 실행 가능한 액션 플랜으로 정리하세요.
+의견 백화점 금지, 추상 표현 금지, 담당과 우선순위 명확히.
+
+★ 영역 12 새 형식: 페르소나는 "근본원인" "조치안 평가" "개선안" "재발방지책" 4축으로 발언합니다.
+
+JSON만 출력:
+{
+  "근본원인_합의":"다수 동의 root cause (1줄)",
+  "조치안_평가_합의":"기존 조치 적절성 평가 (1줄)",
+  "actions":[
+    {"action":"구체적 행동 (60자이내)","owner":"Cell_PE/ME/TE 등","priority":"긴급/중간/낮음","duration":"예: 4h, 2일","type":"개선안/재발방지"}
+  ],
+  "needsMore":"추가 확인 필요 (없으면 '없음')",
+  "summary":"한 줄 핵심 요약 (보고서용)"
+}`;
+
+  await new Promise(r => setTimeout(r, 500));
+  // 영역 12-AN: max_tokens 900 → 1300
+  let rawForDebug = null;
+  try {
+    rawForDebug = await callClaudeRaw(sys, `[이슈]\n${issueCtx}\n\n[의견 — 4축]\n${opinionsText}\n\n액션 플랜으로 정리.`, {
+      model: MODEL_REASONING,
+      max_tokens: 1300,
+    });
+    return safeJSON(rawForDebug);
+  } catch (e) {
+    console.error(`[사회자 STANDARD 실패] ${e?.message || e}`);
+    if (e._rawSnippet !== undefined) {
+      console.error(`  ↳ raw 길이: ${e._rawLength}`);
+      console.error(`  ↳ raw 첫 300자: ${e._rawSnippet}`);
+    } else if (rawForDebug) {
+      console.error(`  ↳ raw 길이: ${String(rawForDebug).length}`);
+      console.error(`  ↳ raw 첫 300자: ${String(rawForDebug).slice(0, 300)}`);
+    } else {
+      console.error(`  ↳ API 단계 실패 (네트워크/timeout/인증)`);
+    }
+    throw e;
+  }
+}
+
+// ─── 6. 사회자: LITE 압축 평가 (단독 호출, 페르소나 호출 없음) ──────────────────
+async function moderateLite(issueCtx) {
+  const sys = `당신은 공장 이슈 논의의 중립 사회자입니다.
+이미 완료된 이슈에 대해 PE/ME/TE 관점을 종합한 짧은 평가를 작성하세요.
+
+JSON만 출력:
+{
+  "supplement":"보완점 (놓친 부분, 1줄)",
+  "recurRisk":"재발 우려 (있음/낮음 + 1줄 근거)",
+  "prevention":"재발 방지책 (1-2개 구체 행동)"
+}`;
+
+  await new Promise(r => setTimeout(r, 400));
+  // 영역 12-AN: max_tokens 400 → 600
+  let rawForDebug = null;
+  try {
+    rawForDebug = await callClaudeRaw(sys, `[완료된 이슈]\n${issueCtx}\n\n짧게 평가.`, {
+      model: MODEL_REASONING,
+      max_tokens: 600,
+    });
+    return safeJSON(rawForDebug);
+  } catch (e) {
+    console.error(`[사회자 LITE 실패] ${e?.message || e}`);
+    if (e._rawSnippet !== undefined) {
+      console.error(`  ↳ raw 길이: ${e._rawLength}`);
+      console.error(`  ↳ raw 첫 300자: ${e._rawSnippet}`);
+    } else if (rawForDebug) {
+      console.error(`  ↳ raw 길이: ${String(rawForDebug).length}`);
+      console.error(`  ↳ raw 첫 300자: ${String(rawForDebug).slice(0, 300)}`);
+    } else {
+      console.error(`  ↳ API 단계 실패 (네트워크/timeout/인증)`);
+    }
+    throw e;
+  }
+}
+
+// ─── 6-1. 사회자 폴백 통합 함수 (영역 12-AL: D3-b 2회 retry + D4-b 4축 stitching) ──
+// 단계: 1차 정상 → 1초 대기 → 정상 재시도 → 3초 대기 → 단순 프롬프트 → 코드 stitching
+async function moderateWithFallback(mode, issueCtx, opinions) {
+  // ★ 영역 12-AT: 페르소나 오류 의견 필터링 — 사회자 입력 노이즈 제거
+  // "분석 오류" stance 또는 "분석 중 오류" 근본원인을 가진 페르소나는 사회자 입력에서 제외
+  const totalOpinions = opinions.length;
+  const validOpinions = opinions.filter(o => {
+    const op = o?.opinion || {};
+    const stance = String(op.stance || "");
+    const cause = String(op["근본원인"] || op["원인"] || "");
+    const isError = stance === "분석 오류" || cause === "분석 중 오류" || op._attempt === "final_failure";
+    return !isError;
+  });
+  const excludedCount = totalOpinions - validOpinions.length;
+
+  if (excludedCount > 0) {
+    const excludedPersonas = opinions
+      .filter(o => !validOpinions.includes(o))
+      .map(o => o.persona)
+      .join(", ");
+    console.warn(`[사회자 입력 필터링] ${mode}: ${excludedCount}명 페르소나 오류 제외 (${excludedPersonas}) — ${validOpinions.length}/${totalOpinions}명 의견으로 사회자 호출`);
+  }
+
+  // 모든 페르소나가 오류면 코드 stitching 즉시 수행 (LLM 호출 무의미)
+  if (validOpinions.length === 0 && totalOpinions > 0 && mode !== "LITE") {
+    console.warn(`[사회자] ${mode}: 모든 페르소나 오류 — 코드 stitching 즉시 사용`);
+    const stitched = codeFallbackModerator(mode, opinions);
+    return { ...stitched, _fallback_level: "all_personas_failed" };
+  }
+
+  const callPrimary = async () => {
+    if (mode === "DEEP")     return await moderateDeep(issueCtx, validOpinions);
+    if (mode === "STANDARD") return await moderateStandard(issueCtx, validOpinions);
+    if (mode === "LITE")     return await moderateLite(issueCtx);
+    throw new Error(`Unknown mode: ${mode}`);
+  };
+
+  // 1차: 정상 호출
+  try {
+    const primary = await callPrimary();
+    return { ...primary, _fallback_level: "primary", _excluded_personas: excludedCount };
+  } catch (e1) {
+    console.warn(`[Moderator 1차 실패] ${mode}: ${e1.message} — 1초 후 retry 1`);
+
+    // retry 1: 1초 대기 후 동일 정상 호출 재시도
+    await new Promise(r => setTimeout(r, 1000));
+    try {
+      const r1 = await callPrimary();
+      return { ...r1, _fallback_level: "retry_primary", _excluded_personas: excludedCount };
+    } catch (e2) {
+      console.warn(`[Moderator retry 1 실패] ${mode}: ${e2.message} — 3초 후 retry 2 (단순)`);
+
+      // retry 2: 3초 대기 후 단순 프롬프트 (validOpinions만 전달)
+      await new Promise(r => setTimeout(r, 3000));
+      try {
+        const r2 = await moderateRetrySimple(mode, issueCtx, validOpinions);
+        return { ...r2, _fallback_level: "retry_simple", _excluded_personas: excludedCount };
+      } catch (e3) {
+        console.warn(`[Moderator retry 2 실패] ${mode}: ${e3.message} — 코드 stitching 사용`);
+
+        // 최종: 코드 레벨 stitching — 원본 opinions로 stitching (오류도 포함하여 누가 무엇을 말했는지 표시)
+        const stitched = codeFallbackModerator(mode, opinions);
+        return { ...stitched, _fallback_level: "code_stitching", _excluded_personas: excludedCount };
+      }
+    }
+  }
+}
+
+// 2차 재시도 - 더 단순한 프롬프트 + 더 짧은 출력 요구
+async function moderateRetrySimple(mode, issueCtx, opinions) {
+  const opinionsCompact = opinions.map(o => {
+    const p = PERSONAS[o.persona];
+    const op = o.opinion || {};
+    return `${p.label}: 근본원인=${op["근본원인"] || op["원인"] || "-"} / 조치평가=${op["조치안_평가"] || op["기존조치_평가"] || "-"} / 개선안=${op["개선안"] || op["대책"] || "-"}`;
+  }).join("\n");
+
+  // 영역 12-AN: try/catch + raw 로깅 추가
+  const tryCall = async (sys, userMsg, maxTokens, label) => {
+    let rawForDebug = null;
+    try {
+      rawForDebug = await callClaudeRaw(sys, userMsg, { model: MODEL_REASONING, max_tokens: maxTokens });
+      return safeJSON(rawForDebug);
+    } catch (e) {
+      console.error(`[사회자 retry simple ${label} 실패] ${e?.message || e}`);
+      if (e._rawSnippet !== undefined) {
+        console.error(`  ↳ raw 길이: ${e._rawLength}`);
+        console.error(`  ↳ raw 첫 300자: ${e._rawSnippet}`);
+      } else if (rawForDebug) {
+        console.error(`  ↳ raw 길이: ${String(rawForDebug).length}`);
+        console.error(`  ↳ raw 첫 300자: ${String(rawForDebug).slice(0, 300)}`);
+      } else {
+        console.error(`  ↳ API 단계 실패`);
+      }
+      throw e;
+    }
+  };
+
+  if (mode === "DEEP") {
+    const sys = `다음 의견들을 4축 합의 형식으로 짧게 종합하세요. JSON만:
+{"근본원인_합의":"...","조치안_평가_합의":"...","개선안_합의":"...","재발방지책_합의":"...","충돌점":"...","추가_논의_필요":"...","consensus":"한 문장 요약"}`;
+    await new Promise(r => setTimeout(r, 400));
+    // 영역 12-AN: max_tokens 600 → 900
+    return await tryCall(sys, `[이슈]\n${issueCtx.slice(0, 300)}\n\n[의견]\n${opinionsCompact}`, 900, "DEEP");
+  }
+
+  if (mode === "STANDARD") {
+    const sys = `다음 의견을 액션 플랜으로 짧게 정리. JSON만:
+{"근본원인_합의":"...","조치안_평가_합의":"...","actions":[{"action":"행동","owner":"담당","priority":"우선순위","duration":"기간","type":"개선안/재발방지"}],"needsMore":"...","summary":"요약"}`;
+    await new Promise(r => setTimeout(r, 400));
+    // 영역 12-AN: max_tokens 600 → 900
+    return await tryCall(sys, `[이슈]\n${issueCtx.slice(0, 300)}\n\n[의견]\n${opinionsCompact}`, 900, "STANDARD");
+  }
+
+  // LITE
+  const sys = `다음 이슈를 짧게 평가. JSON만:
+{"supplement":"보완점","recurRisk":"재발우려","prevention":"방지책"}`;
+  await new Promise(r => setTimeout(r, 400));
+  // 영역 12-AN: max_tokens 300 → 500
+  return await tryCall(sys, `[이슈]\n${issueCtx.slice(0, 300)}`, 500, "LITE");
+}
+
+// 최종 폴백 - 코드 레벨 4축 stitching (영역 12-AL D4-b: 모든 페르소나 의견을 4축별로 모음)
+function codeFallbackModerator(mode, opinions) {
+  // 페르소나별 의견 정리 (영역 12: 새 필드 + 옛 필드 호환)
+  const opinionsByPersona = opinions.map(o => {
+    const p = PERSONAS[o.persona];
+    const op = o.opinion || {};
+    return {
+      label: p?.label || o.persona,
+      code: o.persona,
+      stance: op.stance || "-",
+      근본원인: op["근본원인"] || op["원인"] || "(의견 없음)",
+      조치안_평가: op["조치안_평가"] || op["기존조치_평가"] || "해당없음",
+      개선안: op["개선안"] || op["대책"] || "(의견 없음)",
+      재발방지책: op["재발방지책"] || "(의견 없음)",
+      say: op.say || "",
+    };
+  });
+
+  // 충돌 추출 (반대 stance가 있는지)
+  const stances = opinionsByPersona.map(o => o.stance);
+  const hasConflict = stances.includes("반대") || stances.includes("부분동의");
+
+  // ★ D4-b 핵심: 4축별로 모든 페르소나 의견을 [라벨: 의견] 형식으로 합치기
+  const stitchAxis = (axisKey) => {
+    const parts = opinionsByPersona
+      .filter(o => o[axisKey] && o[axisKey] !== "(의견 없음)" && o[axisKey] !== "해당없음")
+      .map(o => `${o.label}[${String(o[axisKey]).slice(0, 120)}]`);
+    if (parts.length === 0) return "(의견 없음 — 사회자 미합의, 자동 stitching)";
+    return `${parts.join(" / ")} (사회자 미합의 — 자동 stitching)`;
+  };
+
+  if (mode === "DEEP") {
+    return {
+      근본원인_합의: stitchAxis("근본원인"),
+      조치안_평가_합의: stitchAxis("조치안_평가"),
+      개선안_합의: stitchAxis("개선안"),
+      재발방지책_합의: stitchAxis("재발방지책"),
+      충돌점: hasConflict
+        ? `반대/부분동의 ${stances.filter(s => s === "반대" || s === "부분동의").length}건 — 자동 감지 (사회자 미합의)`
+        : "없음 (자동 판정)",
+      추가_논의_필요: "★ 사회자 LLM 호출 실패 — 페르소나 4축 의견을 자동 stitching으로 표시. 정확한 합의는 재실행 권장",
+      consensus: `${opinionsByPersona.length}명 의견 자동 stitching: ` + opinionsByPersona.map(o => `${o.label} ${o.stance}`).join(" / ") + " (사회자 호출 실패)",
+    };
+  }
+
+  if (mode === "STANDARD") {
+    const actions = opinionsByPersona.map(o => ({
+      action: (o.개선안 || "").slice(0, 80),
+      owner: o.code,
+      priority: o.stance === "반대" ? "낮음" : "중간",
+      duration: "검토 필요",
+      type: "개선안 (자동)",
+    })).filter(a => a.action);
+    return {
+      근본원인_합의: stitchAxis("근본원인"),
+      조치안_평가_합의: stitchAxis("조치안_평가"),
+      actions,
+      needsMore: "★ 사회자 LLM 호출 실패 — 페르소나 4축 자동 stitching으로 표시",
+      summary: `${opinionsByPersona.length}명 의견 자동 정리 (사회자 호출 실패)`,
+    };
+  }
+
+  // LITE
+  return {
+    supplement: "사회자 호출 실패 - 자동 평가 생성됨",
+    recurRisk: "낮음 (단순 분석 모드)",
+    prevention: "정상 모드에서 재분석 권장",
+  };
+}
+
+// ─── 6-2. (구버전 호환) 단순 사회자 함수들 - 더 이상 직접 호출 안 함 ────────────
+// runIssueDiscussion에서 moderateWithFallback을 호출하므로 위 함수들은 내부에서만 사용
+
+
+// ─── 7. 통합: 단일 이슈 모드별 논의 실행 ────────────────────────────────────────
+async function runIssueDiscussion(issue, modeInfo, kb, reportType, allowedAgents, onProgress) {
+  // ★ 영역 12-BG-4 (큐 #6 단계 1-RC-1): image_analyses 컨텍스트 추가
+  const imageContext = issue.image_analyses && issue.image_analyses.length > 0
+    ? `\n[첨부 이미지 분석]\n${issue.image_analyses.map((a, i) => `  ${i + 1}. ${a}`).join("\n")}`
+    : "";
+
+  const issueCtx = `설비: ${issue.eq}
+발생시간: ${issue.time}
+다운타임: ${issue.durMin}분
+문제: ${issue.prob}
+원인: ${issue.cause}
+결과: ${issue.result}
+담당자: ${issue.pic}
+우선순위 사유: ${issue.reasons?.join(", ")}${imageContext}`;
+
+  // ★ 기조치 건 판단: result에 "solved" 등이 있으면 이미 조치된 건
+  const resultLower = (issue.result || "").toLowerCase();
+  const isPostAction = resultLower.includes("solved") &&
+                       !resultLower.includes("not solved") &&
+                       !resultLower.includes("unsolved");
+
+  // 영역 12-B: 이슈 상태 정밀 분류 (Solved/Unsolved/Analyzing/unknown)
+  const issueStatus = (() => {
+    if (isPostAction) return "solved";
+    if (resultLower.includes("not solved") || resultLower.includes("unsolved")) return "unsolved";
+    if (resultLower.includes("analyz") || resultLower.includes("분석") || resultLower.includes("진행")) return "analyzing";
+    if (resultLower === "" || resultLower === "-") return "unsolved";  // 결과 없음 = 미해결로 간주
+    return "unknown";
+  })();
+
+  // ─── LITE 모드: 사회자만 단독 호출 (1회) ───
+  if (modeInfo.mode === "LITE") {
+    onProgress?.(`🟢 LITE 모드 - 사회자 단독 평가${isPostAction ? " (기조치)" : ""}`);
+    const result = await moderateWithFallback("LITE", issueCtx, []);
+    return {
+      issue, modeInfo, isPostAction, issueStatus,
+      router: null,
+      opinions: [],
+      moderator: { type: "lite", ...result },
+    };
+  }
+
+  // ─── DEEP / STANDARD: 라우터 → 순차 호출 → 사회자 ───
+  // [1] 라우터 (선택된 풀 안에서만 결정)
+  onProgress?.(`🎯 라우터: 발언 순서 결정 중... (${allowedAgents.length}명 풀)${isPostAction ? " [기조치 건]" : ""}`);
+  const router = await routeAgentOrder(issueCtx, allowedAgents);
+  onProgress?.(`🎯 발언 순서: ${router.order.map(o => PERSONAS[o]?.label).join(" → ")}`);
+
+  // [2] 페르소나 순차 호출 (영역 12: 새 필드 + issueStatus 차등)
+  const opinions = [];
+  for (const personaCode of router.order) {
+    const p = PERSONAS[personaCode];
+    onProgress?.(`${p.icon} ${p.label} 의견 수렴 중... (${opinions.length + 1}/${router.order.length})`);
+    const opinion = await callPersona(personaCode, issueCtx, opinions, kb[personaCode] || "", reportType, isPostAction, issueStatus);
+    opinions.push({ persona: personaCode, opinion });
+  }
+
+  // [3] 사회자 (모드별 분기 + 3단계 폴백)
+  onProgress?.(`📋 사회자 종합 중... (${modeInfo.mode})`);
+  const result = await moderateWithFallback(modeInfo.mode, issueCtx, opinions);
+  const moderator = { type: modeInfo.mode.toLowerCase(), ...result };
+
+  if (result._fallback_level && result._fallback_level !== "primary") {
+    onProgress?.(`⚠️ 사회자 폴백 사용: ${result._fallback_level}`);
+  }
+
+  return { issue, modeInfo, isPostAction, issueStatus, router, opinions, moderator };
+}
+
+// ═════════════════════════════════════════════════════════════════════════════
+// 시간/빈도 분석 (인수인계 문서 7번)
+// ═════════════════════════════════════════════════════════════════════════════
+// ═════════════════════════════════════════════════════════════════════════════
+// 이슈별 상세 카드 생성 (모드별 차등)
+// ═════════════════════════════════════════════════════════════════════════════
+function buildIssueDetailCard(discussion) {
+  const { issue, modeInfo, isPostAction, router, opinions, moderator } = discussion;
+
+  // 페르소나 의견을 종합해 필드별로 추출
+  const aggregateField = (fieldName) => {
+    return opinions
+      .filter(o => o.opinion?.[fieldName] && o.opinion[fieldName] !== "-" && o.opinion[fieldName] !== "해당없음")
+      .map(o => `[${PERSONAS[o.persona]?.label}] ${o.opinion[fieldName]}`)
+      .join(" / ");
+  };
+
+  // 페르소나별 의견 한 줄 요약
+  const opinionsByPersona = opinions.map(o => {
+    const p = PERSONAS[o.persona];
+    const op = o.opinion || {};
+    return {
+      code: o.persona,
+      label: p?.label || o.persona,
+      icon: p?.icon || "•",
+      stance: op.stance || "-",
+      summary: `${op["현상"] || "-"} → ${op["원인"] || "-"} → ${op["대책"] || "-"}`,
+    };
+  });
+
+  // 합의/반대 지점 분석
+  const stances = opinions.map(o => o.opinion?.stance);
+  const agreedCount = stances.filter(s => s === "동의" || s === "초기분석").length;
+  const conflictCount = stances.filter(s => s === "반대" || s === "부분동의").length;
+  const consensusPoint = moderator?.type === "deep" ? (moderator.consensus || "-") : "-";
+  const conflictPoint = moderator?.type === "deep" ? (moderator.conflicts || "-") : "-";
+
+  if (modeInfo.mode === "DEEP") {
+    // DEEP: 8필드 풀 카드
+    return {
+      mode: "DEEP",
+      isPostAction,
+      header: `[${issue.time}] ${issue.eq} (${issue.durMin}분)`,
+      modeReason: modeInfo.reason,
+      fallbackLevel: moderator?._fallback_level || "primary",
+
+      // 8필드
+      현상: aggregateField("현상") || issue.prob || "-",
+      원인: aggregateField("원인") || issue.cause || "-",
+      즉시조치: issue.result || "-",
+      기존조치_적절성: isPostAction
+        ? (aggregateField("기존조치_평가") || "평가 없음")
+        : "(기조치 아님 - 해당없음)",
+      재발방지책: moderator?.type === "deep"
+        ? (moderator.recommendation || "-")
+        : aggregateField("대책"),
+      보완책: moderator?.type === "deep"
+        ? (moderator.needsMore && moderator.needsMore !== "없음" ? moderator.needsMore : aggregateField("대책"))
+        : aggregateField("대책"),
+      발언자별의견: opinionsByPersona,
+      합의반대지점: `합의: ${consensusPoint} | 충돌: ${conflictPoint} (동의 ${agreedCount}, 반대/부분 ${conflictCount})`,
+    };
+  }
+
+  // STANDARD/LITE: 3필드 축약
+  const liteSupplement = moderator?.type === "lite" ? (moderator.supplement || "-") : "-";
+  const literRecur = moderator?.type === "lite" ? (moderator.recurRisk || "-") : "-";
+  const litePrev = moderator?.type === "lite" ? (moderator.prevention || "-") : "-";
+  const stdSummary = moderator?.type === "standard" ? (moderator.summary || "-") : "-";
+
+  return {
+    mode: modeInfo.mode,
+    isPostAction,
+    header: `[${issue.time}] ${issue.eq} (${issue.durMin}분)`,
+    modeReason: modeInfo.reason,
+    fallbackLevel: moderator?._fallback_level || "primary",
+
+    // 3필드 축약
+    현상: aggregateField("현상") || issue.prob || "-",
+    원인: aggregateField("원인") || issue.cause || "-",
+    대책: modeInfo.mode === "LITE"
+      ? `${litePrev} (재발 우려: ${literRecur} | 보완: ${liteSupplement})`
+      : (stdSummary !== "-" ? stdSummary : aggregateField("대책")),
+  };
+}
+
+function buildTimeFreqAnalysis(allIssues, processName = "Cell") {
+  // 시간대별
+  const hourBuckets = new Array(24).fill(0);
+  for (const issue of allIssues) {
+    const h = parseInt(String(issue.time).split(":")[0]);
+    if (!isNaN(h)) hourBuckets[h]++;
+  }
+  const timeOfDay = hourBuckets
+    .map((count, hour) => ({
+      hour,
+      label: `${String(hour).padStart(2, "0")}:00~${String((hour + 1) % 24).padStart(2, "0")}:00`,
+      count,
+    }))
+    .filter(b => b.count > 0)
+    .sort((a, b) => b.count - a.count)
+    .slice(0, 5);
+
+  // 카테고리(설비) × 공정 빈도
+  const eqCounter = new Map();
+  for (const issue of allIssues) {
+    const eq = (issue.eq || "미분류").trim();
+    eqCounter.set(eq, (eqCounter.get(eq) || 0) + 1);
+  }
+  const categoryFreq = Array.from(eqCounter.entries())
+    .map(([eq, count]) => ({ key: `${eq} - ${processName}`, eq, process: processName, count }))
+    .sort((a, b) => b.count - a.count)
+    .slice(0, 5);
+
+  return { timeOfDay, categoryFreq, total: allIssues.length };
+}
+
+// ═════════════════════════════════════════════════════════════════════════════
+// ★ 영역 11-E: 6번 "가장 주목할 사항" + 7번 "액션 후속 사항" 생성
+// LLM이 페르소나 논의 결과 + 큐레이션 + 5-카테고리 통계를 보고 인사이트/액션 생성
+// 환각 방지: confidence 라벨 + 근거 데이터 명시 (ii+iii)
+// 7번 P0/P1/P2 분류: LLM 판단 + 룰 검증 (Z)
+// ═════════════════════════════════════════════════════════════════════════════
+async function generateInsightsAndActions(curation, discussions, taggedResult, kbPE, reportType, categoryMsgs = {}) {
+  const focus = REPORT_FOCUS[reportType] || REPORT_FOCUS.meeting;
+  const kbText = kbPE ? `\n\n[학습 내용 일부]\n${kbPE.slice(0, 300)}` : "";
+
+  // 사회자 합의 — 영역 12-X4 (2): 새 4축 분리 필드 활용 (옛 consensus도 호환)
+  const moderatorSummary = (discussions || []).map((d, i) => {
+    const m = d.moderator || {};
+    return {
+      no: i + 1,
+      equipment: d.issue?.eq || "",
+      problem: (d.issue?.prob || "").slice(0, 80),
+      mode: d.modeInfo?.mode || "",
+      issueStatus: d.issueStatus || "unknown",
+      // ★ 새 4축 (영역 12 Phase 1) — 우선
+      근본원인_합의: (m["근본원인_합의"] || "").slice(0, 200),
+      조치안_평가_합의: (m["조치안_평가_합의"] || "").slice(0, 200),
+      개선안_합의: (m["개선안_합의"] || "").slice(0, 200),
+      재발방지책_합의: (m["재발방지책_합의"] || "").slice(0, 200),
+      충돌점: (m["충돌점"] || "").slice(0, 150),
+      추가_논의_필요: (m["추가_논의_필요"] || "").slice(0, 150),
+      // 옛 호환 (소형 한 줄 종합)
+      consensus_summary: (m.consensus || m.summary || m.supplement || "").slice(0, 150),
+    };
+  });
+
+  // 5-카테고리 통계
+  const counts = (taggedResult && taggedResult.counts) || {};
+
+  // 큐레이션 핵심 + 그룹/만성 (★ 영역 12-AI1: conditionChangeGroups + chronic1AB도 6/7번 LLM에 전달)
+  const cur = curation || {};
+  const briefingSummary = {
+    summary_text: cur.summary_text || "",
+    criticalSummary: cur.criticalSummary || [],
+    longDowntime: (cur.longDowntime || []).slice(0, 8).map(d => ({
+      equipment: d.equipment, durationMin: d.durationMin, time: d.time || "",
+      rootCause: d.rootCause, splitNote: d.splitNote || "",
+      partsReplaced: d.partsReplaced || "", recurrenceGap: d.recurrenceGap || "",
+    })),
+    recurringByCategory: (cur.recurringByCategory || []).slice(0, 8).map(r => ({
+      category: r.category, count: r.count, equipments: (r.equipments || []).slice(0, 5),
+    })),
+    recurringSameEquipment: (cur.recurringSameEquipment || []).slice(0, 5).map(r => ({
+      equipment: r.equipment, count: r.count, detail: r.detail, gapAnalysis: r.gapAnalysis || "",
+      totalDuration: r.totalDuration || "", partsReplaced: r.partsReplaced || "",
+    })),
+    // ★ AI1: conditionChangeGroups — STK-3-B2 매니저 지시 같은 핵심 정보 활용
+    conditionChangeGroups: (cur.conditionChangeGroups || []).slice(0, 5).map(g => ({
+      title: g.title, equipment: g.equipment, picReason: g.picReason,
+      paramCount: (g.parameters || []).length, verification: g.verification || "",
+    })),
+    chronic1AB: cur.chronic1AB ? {
+      title: cur.chronic1AB.title || "",
+      patternSummary: cur.chronic1AB.patternSummary || "",
+      ngEquipmentCount: (cur.chronic1AB.byEquipment || []).length,
+      worstEquipment: (cur.chronic1AB.byEquipment || [])[0]?.equipment || "",
+    } : null,
+    qualityTrend: cur.qualityNg?.trend || "",
+  };
+
+  // ★ AI1: raw 핵심 메시지 발췌 — 매니저 후속 보고 / chronic 1AB / 매니저 지시 (사건 단위 디테일)
+  // 6번/7번이 raw 메시지를 못 봐서 사건 단위 디테일 부족 → 풍부한 raw 컨텍스트 제공
+  const extractKeyEventMsgs = (msgs, max = 5) => (msgs || []).slice(0, max).map((m, i) => ({
+    no: i + 1,
+    date: m.date || "",
+    time: m.time || "",
+    text: (m.text || "").slice(0, 350).replace(/\n/g, " | "),
+  }));
+
+  // ★ 영역 12-AV-1: 부품 코드 추출 (BM/BE/BL/BA/BS prefix + 숫자 + 제조사+모델명 패턴)
+  // 정답 보고서에서 발견된 패턴: BEDRV0568 (Servo Drive), BMASO0166 (Absorber), BESEN2368 (Sensor) 등
+  const extractPartCodes = (msgsArr) => {
+    const codes = new Map();  // code -> { code, contexts: [{date, time, text_snippet}, ...] }
+    const codePatterns = [
+      // 회사 내부 부품 코드: BM/BE/BL/BA/BS/BD/BR/BT prefix + 영문 2~4자 + 숫자 3~5자
+      /\b(B[MELASDRT][A-Z]{1,4})(\d{3,5})\b/gi,
+      // SIEMENS 등 제조사 모델 (예: 6SL3210-5HB10-1UF0)
+      /\b\d[A-Z]{2,3}\d{3,5}-\d[A-Z]{2}\d{2}-\d[A-Z]\d[A-Z]\d\b/gi,
+      // OMRON 등 짧은 모델 (예: E3T-FD13)
+      /\b[A-Z]\d{1,2}[A-Z]-[A-Z]{2}\d{2,4}\b/g,
+    ];
+    for (const msg of (msgsArr || [])) {
+      const text = msg.text || "";
+      for (const pattern of codePatterns) {
+        const matches = [...text.matchAll(pattern)];
+        for (const m of matches) {
+          const code = m[0].toUpperCase();
+          if (code.length < 6 || code.length > 25) continue;  // 길이 필터
+          if (!codes.has(code)) codes.set(code, { code, contexts: [] });
+          if (codes.get(code).contexts.length < 3) {
+            // 코드 주변 50자 컨텍스트 추출
+            const idx = m.index || 0;
+            const ctx = text.slice(Math.max(0, idx - 30), Math.min(text.length, idx + 70))
+                            .replace(/\n/g, " ").trim();
+            codes.get(code).contexts.push({
+              date: msg.date || "",
+              time: msg.time || "",
+              snippet: ctx,
+            });
+          }
+        }
+      }
+    }
+    return [...codes.values()].slice(0, 12);  // 최대 12개 코드만
+  };
+
+  // ★ 영역 12-AV-2: 매니저 멘션 + 직책 추출 (정확한 표기 보존)
+  // 정답이 "유강열 주임"으로 표기, 새 출력이 "Agam 매니저"로 — 발신자명만 보고 본문 멘션 누락 방지
+  const extractMentionedPersons = (msgsArr) => {
+    const persons = new Map();  // name -> { name, role, mentions: [...] }
+    const titles = ['주임', '책임', '매니저', '수석', '대리', '과장', '팀장', '엔지니어', 'Manager', 'manager', 'Engineer', 'PIC'];
+    for (const msg of (msgsArr || [])) {
+      const text = msg.text || "";
+      const sender = msg.sender || "";
+
+      // 패턴 1: WhatsApp @ 멘션 (특수 unicode 처리)
+      const mentionRe = /@[\u2068\u2069]?([A-Za-z0-9가-힣_~\s.]{2,30}?)[\u2068\u2069]?(?=[\s,.:?!]|$)/gu;
+      const mentions1 = [...text.matchAll(mentionRe)].map(m => m[1].trim());
+
+      // 패턴 2: 한국어 이름 + 직책 (예: "유강열 주임", "강철 책임")
+      const titleRe = new RegExp(`([\\w가-힣]{2,5})\\s*(${titles.join('|')})`, 'g');
+      const mentions2 = [...text.matchAll(titleRe)].map(m => `${m[1]} ${m[2]}`);
+
+      // 패턴 3: 영어 이름 + Manager/Engineer
+      const enTitleRe = /([A-Z][a-z]+(?:\s+[A-Z][a-z]+){0,2})\s+(Manager|manager|Engineer|engineer|PIC)/g;
+      const mentions3 = [...text.matchAll(enTitleRe)].map(m => `${m[1]} ${m[2]}`);
+
+      // 발신자도 포함 (직책 들어있으면)
+      const senderHasTitle = titles.some(t => sender.includes(t));
+
+      const allMentions = [...mentions1, ...mentions2, ...mentions3];
+      if (senderHasTitle) allMentions.push(sender);
+
+      for (const name of allMentions) {
+        const cleanName = name.trim().replace(/\s+/g, ' ');
+        if (cleanName.length < 2 || cleanName.length > 40) continue;
+        if (!persons.has(cleanName)) persons.set(cleanName, { name: cleanName, mentions: [] });
+        if (persons.get(cleanName).mentions.length < 3) {
+          persons.get(cleanName).mentions.push({
+            date: msg.date || "",
+            time: msg.time || "",
+            sender: sender,
+            text_snippet: text.slice(0, 120).replace(/\n/g, " ").trim(),
+          });
+        }
+      }
+    }
+    // 멘션 횟수 많은 순으로 정렬, 최대 8명
+    return [...persons.values()]
+      .sort((a, b) => b.mentions.length - a.mentions.length)
+      .slice(0, 8);
+  };
+
+  const rawEventContext = {
+    // ★ 영역 12-AU: critical 메시지 최우선 표시 (라인 정지/매니저 직접/주요 부품)
+    critical_events_top8: extractKeyEventMsgs(categoryMsgs.critical, 8),
+    process_change_top5: extractKeyEventMsgs(categoryMsgs.process_change, 5),
+    quality_top3: extractKeyEventMsgs(categoryMsgs.quality, 3),
+    // ★ 영역 12-AV: 부품 코드 + 매니저 멘션 (정답 격차 축소)
+    part_codes_extracted: extractPartCodes([
+      ...(categoryMsgs.critical || []),
+      ...(categoryMsgs.process_change || []),
+      ...((taggedResult?.issues || [])).map(it => ({
+        text: (it.problem || "") + " " + (it.cause || "") + " " + (it.text || ""),
+        date: it.date,
+        time: it.time,
+      })),
+    ]),
+    persons_mentioned: extractMentionedPersons([
+      ...(categoryMsgs.critical || []),
+      ...(categoryMsgs.process_change || []),
+    ]),
+  };
+
+  // ★ 12-AV 진단 로그
+  if (typeof console !== "undefined") {
+    if (rawEventContext.part_codes_extracted.length > 0) {
+      console.log(`[12-AV 부품 코드] ${rawEventContext.part_codes_extracted.length}개 추출:`,
+        rawEventContext.part_codes_extracted.map(c => c.code).join(", "));
+    }
+    if (rawEventContext.persons_mentioned.length > 0) {
+      console.log(`[12-AV 매니저 멘션] ${rawEventContext.persons_mentioned.length}명:`,
+        rawEventContext.persons_mentioned.map(p => `${p.name}(${p.mentions.length}회)`).join(", "));
+    }
+  }
+
+  // ─── 영역 12-AQ: Background Function 통합 호출 (분할 롤백) ────────────────────
+  // 12-AP 분할(병렬)은 504 회피에 부족 (37초 timeout 확인) → Background로 근본 해결
+  // Background = Pro 플랜 15분 timeout, max_tokens 3500 통합 호출 안전
+  const sys = `${FACTORY_PHILOSOPHY}
+
+당신은 AZS 배터리 공장의 시니어 엔지니어로서, 페르소나 논의 결과 + PE 큐레이션 + 통계를 바탕으로
+보고서의 6번 "가장 주목할 사항"과 7번 "액션 후속 사항"을 작성합니다.${kbText}
+
+${focus}
+
+[★ 영역 12 — 페르소나 4축 합의 활용 강조]
+페르소나 사회자 종합은 다음 4축으로 정리되어 있습니다 (방식 나):
+  1) 근본원인_합의 — root cause에 대한 합의
+  2) 조치안_평가_합의 — 기존 조치의 적절성 평가
+  3) 개선안_합의 — 향후 개선 방향
+  4) 재발방지책_합의 — 장기 재발 방지
+
+★ 인사이트(6번)와 액션(7번) 작성 시 위 4축을 다음과 같이 활용:
+  - 6번 인사이트의 근거(evidence)는 "[설비명] 근본원인_합의" 또는 "[설비명] 충돌점" 형태로 명시
+  - 7번 액션은 사회자 "개선안_합의"와 "재발방지책_합의"에서 직접 도출 (P0/P1/P2 분류)
+  - "충돌점"이 있는 이슈는 "가설-검증필요" confidence + "추가 논의 필요" 액션으로 기재
+
+[★★★ 영역 12-AV — 부품 코드 + 매니저 표기 정확도 (필수) ★★★]
+입력 데이터의 part_codes_extracted, persons_mentioned를 반드시 반영하세요.
+
+(1) 부품 코드 — 코드/모델명이 추출되어 있으면 인사이트/액션에 명시
+   ✅ 좋은 예: "STK-2-B3 Mandrel Y2(-) Servo Drive 손상 — Cable profinet 교체 + Servo Drive 교체 (BEDRV0568, SIEMENS 6SL3210-5HB10-1UF0)"
+   ❌ 나쁜 예: "STK-2-B3 Servo Drive 손상" (부품 코드 누락)
+   → part_codes_extracted에 있는 코드는 인사이트/액션에 그대로 인용
+
+(2) 매니저 표기 — persons_mentioned에 등장한 이름/직책을 정확히 인용
+   ✅ 좋은 예: "유강열 주임 직접 개입 → Agam 매니저 후속 지시"
+   ❌ 나쁜 예: "Agam 매니저"만 (다른 매니저 누락)
+   → 매니저 메시지 발신자뿐 아니라 본문에 멘션된 사람 모두 정확히 표기
+   → persons_mentioned 리스트의 name 필드를 그대로 사용 (한국어/영어 표기 보존)
+
+[★★★ 영역 12-AU — Critical Event 최우선 (반드시 6번 인사이트 1번 항목으로) ★★★]
+입력 데이터의 critical_events_top8에 라인 정지/매니저 직접 개입/주요 부품 교체 메시지가 있으면,
+**반드시 6번 인사이트 1번 항목으로 다루세요**. 누락 금지.
+
+Critical event 작성 5요소 (5W1H):
+  1) 시각 (HH:MM)
+  2) 사건 명 ("Sudden Trip", "Main CDA off", "Cathode Shortage" 등)
+  3) 영향 범위 ("전 라인 정지", "Cutter 4개 Stop Empty" 등)
+  4) 인과 ("Sudden Trip 16:11 → STK-2-B3 servo drive 손상" 등)
+  5) 매니저/엔지니어 직접 개입 (있다면 이름/직책 명시: "유강열 주임 직접 개입")
+
+✅ 좋은 예 (Critical event):
+  "1) Critical: Assembly Line Sudden Trip (16:11) — 전 라인 알람 정지 → 유강열 주임 직접 개입 → Main CDA / BCU 점검 → 16:55부터 STK-2-B3 Mandrel Y2(-) servo drive 손상으로 120분 부동 발생. Cable profinet + Servo Drive 모두 교체 (BEDRV0568)"
+
+★ critical_events_top8이 비어있을 때만 통상 인사이트로 시작 가능.
+
+[★★★ 영역 12-AI1 — 사건 단위 디테일 작성 (가장 중요) ★★★]
+6번 인사이트는 **개념적 통계가 아니라 구체적 사건 단위**로 작성하세요.
+
+❌ 나쁜 예 (개념적, 통계만):
+  "STK-4호기 다발 부동 — 설비 정비 품질 악화 신호"
+  "Ejector 타임아웃 & Servo Fault 반복 — 근본조치 미완"
+
+✅ 좋은 예 (구체적, 시각·분·인과 명시):
+  "STK-4-B1 Stack Table R Servo 47분 간격 2회 발생: 14:17 Servo Forward Over Run → 2nd PnP(+) 충돌, 15:42 Servo Total Fault → Servo R 자체 교체. 1차 조치(homing/tunning)로 해결 안 됨, servo 자체 결함 가능성"
+  "STK-3-C4 Heat Press 영역 8분 간격 2회: 04:57 cable loose, 05:38 mechanical interference. 두 이슈가 timing fault로 연관 가능성"
+  "STK-3-B2 Overhang — 10개 파라미터 동시 변경 후 Agam 매니저 직접 개입 (Gearbox 교체 deep investigation 지시)"
+
+★ 입력 데이터의 critical_events_top8, conditionChangeGroups, recurringSameEquipment, raw 메시지를 활용해
+  시각, 호기명, 부품명, 분 수치, 매니저 지시 등 구체적 사실을 포함하세요.
+
+[★ 7번 액션 — P0 우선순위 명시 (가장 중요)]
+P0 (안전·환경, 매니저 직접 지시, horizontal deployment) 액션을 반드시 포함하세요.
+다음 패턴은 P0:
+  - 매니저 직접 지시 사항 (예: "Agam 매니저 → Gearbox 교체 deep investigation")
+  - 동일 호기 짧은 간격 재발 → horizontal deployment (예: "Servo R 31137 single turn fault 점검")
+  - mechanical interference 의심 → 합동 조사
+
+[환각 방지 규칙 — 매우 중요]
+- 각 인사이트와 액션에 confidence 라벨 (확실/가설-검증필요)을 반드시 명시
+- 가설(검증 필요)인 경우, 어느 데이터에서 도출했는지 근거(evidence) 명시
+- 데이터로 확실히 뒷받침되지 않는 인과 추론은 반드시 "가설-검증필요"로 표기
+- 알려지지 않은 과거 사례를 추측해서 만들지 마세요 — 직접 데이터에 없으면 언급 금지
+
+[7번 P0/P1/P2 분류 기준]
+- P0: 매니저 직접 지시, 안전·환경 키워드, horizontal deployment, mechanical interference 합동 조사
+- P1: 미해결 이슈, root cause 미파악, 4시간+ 부동, 예방 교체 cycle 표준화
+- P2: 모니터링, 일정 협의, 단일 설비 단발 이슈, 1시간 이하
+
+[필수 출력 - JSON만, 다른 텍스트 금지]
+{
+  "section6_insights": [
+    {
+      "title": "1) [핵심 키워드] — [설비/현상]",
+      "bulletPoints": [
+        "★ 시각·호기·분·부품·인과를 포함한 구체적 사실 (80~120자)",
+        "추가 관찰 또는 패턴 (60~100자)"
+      ],
+      "confidence": "확실 또는 가설-검증필요",
+      "evidence": "어느 이슈/데이터에서 도출했는지"
+    }
+  ],
+  "section7_actions": [
+    {
+      "priority": "P0/P1/P2",
+      "action": "구체적 행동 (60자)",
+      "context": "왜 필요한지 (40자)",
+      "evidence": "어느 데이터에서 도출 (40자)",
+      "confidence": "확실 또는 가설-검증필요"
+    }
+  ]
+}
+
+[규칙]
+- section6_insights: **5~6개** (사용자 레포트와 동일 분량)
+- section7_actions: **P0 2~3개 + P1 3~4개 + P2 2~3개 = 총 7~10개** (P0 반드시 포함)
+- 각 인사이트는 bulletPoints 1~3개
+- ★ 인사이트는 통계 카테고리가 아닌 **사건 단위**로 작성 (시각, 호기, 분, 부품, 인과)
+- 데이터 근거 없는 추측은 절대 만들지 마세요
+- confidence는 데이터로 명확히 검증된 것만 "확실", 추론/가설은 "가설-검증필요"`;
+
+  const userMsg = `[PE 큐레이션 요약]
+${JSON.stringify(briefingSummary, null, 1)}
+
+[페르소나 논의 결과 — 사회자 4축 합의 (영역 12 방식 나)]
+${moderatorSummary.length > 0 ? JSON.stringify(moderatorSummary, null, 1) : "(논의된 이슈 없음 — 큐레이션만으로 인사이트 도출)"}
+
+[★ 영역 12-AI1 + 12-AU + 12-AV: raw 핵심 메시지 (사건 단위 디테일 + Critical Event + 부품 코드/매니저 표기)]
+${JSON.stringify(rawEventContext, null, 1)}
+※ critical_events_top8에 라인 정지/매니저 직접 개입/주요 부품 교체 메시지가 있으면 **반드시 6번 인사이트 1번**으로 다루세요.
+※ part_codes_extracted에 부품 코드/모델명이 있으면 인사이트/액션에 **반드시 명시** (예: BEDRV0568, BMASO0166, SIEMENS 6SL3210-...)
+※ persons_mentioned의 매니저/엔지니어 이름은 **정확한 표기 그대로** 인용 (예: "유강열 주임", "Agam 매니저")
+※ process_change_top5에 매니저 지시 ("hadehh, please do investigation deeply ... gearbox change")나
+   동일 호기 다중 파라미터 변경 같은 정보가 있을 수 있음. 사건 단위 디테일에 활용.
+
+[5-카테고리 통계]
+장기부동: ${counts.LONG_DOWNTIME || 0} / 반복: ${counts.HIGH_FREQUENCY || 0} / 조건변경: ${counts.CONDITION_CHANGE || 0} / 테스트PM: ${counts.TEST_PM || 0} / 품질NG: ${counts.QUALITY_NG || 0}
+
+위 데이터를 바탕으로:
+★ 6번 "가장 주목할 사항" 5~6건 — **사건 단위** (시각·호기·분·부품·인과 구체 명시)
+   ★ critical_events_top8이 비어있지 않으면 **1번 항목은 반드시 Critical Event** (Sudden Trip, 매니저 직접 개입, 라인 정지 등)
+★ 7번 "액션 후속 사항" 총 7~10건 — **P0 2~3개 반드시 포함** (매니저 직접 지시, horizontal deployment 등)
+환각 방지를 위해 confidence와 evidence를 반드시 명시하세요.`;
+
+  // ★ 12-AQ: Background 호출로 504 timeout 영구 회피
+  // ★ 12-BI (큐 #9): 재시도 로직 (3회 최대) + 부분 복구 + 에러 분류
+  const MAX_RETRIES = 3;
+  const RETRY_DELAYS_MS = [0, 5000, 15000];  // 1차 즉시, 2차 5초, 3차 15초
+  let raw = "";
+  let lastError = null;
+  let attempt = 0;
+
+  for (attempt = 0; attempt < MAX_RETRIES; attempt++) {
+    if (attempt > 0) {
+      console.log(`[6/7번 재시도] ${attempt + 1}회차 — ${RETRY_DELAYS_MS[attempt]}ms 대기 후 시도`);
+      await new Promise(r => setTimeout(r, RETRY_DELAYS_MS[attempt]));
+    }
+    try {
+      raw = await callClaudeBackground(sys, userMsg, {
+        model: MODEL_REASONING,
+        max_tokens: 3500,
+        onProgress: (msg) => console.log(`[6/7번 BG${attempt > 0 ? ` 재시도${attempt + 1}` : ""}] ${msg}`),
+      });
+      // 빈 응답이면 재시도
+      if (!raw || raw.length < 50) {
+        lastError = new Error(`응답 너무 짧음 (${raw?.length || 0}자) — 빈 응답 또는 무효`);
+        console.warn(`[6/7번] 시도 ${attempt + 1}: ${lastError.message}`);
+        continue;
+      }
+      // 성공 — 루프 탈출
+      break;
+    } catch (e) {
+      lastError = e;
+      // 에러 분류 (재시도 가치)
+      const msg = (e?.message || "").toLowerCase();
+      const isRetryable = msg.includes("500") || msg.includes("503") || msg.includes("429") ||
+                          msg.includes("timeout") || msg.includes("응답 대기 초과") ||
+                          msg.includes("network") || msg.includes("failed") ||
+                          msg.includes("background 트리거");
+      console.error(`[6/7번 시도 ${attempt + 1} 실패] ${e?.message?.slice(0, 200)} (재시도가능=${isRetryable})`);
+      if (!isRetryable) {
+        // 영구 에러 (예: 401 인증, 400 파라미터) — 즉시 백업
+        console.error(`[6/7번] 영구 에러로 판단 — 재시도 중단, 룰 백업으로 진행`);
+        return buildFallbackInsightsAndActions(curation, taggedResult);
+      }
+      // 마지막 시도면 루프 종료 (catch 밖에서 백업 처리)
+      if (attempt === MAX_RETRIES - 1) {
+        console.error(`[6/7번] ${MAX_RETRIES}회 재시도 모두 실패 — 룰 백업으로 진행`);
+      }
+    }
+  }
+
+  // 응답 없으면 백업
+  if (!raw || raw.length < 50) {
+    console.error(`[6/7번] 최종 응답 없음 (last error: ${lastError?.message?.slice(0, 100)}) — 룰 백업`);
+    return buildFallbackInsightsAndActions(curation, taggedResult);
+  }
+
+  // JSON 파싱 — safeJSON 1차 시도, 실패 시 부분 복구 (★ 12-BH 큐 #8 함수 재활용)
+  let parsed;
+  try {
+    parsed = safeJSON(raw);
+  } catch (e) {
+    console.error(`[6/7번 safeJSON 실패] ${e?.message?.slice(0, 200)} — 부분 복구 시도`);
+    parsed = tryPartialJSONRecovery(raw);
+    if (!parsed || Object.keys(parsed).length === 0) {
+      console.error(`[6/7번] 부분 복구도 실패 — 룰 백업`);
+      return buildFallbackInsightsAndActions(curation, taggedResult);
+    }
+    console.log(`[6/7번] ★ 부분 복구 성공 — 키: ${Object.keys(parsed).join(", ")}`);
+  }
+
+  try {
+    // 룰 검증 (Z 옵션) — LLM 분류 결과를 안전 룰로 보정
+    const insights = Array.isArray(parsed.section6_insights) ? parsed.section6_insights : [];
+    const actions = Array.isArray(parsed.section7_actions) ? parsed.section7_actions : [];
+
+    // P0/P1/P2 룰 검증
+    const validatedActions = actions.map(a => {
+      const text = `${a.action || ""} ${a.context || ""} ${a.evidence || ""}`.toLowerCase();
+      if (/safety|emergency|환경|safety|9시간|horizontal/i.test(text) && a.priority !== "P0") {
+        return { ...a, priority: "P0", _ruleAdjusted: "safety 키워드로 P0 격상" };
+      }
+      if (/monitoring|모니터링|일정|schedule/i.test(text) && a.priority === "P0") {
+        return { ...a, priority: "P2", _ruleAdjusted: "monitoring 키워드로 P2 강등" };
+      }
+      if (!["P0", "P1", "P2"].includes(a.priority)) {
+        return { ...a, priority: "P2", _ruleAdjusted: "priority 미지정 — P2 기본" };
+      }
+      return a;
+    });
+
+    return {
+      section6_insights: insights,
+      section7_actions: validatedActions,
+    };
+  } catch (e) {
+    // ★ 12-BI: 룰 검증 단계 실패 — 부분 복구된 parsed에서도 검증 실패 시 룰 백업
+    console.error("[6/7번 룰 검증 실패]", e?.message?.slice(0, 200));
+    return buildFallbackInsightsAndActions(curation, taggedResult);
+  }
+}
+
+// 6/7번 폴백 (LLM 호출 실패 시 룰 기반)
+function buildFallbackInsightsAndActions(curation, taggedResult) {
+  const cur = curation || {};
+  const counts = (taggedResult && taggedResult.counts) || {};
+  const insights = [];
+  const actions = [];
+
+  // 인사이트 — 룰 기반
+  if ((cur.longDowntime || []).length > 0) {
+    const top = cur.longDowntime[0];
+    insights.push({
+      title: `1) ${top.equipment || "?"} — ${top.durationMin || 0}분 부동, 기간 최장`,
+      bulletPoints: [
+        `근본 원인: ${(top.rootCause || "분석 중").slice(0, 60)}`,
+        top.splitNote ? "분할 보고 형태로 전체 누적 시간 추적 필요" : "단일 보고",
+      ].filter(Boolean),
+      confidence: "확실",
+      evidence: `longDowntime[0] - ${top.equipment}`,
+    });
+  }
+  if ((cur.recurringByCategory || []).length > 0) {
+    const top = cur.recurringByCategory[0];
+    insights.push({
+      title: `2) ${top.category} 카테고리 ${top.count}건 다발`,
+      bulletPoints: [
+        `해당 설비: ${(top.equipments || []).slice(0, 3).join(", ")}`,
+        "반복 발생 패턴 확인 필요",
+      ],
+      confidence: "확실",
+      evidence: `recurringByCategory[0]`,
+    });
+  }
+  if (cur.qualityNg?.trend && cur.qualityNg.trend !== "데이터 없음") {
+    insights.push({
+      title: `3) 품질 NG 트렌드`,
+      bulletPoints: [cur.qualityNg.trend.slice(0, 100)],
+      confidence: "확실",
+      evidence: "qualityNg.trend",
+    });
+  }
+
+  // 액션 — 룰 기반
+  if ((cur.longDowntime || []).filter(d => (d.durationMin || 0) >= 540).length > 0) {
+    actions.push({
+      priority: "P0",
+      action: "최장 부동 이슈 horizontal deployment 점검",
+      context: "9시간+ 부동, 학습 내용 다른 라인 적용",
+      evidence: "longDowntime durationMin >= 540",
+      confidence: "확실",
+    });
+  }
+  if ((cur.longDowntime || []).filter(d => /not solved|unsolved/i.test(d.result || "")).length > 0) {
+    actions.push({
+      priority: "P1",
+      action: "미해결 이슈 root cause 분석",
+      context: "Solved되지 않은 장기부동 존재",
+      evidence: "longDowntime result 미해결",
+      confidence: "확실",
+    });
+  }
+  if ((cur.testPm?.linePM || []).filter(p => /stop/i.test(p.status || "")).length > 0) {
+    actions.push({
+      priority: "P2",
+      action: "PM 일정 협의",
+      context: "Stop No Production 발생",
+      evidence: "testPm.linePM",
+      confidence: "확실",
+    });
+  }
+
+  return {
+    section6_insights: insights,
+    section7_actions: actions,
+  };
+}
+
+// ═════════════════════════════════════════════════════════════════════════════
+// 보고서 생성 (모드별 그룹핑 + 시간/빈도 분석 추가)
+// ═════════════════════════════════════════════════════════════════════════════
+async function generateReport(date, dates, discussions, priority, reportType, kb, allIssues, processName = "Cell", curation = null) {
+  const focus = REPORT_FOCUS[reportType] || REPORT_FOCUS.meeting;
+  const reportTitle = REPORT_TYPES.find(r => r.id === reportType)?.label || "회의록";
+  const dateStr = dates.length > 1 ? `${dates[0]} ~ ${dates[dates.length-1]}` : date;
+
+  // 시간/빈도 분석 (모든 이슈 대상)
+  const analytics = buildTimeFreqAnalysis(allIssues, processName);
+
+  // ★ 이슈별 상세 카드 생성 (모드별 차등)
+  const detailCards = discussions.map(d => buildIssueDetailCard(d));
+
+  // 모드별 그룹핑
+  const grouped = { DEEP: [], STANDARD: [], LITE: [] };
+  for (const d of discussions) {
+    grouped[d.modeInfo.mode]?.push(d);
+  }
+
+  // 논의 결과 요약 (사회자 출력 위주)
+  const discussionSummary = discussions.map((d, i) => {
+    const m = d.moderator;
+    if (m.type === "deep") {
+      return `[이슈${i+1}-DEEP] ${d.issue.eq} (${d.issue.durMin}분)
+합의: ${m.consensus} | 충돌: ${m.conflicts} | 권고: ${m.recommendation}`;
+    }
+    if (m.type === "standard") {
+      return `[이슈${i+1}-STANDARD] ${d.issue.eq} (${d.issue.durMin}분)
+요약: ${m.summary} | 액션: ${(m.actions || []).map(a => `${a.owner}-${a.action}`).join(", ")}`;
+    }
+    return `[이슈${i+1}-LITE] ${d.issue.eq}: ${m.supplement} / 재발: ${m.recurRisk}`;
+  }).join("\n\n");
+
+  // ★ 큐 #20 P6 패치: 미해결 이슈 목록 추출 (sys5 §5 후속조치 구체화용)
+  // curation.longDowntime 중 result에 unsolved/not solved 포함된 항목만
+  const _unsolvedIssues = ((curation && curation.longDowntime) || [])
+    .filter(d => {
+      const r = String(d.result || "").toLowerCase();
+      return r.includes("unsolved") || r.includes("not solved");
+    })
+    .slice(0, 10);  // 최대 10건 (ctx 비대 방지)
+  const _unsolvedText = _unsolvedIssues.length > 0
+    ? `\n\n[미해결 이슈 ${_unsolvedIssues.length}건 — §5 후속조치 작성 시 반드시 반영]\n${_unsolvedIssues.map((d, i) =>
+        `${i+1}. ${d.equipment || "?"} (${d.durationMin || 0}분) — ${(d.rootCause || d.title || "원인 미파악").slice(0, 80)} · 결과: ${d.result || "-"}`
+      ).join("\n")}`
+    : "";
+
+  const ctx = `날짜: ${dateStr}
+보고서 종류: ${reportTitle}
+본문 논의: ${priority.urgent.length + priority.important.length + priority.normal.length}건 (LONG_DOWNTIME ${priority.urgent.length} / HIGH_FREQUENCY ${priority.important.length})
+모드별 분석: DEEP ${grouped.DEEP.length} / STANDARD ${grouped.STANDARD.length} / LITE ${grouped.LITE.length}
+
+[시간대별 발생 TOP 5]
+${analytics.timeOfDay.map((t, i) => `${i+1}. ${t.label} ${t.count}건`).join("\n")}
+
+[빈도 TOP 5 (설비×공정)]
+${analytics.categoryFreq.map((c, i) => `${i+1}. ${c.key} ${c.count}건`).join("\n")}
+${_unsolvedText}
+
+[건별 논의 결과]
+${discussionSummary}`;
+
+  const sections = [];
+
+  // 섹션 1: 전체 현황 요약 (시간/빈도 분석 포함)
+  try {
+    await new Promise(r => setTimeout(r, 500));
+    const sys1 = `AZS 배터리 공장 ${reportTitle} 작성. 한국어. JSON만. 4개 items 슬롯 모두 필수 채움.
+각 슬롯 작성 규칙:
+- 1번: 핵심 KPI 정량 (수율%, 불량률%, 총 생산량, 불량 분류별 건수) — 우선순위 최상
+- 2번: 시간대별 집중 패턴 (예: "06~09시 설비 기동 NG 집중, 14~17시 전극 정렬 다발")
+- 3번: 빈도 TOP 패턴 (반복 발생 카테고리, 건수 명시)
+- 4번: 주요 이슈 요약 (장기 정지 / 다발 불량 중심, 최대 3건)
+JSON: {"heading":"1. 전체 현황 요약","items":["핵심 KPI 정량 (80자이내)","시간대별 패턴 (80자이내)","빈도 패턴 (80자이내)","주요 이슈 요약 (80자이내)"]}`;
+    const raw1 = await callClaudeRaw(sys1, ctx, { model: MODEL_REASONING, max_tokens: 600 });
+    sections.push(safeJSON(raw1));
+  } catch { sections.push({ heading:"1. 전체 현황 요약", items:["-"] }); }
+
+  // 섹션 2: DEEP 이슈 종합
+  try {
+    await new Promise(r => setTimeout(r, 500));
+    const deepCtx = grouped.DEEP.map((d, i) =>
+      `이슈${i+1}: ${d.issue.eq} - 합의:${d.moderator.consensus} 충돌:${d.moderator.conflicts} 권고:${d.moderator.recommendation}`
+    ).join(" / ") || "DEEP 이슈 없음";
+    const sys2 = `AZS 배터리 공장 ${reportTitle}. 한국어. JSON만. items 최소 5개 작성 필수.
+포함 규칙 (우선순위 순):
+- 정지 30분 이상 OR 불량 10건 이상 이슈 우선 포함
+- 반복 발생 이슈(동일 설비 또는 동일 카테고리 2회+)는 건수 무관 필수 포함 (예: 1-A2 5회, 1-A4 18회)
+- 근본원인은 raw 데이터 표현 그대로 인용 (추론·일반화 금지)
+  예: "2Sheet Detection 센서 케이블 교체"는 원본 그대로 사용, "Vision 센서 오염"으로 일반화 절대 X
+JSON: {"heading":"2. 🔴 DEEP 이슈 종합 (심각/긴급)","items":["[설비명] 합의·충돌·권고 핵심 (80자이내)","항목2","항목3","항목4","항목5"]}`;
+    const raw2 = await callClaudeRaw(sys2, `${ctx}\n\nDEEP 종합: ${deepCtx}`, { model: MODEL_REASONING, max_tokens: 700 });
+    sections.push(safeJSON(raw2));
+  } catch { sections.push({ heading:"2. 🔴 DEEP 이슈 종합", items:["-"] }); }
+
+  // 섹션 3: STANDARD 이슈 액션
+  try {
+    await new Promise(r => setTimeout(r, 500));
+    const stdCtx = grouped.STANDARD.map((d, i) =>
+      `이슈${i+1}: ${d.issue.eq} - ${d.moderator.summary} | 액션: ${(d.moderator.actions || []).map(a => a.action).join(", ")}`
+    ).join(" / ") || "STANDARD 이슈 없음";
+    const sys3 = `AZS 배터리 공장 ${reportTitle}. 한국어. JSON만. items 최소 5개 작성 필수.
+모든 STANDARD 이슈를 누락 없이 포함 (raw에 5개 이상 있으면 모두 포함). 항목 잘림·중단 금지.
+JSON: {"heading":"3. 🟡 STANDARD 이슈 액션 플랜 (미완료)","items":["[설비명] 액션·담당·우선순위 (80자이내)","항목2","항목3","항목4","항목5"]}`;
+    const raw3 = await callClaudeRaw(sys3, `${ctx}\n\nSTANDARD: ${stdCtx}`, { model: MODEL_REASONING, max_tokens: 1200 });
+    sections.push(safeJSON(raw3));
+  } catch { sections.push({ heading:"3. 🟡 STANDARD 이슈 액션 플랜", items:["-"] }); }
+
+  // 섹션 4: 담당자별 종합 액션
+  try {
+    await new Promise(r => setTimeout(r, 500));
+    const sys4 = `AZS 배터리 공장 ${reportTitle}. 한국어. JSON만. 6팀 슬롯 모두 필수 채움.
+raw 데이터에 해당 팀 활동이 명시되지 않으면 "(해당 활동 없음 — 모니터링 권장)" 형태로 채움. 빈 문자열·항목 생략·축소 절대 금지.
+PLC 슬롯: Cell/Elec/FA 공정의 PLC 관련 시퀀스·인터록·알람·통신 이슈 통합.
+JSON: {"heading":"4. 담당자별 액션 아이템","items":["[PE] 조치 (60자이내)","[ME] 조치","[TE] 조치","[FA] 조치","[Vision] 조치","[PLC] 조치"]}`;
+    const raw4 = await callClaudeRaw(sys4, ctx, { model: MODEL_REASONING, max_tokens: 700 });
+    sections.push(safeJSON(raw4));
+  } catch { sections.push({ heading:"4. 담당자별 액션 아이템", items:["-"] }); }
+
+  // 섹션 5: 재발방지 및 차기 계획 — ★ 큐 #20 P6 패치: 구체성 강화 + 일반론 강요 제거
+  try {
+    await new Promise(r => setTimeout(r, 500));
+    const sys5 = `AZS 배터리 공장 ${reportTitle}. 한국어. JSON만. 4개 슬롯 모두 필수 채움.
+원칙: raw 데이터에 근거 있는 항목 우선. 근거 없는 슬롯은 "데이터 부족 — 추후 확인" 명시 (일반론 채우기 금지).
+"장기 개선 과제" 슬롯: DB화/주간 추적/효과 검증/자동 알람 같은 장기 모니터링 항목 — 단 raw에 단서 있을 때만, 없으면 "추가 검토 필요".
+JSON: {"heading":"5. 재발방지 대책 및 차기 계획","items":["재발방지 핵심 대책 (60자이내)","장기 개선 과제 (raw 단서 있을 때만, DB화·주간 추적·효과 검증)","모니터링 항목 (대상 호기/부품·주기 명시)","차기 일정 (담당자·완료 목표일·검증 방법 명시, 150자이내)"]}`;
+    const raw5 = await callClaudeRaw(sys5, ctx, { model: MODEL_REASONING, max_tokens: 900 });
+    sections.push(safeJSON(raw5));
+  } catch { sections.push({ heading:"5. 재발방지 대책 및 차기 계획", items:["-"] }); }
+
+  return {
+    title: `${dateStr} ${reportTitle}`,
+    date: dateStr,
+    attendees: "선택된 공정 PE/ME/TE + 추가 에이전트",
+    agenda: `본문 논의 ${priority.urgent.length + priority.important.length + priority.normal.length}건 분석 및 대책 수립`,
+    sections,
+    discussions,
+    detailCards,    // ★ 이슈별 상세 카드 (모드별 차등)
+    curation,       // ★ PE 사전 큐레이션
+    analytics,
+    grouped,
+  };
+}
+
+// ─── 큐 #15 Phase 2 (사양 v1 §3.2): 정답 레포트 생성 ────────────────────────
+// 동일 일자 raw messages + ImageAnalysis로 Claude가 "이상적 레포트" 5섹션 생성
+// 비교 운영용 — UI 통합 없음 (Phase 3에서 generateReport와 자동 비교 연결)
+async function generateIdealReport(date, processName = "Cell") {
+  const t0 = Date.now();
+  console.log(`[큐 #15 Phase 2] generateIdealReport 시작: ${date} / ${processName}`);
+
+  // 1) Raw data 수집 — Apps Script가 자체 06시 룰 적용 (큐 #17 적용 후)
+  //    호출자는 startDate=endDate=date만 보내면 1일 분량(06:00~익일 06:00) 자동 반환
+  const rawMessages = await fetchMessagesFromTab(date, date, "[Official] AZS Status Reports");
+
+  // 생산일자(YY/M/D) 필터링 — 안전망 (Apps Script 06시 룰이 정상이면 no-op)
+  const [y, m, d] = date.split("-").map(Number);
+  const targetProdDate = `${String(y).slice(-2)}/${m}/${d}`;
+  const messages = rawMessages.filter(msg =>
+    getProductionDate(msg.date, msg.hour) === targetProdDate
+  );
+  if (rawMessages.length !== messages.length) {
+    console.warn(`[큐 #15] 안전망 필터 작동: ${rawMessages.length}건 → ${messages.length}건 (Apps Script 06시 룰 검토 필요)`);
+  }
+
+  if (messages.length === 0) {
+    throw new Error(`날짜 ${date} 생산일자(${targetProdDate}) 메시지 0건`);
+  }
+  console.log(`[큐 #15] 메시지 수집: ${messages.length}건`);
+
+  // 2) Raw 컨텍스트 구성 (텍스트 + 이미지 분석 결과 통합)
+  const contextLines = messages.map((m, i) => {
+    const head = `[${i + 1}] ${m.date} ${m.time} ${m.sender}`;
+    const text = m.text ? `\n  text: ${m.text}` : "";
+    const imgAnalysis = (m.image_analyses && m.image_analyses[0])
+      ? `\n  [이미지 분석] ${m.image_analyses[0]}` : "";
+    return head + text + imgAnalysis;
+  });
+  const rawContext = contextLines.join("\n\n");
+
+  // 토큰 한도 가드 (대략 글자수/3 ≈ 토큰, 한글 보수적)
+  const estTokens = Math.round(rawContext.length / 3);
+  console.log(`[큐 #15] 추정 입력 토큰: ~${estTokens.toLocaleString()}`);
+  if (estTokens > 180000) {
+    throw new Error(`입력 토큰 초과 위험 (~${estTokens.toLocaleString()}, 한도 180K)`);
+  }
+
+  // 3) Claude 호출 (5섹션 통합 JSON, Background — 큰 토큰/긴 시간)
+  const systemPrompt = `당신은 AZS 배터리 공장 ${processName} 라인의 일일 회의록 작성 전문가입니다.
+주어진 WhatsApp 그룹 메시지(텍스트 + 이미지 분석 결과)를 기반으로 5섹션 통합 JSON으로 한국어 회의록을 작성하세요.
+
+반드시 다음 JSON 구조 그대로 출력. 다른 설명/마크다운/주석/코드블록 절대 금지:
+
+{
+  "section1_overall": {
+    "heading": "1. 전체 현황 요약",
+    "items": ["시간대별 패턴 핵심 (60자이내)", "빈도 패턴 핵심", "주요 이슈 요약", "KPI 또는 영향"]
+  },
+  "section2_deep_issues": {
+    "heading": "2. 🔴 DEEP 이슈 종합 (심각/긴급)",
+    "items": ["[설비명] 합의·충돌·권고 핵심 (80자이내)", "..."]
+  },
+  "section3_standard_actions": {
+    "heading": "3. 🟡 STANDARD 이슈 액션 플랜 (미완료)",
+    "items": ["[설비명] 액션·담당·우선순위 (80자이내)", "..."]
+  },
+  "section4_owner_actions": {
+    "heading": "4. 담당자별 액션 아이템",
+    "items": ["[PE] 조치 (60자이내)", "[ME] 조치", "[TE] 조치", "[FA] 조치 (해당시)", "[Vision] 조치 (해당시)"]
+  },
+  "section5_prevention": {
+    "heading": "5. 재발방지 대책 및 차기 계획",
+    "items": ["재발방지 핵심 대책 (60자이내)", "장기 개선 과제", "모니터링 항목", "차기 일정"]
+  }
+}
+
+기준:
+- 모든 items는 한국어
+- 메시지 내용 근거 기반 (주관적 해석 최소화)
+- DEEP 이슈 없으면 items: ["DEEP 이슈 없음"]
+- STANDARD 이슈 없으면 items: ["STANDARD 이슈 없음"]
+- 각 항목 길이 가이드 준수`;
+
+  const userMsg = `날짜: ${date}
+공정: ${processName}
+전체 메시지: ${messages.length}건
+
+[WhatsApp 메시지 원본]
+${rawContext}`;
+
+  console.log(`[큐 #15] Claude API 호출 시작 (Background, 최대 5분 대기)`);
+  const rawResponse = await callClaudeBackground(systemPrompt, userMsg, {
+    model: MODEL_REASONING,
+    max_tokens: 4000,
+    onProgress: (msg) => console.log(`[큐 #15] ${msg}`),
+  });
+
+  // 4) JSON 파싱
+  let parsed;
+  try {
+    parsed = safeJSON(rawResponse);
+  } catch (e) {
+    console.error("[큐 #15] JSON 파싱 실패. 원본 응답 (앞 500자):");
+    console.error(String(rawResponse).slice(0, 500));
+    throw new Error(`JSON 파싱 실패: ${e.message}`);
+  }
+
+  // 5) 스키마 검증 (5섹션 다 있는지)
+  const requiredKeys = [
+    "section1_overall", "section2_deep_issues", "section3_standard_actions",
+    "section4_owner_actions", "section5_prevention"
+  ];
+  const missingKeys = requiredKeys.filter(k =>
+    !parsed[k] || !parsed[k].heading || !Array.isArray(parsed[k].items)
+  );
+  if (missingKeys.length > 0) {
+    console.warn(`[큐 #15] 일부 섹션 누락/형식 이상: ${missingKeys.join(", ")} — 가능한 부분만 사용`);
+  }
+
+  const elapsedSec = ((Date.now() - t0) / 1000).toFixed(1);
+  console.log(`[큐 #15 Phase 2] ✅ 완료 (${elapsedSec}초)`);
+
+  return {
+    date,
+    processName,
+    messageCount: messages.length,
+    estInputTokens: estTokens,
+    elapsedSec: parseFloat(elapsedSec),
+    model: MODEL_REASONING,
+    sections: parsed,
+    _rawResponse: rawResponse,        // Phase 3 비교용 원본 보존
+    _generatedAt: new Date().toISOString(),
+  };
+}
+
+// ─── 큐 #15 Phase 3: GapLog Apps Script 호출 헬퍼 ───────────────────────────
+// AZS_WhatsApp_Webhook 프로젝트의 ?action=gaplog.append 엔드포인트 호출
+async function appendGapLogRow(gapData) {
+  const GAPLOG_SECRET = import.meta.env.VITE_GAPLOG_SECRET || "";
+  if (!GAPLOG_SECRET) {
+    throw new Error("VITE_GAPLOG_SECRET 환경변수 미설정 — Netlify에 등록 필요");
+  }
+
+  const url = `${WHAPI_APPS_SCRIPT_URL}?action=gaplog.append&secret=${encodeURIComponent(GAPLOG_SECRET)}`;
+  let res;
+  try {
+    res = await fetch(url, {
+      method: "POST",
+      // ★ Apps Script CORS 회피: text/plain으로 preflight 우회 (서버는 e.postData.contents 그대로 JSON.parse)
+      headers: { "Content-Type": "text/plain;charset=utf-8" },
+      body: JSON.stringify(withAuthBody({ data: gapData })),
+      redirect: "follow",
+    });
+  } catch (e) {
+    throw new Error(`GapLog 호출 네트워크 오류: ${e.message}`);
+  }
+
+  if (!res.ok) {
+    const errText = await res.text().catch(() => "");
+    throw new Error(`GapLog append HTTP ${res.status}: ${errText.slice(0, 200)}`);
+  }
+  const result = await res.json();
+  if (!result.ok) {
+    throw new Error(`GapLog append 실패: ${result.error || "unknown"}`);
+  }
+  return result;
+}
+
+// ─── 큐 #15 Phase 3: judge 호출 (현재 vs 정답 5섹션 4차원 비교) ─────────────
+async function judgeReports(currentReport, idealReport, date) {
+  const t0 = Date.now();
+  console.log(`[큐 #15 Phase 3] judgeReports 시작: ${date}`);
+
+  // 두 레포트 직렬화 (generateReport는 sections이 배열, generateIdealReport는 객체)
+  const formatReport = (rpt, label) => {
+    if (!rpt || !rpt.sections) return `${label}: (empty)`;
+    const sections = Array.isArray(rpt.sections)
+      ? rpt.sections
+      : Object.values(rpt.sections);
+    return `${label}:\n` + sections.map(s =>
+      `${s.heading || "(no heading)"}\n${(s.items || []).map(it => `  - ${it}`).join("\n")}`
+    ).join("\n\n");
+  };
+
+  const systemPrompt = `당신은 AZS 배터리 공장 일일 회의록 품질 검토자입니다.
+두 회의록(현재 시스템 생성 vs 정답)을 비교하여 차이점을 4가지 차원으로 분석하세요.
+
+차원 정의:
+- missing: 정답에는 있지만 현재 보고서에 없는 항목 (누락)
+- error: 현재 보고서가 잘못 기술한 항목 (오류)
+- extra: 현재 보고서에만 있는 비핵심/불필요 항목 (잉여)
+- insight_missing: 정답에만 있는 핵심 인사이트/패턴 (관점 누락)
+
+반드시 다음 JSON 형식으로만 출력. 다른 설명/마크다운/코드블록 금지:
+
+{
+  "gaps": [
+    {
+      "section": 1,
+      "dimension": "missing",
+      "gap_description": "차이 항목 설명 (한국어 100자 내외)",
+      "severity": "high",
+      "current_value": "현재 보고서가 출력한 내용 (없으면 '(없음)')",
+      "ideal_value": "정답 보고서가 출력한 내용",
+      "raw_evidence": "raw data 근거 또는 인용 (없으면 '(N/A)')"
+    }
+  ]
+}
+
+기준:
+- section: 1~5 (1=전체현황, 2=DEEP, 3=STANDARD, 4=담당자, 5=재발방지)
+- dimension: missing | error | extra | insight_missing 중 하나
+- severity: high(중대한 누락/오류), medium(개선 권장), low(스타일/사소함)
+- gap이 없는 섹션은 건너뜀 (강제로 작성 X)
+- 최대 15개까지
+- 두 보고서가 동일한 항목은 gap으로 보고하지 말 것`;
+
+  const userMsg = `날짜: ${date}
+
+${formatReport(currentReport, "[현재 시스템 보고서]")}
+
+${formatReport(idealReport, "[정답 보고서]")}
+
+위 두 보고서를 비교하여 차이점을 JSON으로 출력하세요.`;
+
+  let rawResponse;
+  try {
+    rawResponse = await callClaudeBackground(systemPrompt, userMsg, {
+      model: MODEL_REASONING,
+      max_tokens: 3000,
+      onProgress: (msg) => console.log(`[큐 #15 Phase 3 judge] ${msg}`),
+    });
+  } catch (e) {
+    throw new Error(`judge 호출 실패: ${e.message}`);
+  }
+
+  let parsed;
+  try {
+    parsed = safeJSON(rawResponse);
+  } catch (e) {
+    console.error("[큐 #15 Phase 3] JSON 파싱 실패. 원본 응답 (앞 500자):");
+    console.error(String(rawResponse).slice(0, 500));
+    throw new Error(`judge JSON 파싱 실패: ${e.message}`);
+  }
+
+  if (!Array.isArray(parsed.gaps)) {
+    throw new Error(`judge 응답에 gaps 배열 없음 — 형식 이상`);
+  }
+
+  const elapsedSec = ((Date.now() - t0) / 1000).toFixed(1);
+  console.log(`[큐 #15 Phase 3] judge 완료 (${elapsedSec}초, ${parsed.gaps.length}건 gap 식별)`);
+
+  return {
+    gaps: parsed.gaps,
+    elapsedSec: parseFloat(elapsedSec),
+    _rawResponse: rawResponse,
+  };
+}
+
+// ─── 큐 #15 Phase 3: 통합 흐름 (ideal 생성 → judge → GapLog 자동 적재) ──────
+async function compareAndLogGaps(currentReport, date, processName = "Cell") {
+  const t0 = Date.now();
+  console.log(`[큐 #15 Phase 3] compareAndLogGaps 시작: ${date}`);
+
+  if (!currentReport) {
+    throw new Error("currentReport 없음 — 먼저 논의앱에서 회의록 생성 후 window._latestReport 사용");
+  }
+
+  // Step 1: 정답 레포트 생성 (Phase 2 재사용)
+  console.log("[큐 #15 Phase 3] Step 1/3: 정답 레포트 생성 중...");
+  const idealReport = await generateIdealReport(date, processName);
+
+  // Step 2: judge 비교 호출
+  console.log("[큐 #15 Phase 3] Step 2/3: judge 비교 분석 중...");
+  const judgeResult = await judgeReports(currentReport, idealReport, date);
+
+  // Step 3: GapLog 자동 적재 (gap 1건당 1회 호출)
+  console.log(`[큐 #15 Phase 3] Step 3/3: GapLog 적재 (${judgeResult.gaps.length}건)...`);
+  const logResults = [];
+  for (let i = 0; i < judgeResult.gaps.length; i++) {
+    const g = judgeResult.gaps[i];
+    try {
+      const result = await appendGapLogRow({
+        report_date: date,
+        section: g.section,
+        dimension: g.dimension,
+        gap_description: g.gap_description,
+        severity: g.severity || "medium",
+        raw_evidence: g.raw_evidence || "",
+        current_value: g.current_value || "",
+        ideal_value: g.ideal_value || "",
+      });
+      logResults.push({ ok: true, id: result.id, section: g.section, dim: g.dimension });
+      console.log(`  [${i + 1}/${judgeResult.gaps.length}] ✓ §${g.section} ${g.dimension} → ${result.id}`);
+    } catch (e) {
+      logResults.push({ ok: false, error: e.message, section: g.section, dim: g.dimension });
+      console.error(`  [${i + 1}/${judgeResult.gaps.length}] ✗ §${g.section} ${g.dimension}: ${e.message}`);
+    }
+  }
+
+  const successCount = logResults.filter(r => r.ok).length;
+  const totalElapsed = ((Date.now() - t0) / 1000).toFixed(1);
+  console.log(`[큐 #15 Phase 3] ✅ 완료 (${totalElapsed}초): GapLog ${successCount}/${judgeResult.gaps.length}건 적재`);
+
+  return {
+    date,
+    idealReport,
+    judgeResult,
+    logResults,
+    summary: {
+      gapCount: judgeResult.gaps.length,
+      loggedCount: successCount,
+      failedCount: logResults.length - successCount,
+      totalElapsedSec: parseFloat(totalElapsed),
+    },
+  };
+}
+
+// ─── 큐 #15 Phase 5a: GapLog 조회 헬퍼 ────────────────────────────────────
+// Apps Script ?action=gaplog.list 호출 (filter 옵션 지원)
+async function fetchGapLogList(filter = {}) {
+  const GAPLOG_SECRET = import.meta.env.VITE_GAPLOG_SECRET || "";
+  if (!GAPLOG_SECRET) {
+    throw new Error("VITE_GAPLOG_SECRET 환경변수 미설정");
+  }
+
+  const url = `${WHAPI_APPS_SCRIPT_URL}?action=gaplog.list&secret=${encodeURIComponent(GAPLOG_SECRET)}`;
+  let res;
+  try {
+    res = await fetch(url, {
+      method: "POST",
+      headers: { "Content-Type": "text/plain;charset=utf-8" },
+      body: JSON.stringify(withAuthBody({ filter })),
+      redirect: "follow",
+    });
+  } catch (e) {
+    throw new Error(`GapLog list 네트워크 오류: ${e.message}`);
+  }
+
+  if (!res.ok) {
+    const errText = await res.text().catch(() => "");
+    throw new Error(`GapLog list HTTP ${res.status}: ${errText.slice(0, 200)}`);
+  }
+  const result = await res.json();
+  if (!result.ok) {
+    throw new Error(`GapLog list 실패: ${result.error || "unknown"}`);
+  }
+  return result;
+}
+
+// ─── 큐 #20: GapLog status 업데이트 (패치 적용 후 gap 닫기용) ───────────────
+// AZS_WhatsApp_Webhook 프로젝트의 ?action=gaplog.update 엔드포인트 호출
+// ★ 실제 Apps Script(gapLog.gs Phase 5c) 인터페이스에 맞춤:
+//   요청 body: { filter: { id: [ids...] }, updates: { status, resolved_in_cycle } }
+//   응답:      { ok, updated, ids }  (updated = 갱신된 행 수, ids = 갱신된 행의 id 배열)
+//   허용 update 컬럼: status, resolved_in_cycle, severity 만 (불변필드 보호)
+//   filter 안전장치: filter가 비어있으면 서버가 거부 (전체 갱신 사고 방지)
+async function updateGapLogStatus({ ids, status, resolved_in_cycle = "" }) {
+  if (!Array.isArray(ids) || ids.length === 0) {
+    throw new Error("ids 배열이 비어있음");
+  }
+  const GAPLOG_SECRET = import.meta.env.VITE_GAPLOG_SECRET || "";
+  if (!GAPLOG_SECRET) {
+    throw new Error("VITE_GAPLOG_SECRET 환경변수 미설정");
+  }
+
+  const url = `${WHAPI_APPS_SCRIPT_URL}?action=gaplog.update&secret=${encodeURIComponent(GAPLOG_SECRET)}`;
+  let res;
+  try {
+    res = await fetch(url, {
+      method: "POST",
+      headers: { "Content-Type": "text/plain;charset=utf-8" },
+      body: JSON.stringify(withAuthBody({
+        filter: { id: ids },                          // ★ Apps Script: filter.id 배열 허용
+        updates: { status, resolved_in_cycle },       // ★ Apps Script: 허용 컬럼만
+      })),
+      redirect: "follow",
+    });
+  } catch (e) {
+    throw new Error(`GapLog update 네트워크 오류: ${e.message}`);
+  }
+
+  if (!res.ok) {
+    const errText = await res.text().catch(() => "");
+    throw new Error(`GapLog update HTTP ${res.status}: ${errText.slice(0, 200)}`);
+  }
+  const result = await res.json();
+  if (!result.ok) {
+    throw new Error(`GapLog update 실패: ${result.error || "unknown"}`);
+  }
+  return result;  // { ok: true, updated: N, ids: [...] }
+}
+
+// ─── 큐 #15 Phase 5a: 누적 gap 패턴 분석 ─────────────────────────────────
+async function analyzeGapPatterns(filter = { status: "open" }, opts = {}) {
+  const t0 = Date.now();
+  const _dfLog = (opts.dateFilter && opts.dateFilter.length) ? opts.dateFilter.join(", ") : "(all)";
+  console.log(`[큐 #15 Phase 5a] analyzeGapPatterns 시작 (filter: ${JSON.stringify(filter)}, dateFilter: ${_dfLog})`);
+
+  // 1) GapLog 로드
+  const listResult = await fetchGapLogList(filter);
+  if (listResult.count === 0) {
+    throw new Error("분석할 gap 없음 — filter 조건 확인 (예: status='open')");
+  }
+  console.log(`[큐 #15 Phase 5a] ${listResult.count}건 gap 로드`);
+
+  // ★ 큐 #20: 클라이언트 측 report_date 필터 (Apps Script gaplog.list가 report_date 필터 미지원 가정)
+  let filteredGaps = listResult.gaps || [];
+  if (opts.dateFilter && Array.isArray(opts.dateFilter) && opts.dateFilter.length > 0) {
+    const dateSet = new Set(opts.dateFilter.map(d => String(d).trim()));
+    filteredGaps = filteredGaps.filter(g => dateSet.has(String(g.report_date).trim()));
+    console.log(`[큐 #20 dateFilter 적용] 전체 ${listResult.count}건 → ${filteredGaps.length}건 (대상 일자: ${opts.dateFilter.join(", ")})`);
+    if (filteredGaps.length === 0) {
+      throw new Error(`해당 일자(${opts.dateFilter.join(", ")})에 매칭되는 gap이 0건 — 일자 입력 확인 또는 'all'로 전체 분석`);
+    }
+  }
+
+  // 2) gap 요약 텍스트 구성 (Claude에게 전달)
+  const gapSummary = filteredGaps.map((g, i) =>
+    `[${i + 1}] id=${g.id} §${g.section} ${g.dimension} (${g.severity || "medium"})
+  날짜: ${g.report_date}
+  내용: ${g.gap_description}
+  현재값: ${String(g.current_value || "").slice(0, 100)}
+  정답값: ${String(g.ideal_value || "").slice(0, 100)}`
+  ).join("\n\n");
+
+  // 3) Claude 패턴 분석 호출
+  const systemPrompt = `당신은 AZS 논의앱 코드 품질 진단 전문가입니다.
+누적된 N건의 gap을 분석하여 공통 패턴을 도출하고, 각 패턴에 대해 원인 가설과 영향 받는 코드 영역을 식별하세요.
+
+반드시 다음 JSON 형식 그대로 출력 (다른 설명/마크다운/코드블록 절대 금지):
+
+{
+  "patterns": [
+    {
+      "pattern_id": "P1",
+      "title": "패턴 제목 (한국어, 50자 내외)",
+      "gap_count": 5,
+      "affected_gap_ids": ["gap-xxx", "gap-yyy"],
+      "hypothesis": "원인 가설 — 어떤 코드 동작이 이 패턴을 만드는지",
+      "affected_code_area": "App.jsx의 어느 함수/영역으로 추정 (모르면 '추정 어려움')",
+      "severity": "high",
+      "recommended_action": "패치 방향 (구체적이지 않아도 됨)"
+    }
+  ],
+  "summary": "전체 요약 (한국어, 2~3문장)"
+}
+
+기준:
+- 패턴은 최소 2건 이상의 gap이 공유해야 의미 있음 (단발성 1건은 제외)
+- 패턴 수는 보통 3~7개 (너무 잘게 나누지 말 것)
+- severity: high=즉시 패치 권장, medium=다음 사이클, low=장기 과제
+- affected_code_area는 가능한 만큼 구체적으로 (예: "generateReport §4 프롬프트")`;
+
+  const userMsg = `누적 gap ${filteredGaps.length}건을 분석하세요.
+
+${gapSummary}`;
+
+  console.log(`[큐 #15 Phase 5a] Claude 분석 호출... (Background)`);
+  const rawResponse = await callClaudeBackground(systemPrompt, userMsg, {
+    model: MODEL_REASONING,
+    max_tokens: 3000,
+    onProgress: (msg) => console.log(`[큐 #15 Phase 5a] ${msg}`),
+  });
+
+  // 4) JSON 파싱
+  let parsed;
+  try {
+    parsed = safeJSON(rawResponse);
+  } catch (e) {
+    console.error("[큐 #15 Phase 5a] JSON 파싱 실패. 원본 (앞 500자):");
+    console.error(String(rawResponse).slice(0, 500));
+    throw new Error(`JSON 파싱 실패: ${e.message}`);
+  }
+
+  if (!Array.isArray(parsed.patterns)) {
+    throw new Error("patterns 배열 없음 — 응답 형식 이상");
+  }
+
+  const elapsedSec = ((Date.now() - t0) / 1000).toFixed(1);
+  console.log(`[큐 #15 Phase 5a] ✅ 완료 (${elapsedSec}초): ${parsed.patterns.length}개 패턴 식별`);
+
+  return {
+    gapCount: filteredGaps.length,  // ★ 큐 #20: 필터 적용 후 카운트 (UI 표시용)
+    totalGapCount: listResult.count,  // ★ 큐 #20: 필터 전 전체 카운트 (참고용)
+    patternCount: parsed.patterns.length,
+    patterns: parsed.patterns,
+    summary: parsed.summary,
+    elapsedSec: parseFloat(elapsedSec),
+    _rawGaps: filteredGaps,    // Phase 5b에서 사용 (필터 적용된 gap만)
+    _rawResponse: rawResponse,
+    _generatedAt: new Date().toISOString(),
+    _dateFilter: opts.dateFilter || null,  // ★ 큐 #20: 적용된 필터 정보
+  };
+}
+
+// ─── 큐 #15 Phase 4: 자동 비교 (레포트 생성 후 자동 호출) ──────────────────
+// 일일(단일 생산일자) 레포트만 비교. 범위·중복은 스킵. 비동기 — 화면 흐름 안 막음.
+//   report      : generateReport 결과 (window._latestReport)
+//   selDates    : ["YY/M/D"] (예: ["26/5/16"]) — length===1일 때만 실행
+//   processName : "Cell" | "Elec" 등 (selectedProcess)
+//   setProgress : 진행 표시 (없으면 console만)
+//   opts.force  : true면 중복이어도 강제 비교 (콘솔 디버그용)
+async function runAutoCompare(report, selDates, processName, setProgress, { force = false, setStatus, refreshBadge } = {}) {
+  const emit = (msg) => {
+    if (typeof setProgress === "function") setProgress(p => [...p, msg]);
+    console.log(`[큐 #15 자동비교] ${msg}`);
+  };
+  const status = (s) => { if (typeof setStatus === "function") setStatus(s); };
+
+  // 1) 일일 레포트만 (selDates 정확히 1개)
+  if (!Array.isArray(selDates) || selDates.length !== 1) {
+    console.log(`[큐 #15 자동비교] 범위/비단일 레포트 — 비교 생략 (selDates=${(selDates || []).join(",")})`);
+    return;
+  }
+
+  // 2) 생산일자(YY/M/D) → YYYY-MM-DD 변환 (기존 toAPIDate 패턴 재사용)
+  let date;
+  try {
+    const [y, m, d] = String(selDates[0]).split("/").map(Number);
+    if (!y || !m || !d) throw new Error("형식 불일치");
+    date = `20${String(y).padStart(2, "0")}-${String(m).padStart(2, "0")}-${String(d).padStart(2, "0")}`;
+  } catch (e) {
+    console.warn(`[큐 #15 자동비교] 날짜 변환 실패: "${selDates[0]}" — 비교 생략`);
+    status({ state: "failed", message: `날짜 변환 실패 (${selDates[0]})` });
+    return;
+  }
+
+  // 3) 중복 체크 (같은 report_date 이미 비교됐으면 스킵)
+  if (!force) {
+    try {
+      const dup = await fetchGapLogList({ report_date: date });
+      if (dup.count > 0) {
+        emit(`ℹ️ 이미 비교된 날짜 (${date}) — 품질 비교 생략`);
+        status({ state: "skipped", date });
+        return;
+      }
+    } catch (e) {
+      emit(`⚠️ 중복 확인 실패 — 품질 비교 보류 (${e.message})`);
+      status({ state: "failed", date, message: `중복 확인 실패: ${e.message}` });
+      return;
+    }
+  }
+
+  // 4) 비교 실행 (정답 생성 + judge + GapLog 적재)
+  emit(`🔍 품질 비교 중... (정답 레포트 생성, 약 40초)`);
+  status({ state: "running", date });
+  try {
+    const result = await compareAndLogGaps(report, date, processName || "Cell");
+    const logged = (result && result.summary && result.summary.loggedCount) || 0;
+    const failed = (result && result.summary && result.summary.failedCount) || 0;
+    emit(`💾 GapLog 적재 완료 (${logged}건${failed > 0 ? `, 실패 ${failed}건` : ""})`);
+    status({ state: "done", date, gapCount: logged });
+    // 비교로 gap이 새로 쌓였으니 배지 재계산
+    if (typeof refreshBadge === "function") { try { await refreshBadge(); } catch (_) {} }
+  } catch (e) {
+    emit(`⚠️ 품질 비교 실패 — ${e.message}`);
+    status({ state: "failed", date, message: e.message });
+    console.error("[큐 #15 자동비교] 비교 실패:", e);
+  }
+}
+
+// 큐 #15 Phase 2/3/5a/4 임시 글로벌 노출 (콘솔 검증용 — Phase 5c UI 진입 시 제거)
+if (typeof window !== "undefined") {
+  window.generateIdealReport = generateIdealReport;
+  window.judgeReports = judgeReports;
+  window.compareAndLogGaps = compareAndLogGaps;
+  window.appendGapLogRow = appendGapLogRow;
+  window.fetchGapLogList = fetchGapLogList;
+  window.updateGapLogStatus = updateGapLogStatus;  // ★ 큐 #20: gap 닫기 헬퍼
+  window.analyzeGapPatterns = analyzeGapPatterns;
+  window.runAutoCompare = runAutoCompare;
+}
+
+// ─── UI 헬퍼 ──────────────────────────────────────────────────────────────────
+function Spinner() {
+  return <span style={{
+    display:"inline-block", width:13, height:13,
+    border:"2px solid rgba(255,255,255,0.2)",
+    borderTop:"2px solid currentColor", borderRadius:"50%",
+    animation:"spin 0.7s linear infinite",
+  }}/>;
+}
+
+function BackBtn({ onClick, label="← 이전" }) {
+  return (
+    <button onClick={onClick} style={{
+      padding:"9px 16px",
+      background:"transparent", border:"1.5px solid rgba(51,65,85,0.4)",
+      borderRadius:8, color:"#475569", fontSize:12, cursor:"pointer",
+    }}>{label}</button>
+  );
+}
+
+function StepBar({ step }) {
+  // ★ 12-AZ-6: 업로드 단계 제거 (날짜가 첫 페이지) — step 1~5 매핑
+  const STEPS = ["날짜","보고서","이슈 확인","논의 중","문서 생성"];
+  return (
+    <div style={{ display:"flex", borderBottom:"1px solid rgba(51,65,85,0.3)", background:"rgba(3,6,13,0.85)", overflowX:"auto" }}>
+      {STEPS.map((s,i) => {
+        const stepNum = i + 1;  // step 1~5 매핑
+        return (
+          <div key={i} style={{
+            flex:"1 0 auto", padding:"10px 6px", textAlign:"center",
+            background: step===stepNum ? "rgba(34,211,238,0.08)" : "transparent",
+            borderBottom:`2px solid ${step===stepNum ? "#22d3ee" : step>stepNum ? "#34d399" : "transparent"}`,
+            fontSize:9, fontWeight:800,
+            color: step===stepNum ? "#22d3ee" : step>stepNum ? "#34d399" : "#374151",
+          }}>
+            <div style={{ fontSize:9, marginBottom:2 }}>{stepNum}</div>
+            {s}
+          </div>
+        );
+      })}
+    </div>
+  );
+}
+
+const MODE_STYLE = {
+  DEEP:     { color:"#ef4444", bg:"rgba(239,68,68,0.1)",  border:"rgba(239,68,68,0.3)",  label:"🔴 DEEP" },
+  STANDARD: { color:"#f59e0b", bg:"rgba(245,158,11,0.1)", border:"rgba(245,158,11,0.3)", label:"🟡 STANDARD" },
+  LITE:     { color:"#22c55e", bg:"rgba(34,197,94,0.1)",  border:"rgba(34,197,94,0.3)",  label:"🟢 LITE" },
+};
+
+// ─── 메인 앱 ──────────────────────────────────────────────────────────────────
+export default function App() {
+  // ─── 큐 #22 Phase B-1: Google OAuth 인증 state ───
+  // authStatus: 'loading' (초기 마운트) | 'unauthenticated' (로그인 필요)
+  //           | 'authenticated' (로그인 완료, 정상 진입)
+  //           | 'forbidden' (백엔드 401/403, 미등록 또는 apps 미허용)
+  const [authStatus, setAuthStatus] = useState("loading");
+  const [authIdToken, setAuthIdToken] = useState("");
+  const [authUserEmail, setAuthUserEmail] = useState("");
+  const [authUserName, setAuthUserName] = useState("");
+  const [authError, setAuthError] = useState("");
+  const [authExpiresAt, setAuthExpiresAt] = useState(0);  // ms epoch — 토큰 exp(초) × 1000
+
+  // 토큰 갱신 시 모듈 레벨에도 반영 (모든 fetch 함수가 사용)
+  useEffect(() => { setCurrentIdToken(authIdToken); }, [authIdToken]);
+
+  // ─── 마운트 시 localStorage 복원 + 토큰 만료 확인 ───
+  useEffect(() => {
+    try {
+      const saved = localStorage.getItem("azs_auth_v1");
+      if (!saved) { setAuthStatus("unauthenticated"); return; }
+      const obj = JSON.parse(saved);
+      if (!obj || !obj.idToken || !obj.expiresAt) { setAuthStatus("unauthenticated"); return; }
+      if (Date.now() >= obj.expiresAt) {
+        // 만료됨 — localStorage 클리어 후 재로그인
+        console.log("[큐 #22] 저장된 토큰 만료 — 재로그인 필요");
+        localStorage.removeItem("azs_auth_v1");
+        setAuthStatus("unauthenticated");
+        return;
+      }
+      // 유효 — state 복원
+      setAuthIdToken(obj.idToken);
+      setAuthUserEmail(obj.email || "");
+      setAuthUserName(obj.name || "");
+      setAuthExpiresAt(obj.expiresAt);
+      setAuthStatus("authenticated");
+      console.log(`[큐 #22] 저장된 토큰 복원: ${obj.email} (만료까지 ${Math.round((obj.expiresAt - Date.now())/60000)}분)`);
+    } catch (e) {
+      console.error("[큐 #22] localStorage 복원 실패:", e);
+      setAuthStatus("unauthenticated");
+    }
+  }, []);
+
+  // ─── Google Identity Services 콜백 (window.handleGoogleLogin로 노출) ───
+  const handleGoogleLogin = (credentialResponse) => {
+    try {
+      const idToken = credentialResponse?.credential;
+      if (!idToken) {
+        setAuthError("Google 응답에 토큰 없음");
+        return;
+      }
+      // JWT payload 디코딩 (검증은 Apps Script가 함 — 여기선 만료/이름만 추출)
+      const parts = idToken.split(".");
+      if (parts.length !== 3) {
+        setAuthError("올바르지 않은 토큰 형식");
+        return;
+      }
+      const payload = JSON.parse(atob(parts[1].replace(/-/g, "+").replace(/_/g, "/")));
+      const email = String(payload.email || "").toLowerCase();
+      const name = payload.name || "";
+      const expMs = (parseInt(payload.exp, 10) || 0) * 1000;
+
+      if (!email || !expMs || Date.now() >= expMs) {
+        setAuthError("토큰 만료 또는 이메일 없음");
+        return;
+      }
+
+      setAuthIdToken(idToken);
+      setAuthUserEmail(email);
+      setAuthUserName(name);
+      setAuthExpiresAt(expMs);
+      setAuthStatus("authenticated");
+      setAuthError("");
+      // localStorage 저장
+      localStorage.setItem("azs_auth_v1", JSON.stringify({
+        idToken, email, name, expiresAt: expMs,
+      }));
+      console.log(`[큐 #22] ✅ 로그인 성공: ${email} (만료: ${new Date(expMs).toLocaleString("ko-KR")})`);
+
+      // Audit 적재 (모듈 레벨 변수 반영 후 호출 — 한 틱 대기)
+      setTimeout(() => {
+        fetch(`${WHAPI_APPS_SCRIPT_URL}?action=discussion_login`, {
+          method: "POST",
+          headers: { "Content-Type": "text/plain;charset=utf-8" },
+          body: JSON.stringify({ id_token: idToken, _meta: { name, email } }),
+        }).catch(e => console.warn("[큐 #22] discussion_login audit 실패:", e?.message));
+      }, 100);
+    } catch (e) {
+      console.error("[큐 #22] handleGoogleLogin 예외:", e);
+      setAuthError(e?.message || "로그인 처리 실패");
+    }
+  };
+
+  // ─── 로그아웃 ───
+  const handleLogout = () => {
+    const email = authUserEmail;
+    const token = authIdToken;
+    // Audit 적재 (state 클리어 전에 호출)
+    if (token && email) {
+      fetch(`${WHAPI_APPS_SCRIPT_URL}?action=discussion_logout`, {
+        method: "POST",
+        headers: { "Content-Type": "text/plain;charset=utf-8" },
+        body: JSON.stringify({ id_token: token, _meta: { email } }),
+      }).catch(e => console.warn("[큐 #22] discussion_logout audit 실패:", e?.message));
+    }
+    localStorage.removeItem("azs_auth_v1");
+    setAuthIdToken(""); setAuthUserEmail(""); setAuthUserName("");
+    setAuthExpiresAt(0); setAuthError("");
+    setAuthStatus("unauthenticated");
+    console.log("[큐 #22] 로그아웃 완료");
+  };
+
+  // ─── 백엔드 401/403 응답 시 호출 (미등록 또는 apps 미허용) ───
+  // 추후 모든 fetch 호출의 결과 처리에서 사용 가능
+  const handleAuthDeny = (reason) => {
+    setAuthError(reason || "접근 권한 없음");
+    setAuthStatus("forbidden");
+  };
+
+  // window에 노출 — GIS 버튼 콜백 + 디버깅용
+  useEffect(() => {
+    window.handleGoogleLogin = handleGoogleLogin;
+    window.azsAuthLogout = handleLogout;
+    window.azsAuthState = () => ({ authStatus, email: authUserEmail, expiresAt: authExpiresAt });
+    return () => {
+      delete window.handleGoogleLogin;
+      delete window.azsAuthLogout;
+      delete window.azsAuthState;
+    };
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [authStatus, authIdToken, authUserEmail, authExpiresAt]);
+
+  const [step, setStep]           = useState(1);  // ★ 12-AZ-6: 첫 페이지를 STEP 1 (날짜 선택)으로
+  const [allMsgs, setAllMsgs]     = useState([]);
+  const [dates, setDates]         = useState([]);
+  const [selDates, setSelDates]   = useState([]);
+  // ★ 영역 8: 날짜 범위 선택 (start/end/unit). 분석 함수는 selDates 사용 — selRange는 표시/분기용.
+  const [selRange, setSelRange]   = useState({ start: null, end: null, unit: "day" });
+  const [reportType, setReportType] = useState("daily");  // ★ 12-AZ-6: 디폴트를 일일 생산 보고서로
+  // ★ 영역 9-D: 보고서 생성 모드 (간단=명세서 표 형태, 상세=페르소나 8명 논의)
+  // 영역 11: reportMode (간단/상세 모드) 폐기. 단일 흐름.
+  // ★ 영역 9: 명세서 5-카테고리 분류 결과 (간단모드 표 출력용)
+  const [taggedIssues, setTaggedIssues] = useState(null);
+  const [classified, setClassified] = useState(null);
+  const [priority, setPriority]   = useState(null);
+  const [kbStats, setKbStats]     = useState(null);
+  const [discussions, setDiscussions] = useState([]);
+  const [minutes, setMinutes]     = useState(null);
+  const [progress, setProgress]   = useState([]);
+  const [running, setRunning]     = useState(false);
+  const [error, setError]         = useState("");
+  const [sheetSaved, setSheetSaved] = useState(false);
+  // ★ 큐 #15 Phase 5c: 자동 비교 고정 상태 + 업데이트 준비 배지
+  const [autoCompareStatus, setAutoCompareStatus] = useState(null);
+  // { state:"running"|"done"|"skipped"|"failed", date, gapCount, message }
+  const [updateReady, setUpdateReady] = useState(null);
+  // { ready:bool, dateCount, dates:[...] }
+  // ★ 큐 #20 Phase 5a UI: 패턴 분석 결과 / 로딩 / 패널 펼침 / 쿨다운 추적
+  const [patternsResult, setPatternsResult] = useState(null);
+  // { gapCount, patternCount, patterns:[...], summary, elapsedSec, _generatedAt }
+  const [patternsLoading, setPatternsLoading] = useState(false);
+  const [patternsExpanded, setPatternsExpanded] = useState(false);
+  const [patternsLastRunAt, setPatternsLastRunAt] = useState(0);  // 쿨다운 추적 (Date.now())
+  // ★ 큐 #20: 패턴별 gap 닫기 상태 — { [pattern_id]: {stage:"idle"|"confirming"|"closing"|"done"|"error", result?, error?} }
+  const [closeStatus, setCloseStatus] = useState({});
+  // ★ 큐 #21: 일자 필터를 캡슐 칩으로 (메모리 #18 합의 스펙)
+  //   - patternsDateChips: 선택된 일자 배열 (기본 = 오늘 기준 최근 7일)
+  //   - patternsAddInput: '+ 일자 추가' 보조 인풋의 임시 값
+  //   - patternsUseAll: '🌐 전체 분석' 토글 (true면 chips 무시하고 전체 gap 분석)
+  const [patternsDateChips, setPatternsDateChips] = useState(() => {
+    const today = new Date();
+    const dates = [];
+    for (let i = 6; i >= 0; i--) {
+      const d = new Date(today);
+      d.setDate(d.getDate() - i);
+      dates.push(`${d.getFullYear()}-${String(d.getMonth()+1).padStart(2,"0")}-${String(d.getDate()).padStart(2,"0")}`);
+    }
+    return dates;
+  });
+  const [patternsAddInput, setPatternsAddInput] = useState("");
+  const [patternsUseAll, setPatternsUseAll] = useState(false);
+  // ★ 공정/추가 에이전트 선택 state
+  const [selectedProcess, setSelectedProcess] = useState("Cell");
+  const [extraAgents, setExtraAgents] = useState([]);
+  // ★ 영역 12-AZ-3: 데이터 소스 모드 — STEP 1 (DateRangePicker) 통합 사용
+  // "file" = .txt/.zip 업로드 / "tab" = messages 탭 자동연동
+  // STEP 1에서 사용자가 선택한 selDates로 처리 분기 (handleDateConfirm)
+  const [dataSource, setDataSource] = useState(null);
+  const [tabFetchLoading, setTabFetchLoading] = useState(false);
+  // ★ 영역 5: 선정 기준 드롭다운 (평소 숨김)
+  const [showCriteriaBox, setShowCriteriaBox] = useState(false);
+  // ★ 영역 6: PE 사전 큐레이션 결과 캐싱 + 사용자 선택 이슈 관리
+  const [preCuration, setPreCuration] = useState(null);          // 큐레이션 결과 (재사용 위해 캐싱)
+  const [preCategoryMsgs, setPreCategoryMsgs] = useState(null);  // 카테고리 메시지 (재사용)
+  const [autoSelectedIds, setAutoSelectedIds] = useState([]);    // 자동 선정된 이슈 id 목록 (TOP N)
+  const [selectedIssueIds, setSelectedIssueIds] = useState([]);  // 사용자가 최종 선택한 이슈 id 목록
+  const [curating, setCurating] = useState(false);               // 큐레이션 실행 중 플래그
+  // ★ 영역 7: 자유 채팅방
+  const [chatOpen, setChatOpen] = useState(false);                // 채팅창 표시 여부
+  const [chatStage, setChatStage] = useState("setup");           // "setup" (에이전트 선택) | "active" (대화 중)
+  const [chatAgents, setChatAgents] = useState([]);              // 채팅방 참석 에이전트 코드 배열
+  const [chatKb, setChatKb] = useState({});                       // 채팅 전용 KB 캐시 (방 개설 시 1회 로드)
+  const [chatMessages, setChatMessages] = useState([]);          // {role:"user"|"assistant", agent?:string, text, time}
+  const [chatInput, setChatInput] = useState("");                 // 입력창
+  const [chatBusy, setChatBusy] = useState(false);                // AI 응답 대기 중
+  const fileRef = useRef();
+
+  const toggleDate = (d) => {
+    setSelDates(prev =>
+      prev.includes(d) ? prev.filter(x => x !== d) : [...prev, d]
+    );
+  };
+
+  const handleReportTypeSelect = (rt) => {
+    setReportType(rt);
+    if (rt === "weekly" && selDates.length > 0) {
+      const weekDates = getWeekDates(selDates[0]);
+      const available = weekDates.filter(d => dates.includes(d));
+      setSelDates(available);
+    }
+  };
+
+  const handleFile = async (e) => {
+    const f = e.target.files[0];
+    if (!f) return;
+
+    // ★ 영역 12-AY-2: .zip vs .txt 분기
+    const isZip = /\.zip$/i.test(f.name);
+
+    try {
+      if (isZip) {
+        // .zip 처리: extractZipBundle → 메시지 + 이미지 base64
+        const result = await extractZipBundle(f);
+        if (typeof window !== "undefined") {
+          window.__zipImagesBuffer = result.images;
+          window.__zipExtractStats = result.stats;
+        }
+        const msgs = result.messages;
+        const ds = getUniqueDates(msgs);
+        setDataSource("file");  // ★ 12-AZ-3
+        setAllMsgs(msgs);
+        setDates(ds);
+        setSelDates([ds[ds.length-1]]);
+        setStep(1);
+        setError("");
+      } else {
+        // .txt 처리: 기존 흐름 그대로
+        const text = await f.text();
+        const msgs = parseWhatsApp(text);
+        const ds = getUniqueDates(msgs);
+        setDataSource("file");  // ★ 12-AZ-3
+        setAllMsgs(msgs);
+        setDates(ds);
+        setSelDates([ds[ds.length-1]]);
+        setStep(1);
+        setError("");
+      }
+    } catch (err) {
+      console.error("[12-AY-2] 파일 처리 실패:", err);
+      setError(`파일 처리 실패: ${err?.message || err}`);
+    }
+  };
+
+  // ★ 영역 12-AZ-3: messages 탭 모드로 STEP 1 진입
+  // dates를 250일치(~8개월)로 채워서 DateRangePicker가 그 안에서 자유 선택 가능
+  // 실제 API 호출은 handleDateConfirm에서 (사용자가 선택 완료 후)
+  // ★ 영역 12-AZ-5: zip 일회성 적재(25/10/1~5/3) 후 5/4 이전 제한 제거
+  //   - 자동연동(whapi_webhook)과 zip 적재(zip_import)가 messages 탭에 함께 존재
+  //   - 250일치 = 약 8개월 → zip 적재 범위(25/10~) 모두 포함
+  //   - get_messages가 빈 결과 반환하면 사용자에게 안내 (실제 데이터 없는 일자)
+  const handleEnterTabMode = () => {
+    // 인니 시간 기준 오늘부터 250일 전까지 dates 생성 (zip 적재 범위 포함)
+    const now = new Date();
+    const wibNow = new Date(now.getTime() + (7 * 60 - now.getTimezoneOffset()) * 60 * 1000);
+    const dummyDates = [];
+    for (let i = 250; i >= 0; i--) {
+      const dt = new Date(wibNow.getTime() - i * 24 * 3600 * 1000);
+      const yy = dt.getUTCFullYear() % 100;
+      const mm = dt.getUTCMonth() + 1;
+      const dd = dt.getUTCDate();
+      dummyDates.push(`${yy}/${mm}/${dd}`);
+    }
+    // 어제 디폴트 선택
+    const defaultSel = dummyDates.length >= 2
+      ? dummyDates[dummyDates.length - 2]  // 어제
+      : dummyDates[dummyDates.length - 1];  // 오늘
+
+    setDataSource("tab");
+    setAllMsgs([]);  // STEP 2에서 API 호출 후 채울 예정
+    setDates(dummyDates);
+    setSelDates(defaultSel ? [defaultSel] : []);
+    setStep(1);
+    setError("");
+  };
+
+  // ★ 큐 #15 Phase 5c: 업데이트 준비 배지 갱신 (open gap의 서로 다른 날짜 ≥ 3)
+  const refreshUpdateBadge = async () => {
+    try {
+      const r = await fetchGapLogList({ status: "open" });
+      const dates = [...new Set((r.gaps || []).map(g => String(g.report_date).trim()))]
+        .filter(Boolean).sort();
+      setUpdateReady({ ready: dates.length >= 3, dateCount: dates.length, dates });
+    } catch (e) {
+      console.error("[큐 #15 배지 갱신 실패]", e.message);
+    }
+  };
+  // 마운트 시 1회 배지 계산
+  // eslint-disable-next-line react-hooks/exhaustive-deps
+  useEffect(() => { refreshUpdateBadge(); }, []);
+
+  // ★ 큐 #20 Phase 5a UI: 패턴 분석 실행 핸들러 (쿨다운 10분 적용)
+  const PATTERN_COOLDOWN_MS = 10 * 60 * 1000;  // 10분
+  const runPatternAnalysis = async ({ force = false } = {}) => {
+    if (patternsLoading) return;
+    // 쿨다운 체크 — 이전 결과가 있고 10분 안 지났으면 재사용
+    if (!force && patternsResult && (Date.now() - patternsLastRunAt) < PATTERN_COOLDOWN_MS) {
+      const remainSec = Math.ceil((PATTERN_COOLDOWN_MS - (Date.now() - patternsLastRunAt)) / 1000);
+      const remainMin = Math.ceil(remainSec / 60);
+      console.log(`[큐 #20] 쿨다운 — 직전 분석 후 ${remainMin}분 남음, 캐시된 결과 사용`);
+      setPatternsExpanded(true);
+      return;
+    }
+    setPatternsLoading(true);
+    setPatternsExpanded(true);
+    try {
+      // ★ 큐 #21: dateFilter 결정 — useAll이면 null(전체), 아니면 chips 배열 그대로
+      //   가드: useAll이 false인데 chips가 비어있으면 진입 안 됨 (UI에서 버튼 비활성)
+      let dateFilter = null;
+      if (!patternsUseAll) {
+        if (patternsDateChips.length === 0) {
+          throw new Error("분석할 일자가 없습니다 — 일자 칩 추가 또는 '🌐 전체 분석' 토글");
+        }
+        dateFilter = patternsDateChips;
+      }
+      const result = await analyzeGapPatterns({ status: "open" }, { dateFilter });
+      setPatternsResult(result);
+      setPatternsLastRunAt(Date.now());
+      console.log(`[큐 #20] ✅ 패턴 분석 완료: ${result.patternCount}개 패턴 / ${result.gapCount}건 gap`);
+    } catch (e) {
+      console.error("[큐 #20] 패턴 분석 실패:", e?.message);
+      setPatternsResult({
+        _error: e?.message || "알 수 없는 오류",
+        _generatedAt: new Date().toISOString(),
+      });
+    } finally {
+      setPatternsLoading(false);
+    }
+  };
+
+  // ★ 큐 #20 Phase 5a UI: 패턴 분석 결과 HTML 다운로드 (운영 규칙: 모든 결과물 HTML 통일)
+  // ★ 큐 #20 P6 사이클: 패턴 카드의 gap 일괄 닫기 핸들러 (인라인 2단계 확인)
+  // 1단계: 사용자가 "🔒 gap N건 닫기" 버튼 클릭 → stage=confirming
+  // 2단계: "✓ 확정" 클릭 → stage=closing → updateGapLogStatus 호출 → done/error
+  const closeGapsForPattern = async (pattern, action) => {
+    const pid = pattern.pattern_id || `idx-${pattern.title?.slice(0,20)}`;
+    const ids = pattern.affected_gap_ids || [];
+    if (ids.length === 0) {
+      console.warn(`[큐 #20] 패턴 "${pid}"에 affected_gap_ids 없음 — 닫기 불가`);
+      return;
+    }
+    if (action === "request") {
+      // 1단계 — 확인 모드 진입
+      setCloseStatus(s => ({ ...s, [pid]: { stage: "confirming" } }));
+    } else if (action === "cancel") {
+      // 취소
+      setCloseStatus(s => ({ ...s, [pid]: { stage: "idle" } }));
+    } else if (action === "confirm") {
+      // 2단계 — 실제 닫기 실행
+      setCloseStatus(s => ({ ...s, [pid]: { stage: "closing" } }));
+      try {
+        // ★ Apps Script resolved_in_cycle 컬럼에 들어갈 cycle 식별자
+        //   형식: cycle-q20-{pattern_id}-{YYYYMMDD} (예: cycle-q20-P6-20260530)
+        //   GapLog 시트에서 같은 cycle로 닫힌 gap들을 그룹핑하여 추적 가능
+        const ymd = new Date().toISOString().slice(0, 10).replace(/-/g, "");
+        const cycleTag = `cycle-q20-${pid}-${ymd}`;
+        const result = await updateGapLogStatus({
+          ids,
+          status: "resolved",
+          resolved_in_cycle: cycleTag,
+        });
+        setCloseStatus(s => ({
+          ...s,
+          [pid]: {
+            stage: "done",
+            result: {
+              updatedCount: result.updated || 0,           // ★ Apps Script: result.updated
+              updatedIds: result.ids || [],                // ★ Apps Script: 갱신된 id 배열
+              closed_at: new Date().toISOString(),         // 클라이언트 측 시각 (시트엔 별도 컬럼 없음)
+              resolved_in_cycle: cycleTag,                 // UI 표시용
+            },
+          },
+        }));
+        console.log(`[큐 #20] ✅ 패턴 "${pid}" gap ${result.updated}건 closed (cycle: ${cycleTag})`);
+        // 배지 카운트 재계산 (open gap 줄었을 테니)
+        try { await refreshUpdateBadge(); } catch (_) {}
+      } catch (e) {
+        console.error(`[큐 #20] gap 닫기 실패 (${pid}):`, e?.message);
+        setCloseStatus(s => ({ ...s, [pid]: { stage: "error", error: e?.message || "알 수 없는 오류" } }));
+      }
+    }
+  };
+
+  // ★ 큐 #20 Phase 5a UI: 패턴 분석 결과 HTML 다운로드 (운영 규칙: 모든 결과물 HTML 통일)
+  const downloadPatternsHtml = () => {
+    if (!patternsResult || !patternsResult.patterns) return;
+    const esc = (s) => String(s || "").replace(/&/g,"&amp;").replace(/</g,"&lt;").replace(/>/g,"&gt;").replace(/"/g,"&quot;");
+    const sevColor = (s) => s === "high" ? "#c0392b" : s === "medium" ? "#e67e22" : "#d4ac0d";
+    const sevIcon = (s) => s === "high" ? "🚨" : s === "medium" ? "🔴" : "🟡";
+    const sorted = [...patternsResult.patterns].sort((a,b) => {
+      const order = { high:0, medium:1, low:2 };
+      const sa = order[a.severity] ?? 9, sb = order[b.severity] ?? 9;
+      if (sa !== sb) return sa - sb;
+      return (b.gap_count || 0) - (a.gap_count || 0);
+    });
+    const generatedAt = patternsResult._generatedAt ? new Date(patternsResult._generatedAt).toLocaleString("ko-KR") : new Date().toLocaleString("ko-KR");
+    const html = `<!DOCTYPE html>
+<html lang="ko">
+<head>
+<meta charset="UTF-8">
+<title>큐 #15 Phase 5a — 누적 Gap 패턴 분석 결과</title>
+<style>
+  body { font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", "Noto Sans KR", sans-serif;
+    max-width: 1100px; margin: 2em auto; padding: 0 1.5em; line-height: 1.65; color: #222; background: #fafafa; }
+  h1 { font-size: 1.9em; border-bottom: 3px solid #7c3aed; padding-bottom: 0.3em; color: #7c3aed; }
+  h2 { font-size: 1.3em; color: #1a3a5c; margin-top: 1.6em; }
+  .meta { color: #666; font-size: 0.92em; }
+  .summary-box { background: #fff; border: 2px solid #7c3aed; padding: 1em 1.3em; margin: 1.5em 0; border-radius: 5px; }
+  .pattern-card { background: #fff; border: 1px solid #ccc; border-left: 6px solid; padding: 1em 1.3em; margin: 1.2em 0; border-radius: 4px; }
+  .sev-badge { display: inline-block; padding: 2px 10px; border-radius: 12px; font-size: 0.85em; font-weight: 700; color: white; }
+  table { border-collapse: collapse; margin: 0.5em 0; width: 100%; font-size: 0.92em; background: #fff; }
+  th, td { border: 1px solid #bbb; padding: 6px 10px; text-align: left; vertical-align: top; }
+  th { background: #ede9fe; font-weight: 600; color: #5b21b6; width: 22%; }
+  .gap-ids { font-family: monospace; font-size: 0.85em; color: #666; }
+  code { background: #f0f0f0; padding: 1px 5px; border-radius: 3px; font-family: "SF Mono", Consolas, monospace; }
+</style>
+</head>
+<body>
+<h1>🔍 큐 #15 Phase 5a — 누적 Gap 패턴 분석 결과</h1>
+<p class="meta">
+  <b>생성 시각:</b> ${esc(generatedAt)}<br>
+  <b>분석 대상:</b> open 상태 gap ${patternsResult.gapCount}건${patternsResult.totalGapCount && patternsResult.totalGapCount !== patternsResult.gapCount ? ` <span style="color:#888;">(전체 ${patternsResult.totalGapCount}건 중 필터링)</span>` : ""}<br>
+  ${patternsResult._dateFilter ? `<b>일자 필터:</b> <code>${esc(patternsResult._dateFilter.join(", "))}</code><br>` : ""}
+  <b>식별 패턴:</b> ${patternsResult.patternCount}개<br>
+  <b>분석 소요:</b> ${patternsResult.elapsedSec}초
+</p>
+
+${patternsResult.summary ? `<div class="summary-box"><h2 style="margin-top:0;">📋 전체 요약</h2><p>${esc(patternsResult.summary)}</p></div>` : ""}
+
+<h2>🎯 식별된 패턴 (${sorted.length}개)</h2>
+${sorted.map((p,i) => `
+<div class="pattern-card" style="border-left-color:${sevColor(p.severity)};">
+  <h3 style="margin-top:0;color:${sevColor(p.severity)};">
+    ${i+1}. ${esc(p.title)}
+    <span class="sev-badge" style="background:${sevColor(p.severity)};">${sevIcon(p.severity)} ${esc((p.severity||"").toUpperCase())}</span>
+  </h3>
+  <table>
+    <tr><th>패턴 ID</th><td><code>${esc(p.pattern_id || "-")}</code></td></tr>
+    <tr><th>영향 받은 gap</th><td><b>${p.gap_count}건</b> · <span class="gap-ids">${esc((p.affected_gap_ids||[]).join(", "))}</span></td></tr>
+    <tr><th>원인 가설</th><td>${esc(p.hypothesis || "-")}</td></tr>
+    <tr><th>영향 코드 영역</th><td><code>${esc(p.affected_code_area || "-")}</code></td></tr>
+    <tr><th>권장 액션</th><td><b>${esc(p.recommended_action || "-")}</b></td></tr>
+  </table>
+</div>
+`).join("")}
+
+<hr>
+<p class="meta" style="text-align:center;">— 분석 종료 —<br>AZS 논의앱 큐 #15 Phase 5a · ${esc(generatedAt)}</p>
+</body>
+</html>`;
+    const blob = new Blob([html], { type: "text/html;charset=utf-8" });
+    const url = URL.createObjectURL(blob);
+    const a = document.createElement("a");
+    a.href = url;
+    a.download = `gap_patterns_${new Date().toISOString().slice(0,10)}.html`;
+    document.body.appendChild(a);
+    a.click();
+    document.body.removeChild(a);
+    URL.revokeObjectURL(url);
+  };
+
+  // ★ 영역 12-AZ-6: 앱 마운트 시 자동으로 messages 탭 모드 진입
+  // (업로드 단계 제거 → 첫 페이지 = 날짜 선택)
+  // 파일 업로드는 STEP 1 하단의 보조 버튼으로 옵션 제공
+  // eslint-disable-next-line react-hooks/exhaustive-deps
+  useEffect(() => {
+    handleEnterTabMode();
+  }, []);
+
+  const handleDateConfirm = async () => {
+    if (selDates.length === 0) return;
+
+    // ★ 영역 12-AZ-3: messages 탭 모드 → 사용자가 선택한 일자로 API 호출
+    if (dataSource === "tab") {
+      setTabFetchLoading(true);
+      setError("");
+      try {
+        // selDates가 생산일(YY/M/D) 기준 → API용 startDate/endDate (YYYY-MM-DD, 인니 시간 기준)
+        // 06:00 룰: selDates의 일자를 분석하려면 startDate=selDate, endDate=selDate+1일
+        // (selDate 06:00 ~ selDate+1 06:00 분량)
+        // ★ 영역 12-BK-fix: 문자열 sort 버그 — Date 비교로 변경
+        // "26/5/10" vs "26/5/8" 문자열 비교 시 "26/5/10"이 사전 순으로 앞 → 정렬 뒤집힘
+        const sortedSelDates = [...selDates].sort(
+          (a, b) => dateStrToDate(a).getTime() - dateStrToDate(b).getTime()
+        );
+        const firstDate = sortedSelDates[0];  // 가장 빠른 일자
+        const lastDate = sortedSelDates[sortedSelDates.length - 1];  // 가장 늦은 일자
+        console.log(`[12-BK-fix] selDates=${selDates.join(',')} → sorted=${sortedSelDates.join(',')} (first=${firstDate}, last=${lastDate})`);
+        const toAPIDate = (yymdStr) => {
+          const [y, m, d] = yymdStr.split('/').map(Number);
+          return `20${String(y).padStart(2,'0')}-${String(m).padStart(2,'0')}-${String(d).padStart(2,'0')}`;
+        };
+        const apiStart = toAPIDate(firstDate);
+        // ★ 큐 #17: Apps Script가 자체 06시 룰 적용 → endDate 보정 불필요
+        const apiEnd = toAPIDate(lastDate);
+
+        const msgs = await fetchMessagesFromTab(apiStart, apiEnd, "[Official] AZS Status Reports");
+
+        if (msgs.length === 0) {
+          setError(`해당 기간(${apiStart} ~ ${apiEnd})에 메시지가 없습니다`);
+          setTabFetchLoading(false);
+          return;
+        }
+
+        // 실제 데이터로 dates/allMsgs 갱신 (selDates는 사용자 선택 그대로 유지)
+        const realDs = getUniqueDates(msgs);
+        setAllMsgs(msgs);
+        setDates(realDs);
+        // selDates가 실제 dates에 있는지 확인, 없으면 폴백
+        const validSelDates = selDates.filter(d => realDs.includes(d));
+        if (validSelDates.length === 0) {
+          // 사용자 선택이 데이터에 없음 → 가장 가까운 일자로 폴백
+          setError(`선택한 일자(${selDates.join(', ')})에 메시지가 없습니다. 다른 날짜를 선택하세요.`);
+          setTabFetchLoading(false);
+          return;
+        }
+        if (validSelDates.length !== selDates.length) {
+          setSelDates(validSelDates);
+        }
+        console.log(`[12-AZ-3] messages 탭 모드 분석 진입: 사용자 선택 ${selDates.join(',')} → 실제 ${validSelDates.join(',')}`);
+        setStep(2);
+      } catch (err) {
+        console.error("[12-AZ-3] messages 탭 조회 실패:", err);
+        setError(`조회 실패: ${err?.message || err}`);
+      } finally {
+        setTabFetchLoading(false);
+      }
+      return;
+    }
+
+    // 기존 file 모드: 단순 STEP 2 진입
+    setStep(2);
+    setError("");
+  };
+
+  // ★ 영역 6: getIssueId는 모듈 최상위 함수로 이동 (BriefingDisplay 등에서도 사용)
+
+  const handleReportConfirm = async () => {
+    setError("");
+    const dayMsgs = filterByDates(allMsgs, selDates);
+    const cl = classifyMessages(dayMsgs);
+    const bmIssues = extractAllIssues(cl.downtime, dayMsgs);  // ★ 12-BG-4: 메시지 풀 전달
+    // ★ 영역 12-AW: Critical 메시지를 가상 issue로 변환 → 본문 논의 후보 통합
+    const criticalIssues = extractCriticalIssues(cl.criticalMsgs || []);
+    const allIssuesFlat = [...bmIssues, ...criticalIssues];
+    setClassified(cl);
+    setPriority(allIssuesFlat);  // priority state는 이제 평면 배열을 보유
+
+    // ★ 영역 12-AW: Critical 통합 진단
+    console.log(`[★ 12-AW Critical 통합] BM bot ${bmIssues.length}건 + Critical 가상 ${criticalIssues.length}건 = 총 ${allIssuesFlat.length}건`);
+    if (criticalIssues.length > 0) {
+      console.log(`  ↳ Critical 가상 issue 샘플:`);
+      criticalIssues.slice(0, 3).forEach((ci, i) => {
+        const probPreview = (ci.prob || "").slice(0, 100);
+        console.log(`    [C${i+1}] ${ci.date} ${ci.time} ${ci.eq} (${ci.durMin}분): ${probPreview}`);
+      });
+    }
+
+    // ★ 영역 12-AA: Duration 파싱 진단 로그
+    const dur30plus = allIssuesFlat.filter(i => (i.durMin || 0) >= 30).length;
+    const dur60plus = allIssuesFlat.filter(i => (i.durMin || 0) >= 60).length;
+    const dur0 = allIssuesFlat.filter(i => (i.durMin || 0) === 0).length;
+    console.log(`[Duration 파싱 진단] 전체 ${allIssuesFlat.length}건 / 30분+ ${dur30plus}건 / 60분+ ${dur60plus}건 / durMin=0 ${dur0}건`);
+    if (allIssuesFlat.length > 0) {
+      console.log(`[Duration 샘플]`, allIssuesFlat.slice(0, 3).map(i => ({
+        eq: i.eq, durMin: i.durMin, prob: (i.prob || "").slice(0, 50)
+      })));
+    }
+    console.log(`[메시지 분류] downtime ${cl.downtime?.length || 0} / quality ${cl.qualityMsgs?.length || 0} / process_change ${cl.processChangeMsgs?.length || 0} / test ${cl.testMsgs?.length || 0} / ambiguous ${cl.ambiguousMsgs?.length || 0}`);
+
+    // ★ 영역 6-B: STEP 3 진입 전에 PE 큐레이션을 미리 실행 (사용자가 자동 선정 결과를 바로 보고 추가 선택할 수 있도록)
+    setCurating(true);
+    setProgress(["📝 PE 사전 큐레이션 실행 중 (전체 이슈 정리)..."]);
+    setStep(3);  // STEP 3 화면으로 먼저 전환 (로딩 표시 포함)
+
+    try {
+      // 카테고리 메시지 준비 (영역 5 흐름과 동일)
+      const ambig = cl.ambiguousMsgs || [];
+      let ambigResult = { quality: [], process_change: [], test: [], skip: [] };
+      if (ambig.length > 0) {
+        setProgress(p => [...p, `🔀 모호 메시지 AI 분류 중 (${ambig.length}건)...`]);
+        try {
+          ambigResult = await classifyAmbiguousMessages(ambig);
+          setProgress(p => [...p, `✅ 모호 분류 완료 (품질 ${ambigResult.quality.length} / 공정변경 ${ambigResult.process_change.length} / 테스트 ${ambigResult.test.length})`]);
+        } catch {
+          setProgress(p => [...p, `⚠️ 모호 분류 실패 — 첫 매칭 카테고리로 자동 할당`]);
+          ambig.forEach(m => {
+            const first = m.matched?.[0];
+            if (first === "quality") ambigResult.quality.push(m);
+            else if (first === "process_change") ambigResult.process_change.push(m);
+            else if (first === "test") ambigResult.test.push(m);
+          });
+        }
+      }
+      const categoryMsgs = {
+        quality: [...(cl.qualityMsgs || []), ...ambigResult.quality],
+        process_change: [...(cl.processChangeMsgs || []), ...ambigResult.process_change],
+        test: [...(cl.testMsgs || []), ...ambigResult.test],
+        // ★ 영역 12-AU: critical 카테고리 추가 (라인 정지/매니저 직접 개입/주요 부품 교체)
+        critical: [...(cl.criticalMsgs || [])],
+      };
+      // ★ 영역 12-AD2 + 12-AU: 최종 카테고리 메시지 분포 로그
+      console.log(`[메시지 최종 분류] critical ${categoryMsgs.critical.length} / quality ${categoryMsgs.quality.length} (직접 ${cl.qualityMsgs?.length || 0} + 모호 ${ambigResult.quality.length}) / process_change ${categoryMsgs.process_change.length} (직접 ${cl.processChangeMsgs?.length || 0} + 모호 ${ambigResult.process_change.length}) / test ${categoryMsgs.test.length} (직접 ${cl.testMsgs?.length || 0} + 모호 ${ambigResult.test.length})`);
+      if (ambig.length > 0 && (ambigResult.skip?.length || 0) > 0) {
+        console.log(`[모호 분류] skip ${ambigResult.skip.length}건 (어디에도 분류 안 됨)`);
+      }
+
+      // ★ 영역 12-AE0 + AE3: 카테고리별 raw 메시지 샘플 출력 (LLM에 들어가는 데이터 확인용)
+      // 사용자 정답 레포트 (24일자) 5개 그룹 (STK-3-B2 Overhang, Cutter 2C, STK-4-B1, STK-4-B3, STK-2-A1)이
+      // 실제 데이터에 있는지 확인 — 풍부도 갭의 원인 진단 (데이터 부족 vs LLM 부족)
+      // AE3: 250자 → 500자로 확장 (Cutter 2C, STK-2-A1 등 데이터 유무 정확 확인)
+      console.log(`[process_change 메시지 raw — ${categoryMsgs.process_change.length}건 중 최대 10건]`);
+      categoryMsgs.process_change.slice(0, 10).forEach((m, i) => {
+        const preview = (m.text || "").replace(/\n/g, " | ").slice(0, 500);
+        console.log(`  [PC-${i+1}] ${m.date || "?"} ${m.time || "?"} ${m.sender || "?"}: ${preview}${m.text.length > 500 ? "..." : ""}`);
+      });
+      console.log(`[test 메시지 raw — ${categoryMsgs.test.length}건 중 최대 10건]`);
+      categoryMsgs.test.slice(0, 10).forEach((m, i) => {
+        const preview = (m.text || "").replace(/\n/g, " | ").slice(0, 500);
+        console.log(`  [TST-${i+1}] ${m.date || "?"} ${m.time || "?"} ${m.sender || "?"}: ${preview}${m.text.length > 500 ? "..." : ""}`);
+      });
+      if (categoryMsgs.quality.length > 0) {
+        console.log(`[quality 메시지 raw — ${categoryMsgs.quality.length}건 중 최대 5건]`);
+        categoryMsgs.quality.slice(0, 5).forEach((m, i) => {
+          const preview = (m.text || "").replace(/\n/g, " | ").slice(0, 500);
+          console.log(`  [QL-${i+1}] ${m.date || "?"} ${m.time || "?"} ${m.sender || "?"}: ${preview}${m.text.length > 500 ? "..." : ""}`);
+        });
+      }
+
+      // ★ 영역 12-Y5: 큐레이션에 KB 활용 (Cell_PE / Elec_PE 우선, 없으면 빈 문자열)
+      let kbForCuration = "";
+      try {
+        setProgress(p => [...p, `📚 PE KB 로딩 중... (cross-day 패턴 분석용)`]);
+        const peKbResult = await loadSelectedKnowledge(["Cell_PE", "Elec_PE"]);
+        kbForCuration = peKbResult.kb["Cell_PE"] || peKbResult.kb["Elec_PE"] || "";
+        if (kbForCuration) {
+          setProgress(p => [...p, `✅ KB 로딩 완료 (${kbForCuration.length} 자)`]);
+        } else {
+          setProgress(p => [...p, `ℹ️ KB 비어있음 — 단일 일자 분석으로 진행`]);
+        }
+      } catch (e) {
+        setProgress(p => [...p, `⚠️ KB 로딩 실패 — KB 없이 진행`]);
+        kbForCuration = "";
+      }
+
+      // PE 큐레이션 실행 (12-Y5: KB 활용)
+      const allIssuesForCuration = allIssuesFlat;
+      let curation;
+      try {
+        curation = await runPreCuration(allIssuesForCuration, kbForCuration, reportType, categoryMsgs);
+        // ★ 큐 #19 폴백버그 수정(방안A): date 미정의 ReferenceError 차단 — selDates[0](YY/M/D) → YYYY-MM-DD 변환(GapLog report_date 일관)
+        const _reportDate = selDates[0] ? dateStrToIso(selDates[0]) : "";
+        await _logCurationDiag(curation, _reportDate);  // ★ 큐 #19 ⑦: 큐레이션 진단 GapLog 적재
+        setProgress(p => [...p, `✅ PE 큐레이션 완료 (장기부동 ${curation.long_downtime.length}건, 반복 ${curation.recurring.length}건)`]);
+      } catch (e) {
+        // ★ 큐 #19 폴백버그 수정(방안B): 에러 swallow 방지 — try 내부(_logCurationDiag 포함) 실패 원인 콘솔 노출
+        console.error(`[큐레이션 try-catch 트리거 / handleReportConfirm]`, e?.message, e?.stack);
+        setProgress(p => [...p, `⚠️ PE 큐레이션 실패 — 폴백 사용`]);
+        curation = buildFallbackCuration(allIssuesForCuration, categoryMsgs);
+      }
+      // ★ 큐 #19 ⑧: crack 조각미회수 추출 (큐레이션 성공/폴백 무관 — 품질 메시지에서 직접)
+      if (curation) curation.fragmentLost = extractFragmentLost(categoryMsgs);
+
+      // ★ 영역 11-B: 5-카테고리 분류 즉시 실행 (체크박스 + 큐레이션 모두 활용)
+      const taggedNow = classifyIssues5Category(allIssuesFlat, {
+        longDowntimeThresholdMin: reportType === "weekly" ? 60 : 30,
+        repeatThreshold: 2,
+      });
+      setTaggedIssues(taggedNow);
+
+      // ★ 영역 11-7-1: 자동 선정 = LONG_DOWNTIME 또는 HIGH_FREQUENCY tag 보유 이슈
+      const autoSelected = taggedNow.issues.filter(i =>
+        (i.tags || []).includes("LONG_DOWNTIME") || (i.tags || []).includes("HIGH_FREQUENCY")
+      );
+      // 점수순 정렬 후 MAX_ISSUES 제한
+      const autoScored = autoSelected.map(issue => {
+        const s = scoreIssueMatrix(issue);
+        return { ...issue, score: s.total };
+      }).sort((a, b) => b.score - a.score).slice(0, MAX_ISSUES);
+      const autoIds = autoScored.map(getIssueId);
+
+      setPreCuration(curation);
+      setPreCategoryMsgs(categoryMsgs);
+      setAutoSelectedIds(autoIds);
+      setSelectedIssueIds(autoIds);  // 초기값 = 자동 선정 (사용자가 추가/제거 가능)
+      setProgress(p => [...p, `🎯 자동 선정 ${autoIds.length}건 (LONG_DOWNTIME/HIGH_FREQUENCY tag). 추가 선택 후 분석 시작 가능.`]);
+    } catch (e) {
+      setError(`STEP 3 준비 중 오류: ${e?.message || e}`);
+    } finally {
+      setCurating(false);
+    }
+  };
+
+  // ★ 영역 6: 체크박스 토글
+  const toggleIssueSelection = (id) => {
+    setSelectedIssueIds(prev =>
+      prev.includes(id) ? prev.filter(x => x !== id) : [...prev, id]
+    );
+  };
+
+  const runAnalysis = async () => {
+    setRunning(true); setError(""); setProgress([]);
+    setDiscussions([]); setMinutes(null); setSheetSaved(false);
+
+    // ★ 영역 12-AZ-8 (큐 #15): Wake Lock API — 보고서 생성 중 화면 꺼짐 방지
+    let wakeLock = null;
+    const requestWakeLock = async () => {
+      try {
+        if ("wakeLock" in navigator) {
+          wakeLock = await navigator.wakeLock.request("screen");
+          console.log("[12-AZ-8] Wake Lock 활성화 — 화면 꺼짐 방지");
+          wakeLock.addEventListener("release", () => {
+            console.log("[12-AZ-8] Wake Lock 해제됨");
+          });
+        } else {
+          console.log("[12-AZ-8] Wake Lock API 미지원 — 화면 꺼짐 방지 불가 (구버전 브라우저)");
+        }
+      } catch (e) {
+        console.warn("[12-AZ-8] Wake Lock 요청 실패:", e?.message);
+      }
+    };
+    // 화면 visibility 변경 시 자동 재요청 (탭 전환 후 복귀 시 wake lock 끊기는 경우 대응)
+    const handleVisibilityChange = async () => {
+      if (wakeLock !== null && document.visibilityState === "visible") {
+        await requestWakeLock();
+      }
+    };
+    document.addEventListener("visibilitychange", handleVisibilityChange);
+    await requestWakeLock();
+
+    try {
+      // ★ 선택된 페르소나 풀 구성: 공정 자동 + 추가 선택
+      const autoAgents = PROCESSES[selectedProcess].auto;
+      const allowedAgents = [...autoAgents, ...extraAgents];
+
+      setProgress([`🎯 참여 에이전트: ${allowedAgents.map(a => PERSONAS[a]?.label).join(", ")} (${allowedAgents.length}명)`]);
+
+      // 학습 내용 선별 로드 (선택된 페르소나만)
+      setProgress(p => [...p, `📚 학습 내용 로드 중 (${allowedAgents.length}종)...`]);
+      let kbResult;
+      try {
+        kbResult = await loadSelectedKnowledge(allowedAgents);
+        setKbStats(kbResult.stats);
+        const statsStr = allowedAgents.map(a => `${a}:${kbResult.stats[a] || 0}`).join(" ");
+        setProgress(p => [...p, `✅ 학습 로드 완료 (${statsStr})`]);
+      } catch {
+        kbResult = { kb: {}, stats: { failed: allowedAgents.length } };
+        allowedAgents.forEach(a => { kbResult.kb[a] = ""; kbResult.stats[a] = 0; });
+        setKbStats(kbResult.stats);
+        setProgress(p => [...p, "⚠️ 학습 로드 실패 — 기본 역할로 진행"]);
+      }
+
+      // ★ 영역 11-A: priority가 평면 배열이라 직접 사용. taggedIssues가 5-카테고리 분류 결과.
+      // 자동 선정 + 사용자 추가 = selectedIssueIds (체크박스로 자유 선택)
+      // tagged.issues는 모든 이슈에 tags 부착된 상태
+      const allIssuesFlat = priority || [];
+
+      // 5-카테고리 분류는 STEP 3 진입 시 이미 실행됨 (taggedIssues state). 없으면 여기서 재계산.
+      let taggedResult = taggedIssues;
+      if (!taggedResult) {
+        taggedResult = classifyIssues5Category(allIssuesFlat, {
+          longDowntimeThresholdMin: reportType === "weekly" ? 60 : 30,
+          repeatThreshold: 2,
+        });
+        setTaggedIssues(taggedResult);
+      }
+
+      // 사용자가 STEP 3에서 체크한 이슈 = 본문 논의 대상 (DEEP/STANDARD/LITE 모드 자동 분류)
+      const candidatesScored = taggedResult.issues.map(issue => {
+        const s = scoreIssueMatrix(issue);
+        return { ...issue, score: s.total, scoreBreakdown: s.breakdown };
+      });
+      const keyIssues = candidatesScored
+        .filter(issue => selectedIssueIds.includes(getIssueId(issue)))
+        .sort((a, b) => {
+          if (b.score !== a.score) return b.score - a.score;
+          return (b.durMin || 0) - (a.durMin || 0);
+        });
+
+      // 영역 11: 체크 안 된 이슈는 본문 논의 대상 X (사용자 명시 선정만)
+      const liteIssues = [];  // 폐기: 사용자가 명시적으로 체크한 것만 분석
+      const allTargets = keyIssues;
+
+      const autoCount = keyIssues.filter(i => autoSelectedIds.includes(getIssueId(i))).length;
+      const manualCount = keyIssues.length - autoCount;
+      setProgress(p => [...p, `🔍 본문 논의: 자동 ${autoCount}건 + 사용자 추가 ${manualCount}건 = 총 ${keyIssues.length}건`]);
+
+      // ★ 영역 6-E: STEP 3에서 미리 실행한 큐레이션 재사용 (재호출 없음)
+      const allIssuesForCuration = allIssuesFlat;
+      const categoryMsgs = preCategoryMsgs || {
+        quality: classified?.qualityMsgs || [],
+        process_change: classified?.processChangeMsgs || [],
+        test: classified?.testMsgs || [],
+        critical: classified?.criticalMsgs || [],  // ★ 12-AU
+      };
+      let curation = preCuration;
+      if (curation) {
+        setProgress(p => [...p, `♻️ PE 큐레이션 재사용 (STEP 3에서 사전 실행됨)`]);
+      } else {
+        // 폴백: STEP 3 큐레이션이 어떤 이유로든 없으면 여기서 실행
+        setProgress(p => [...p, "📝 PE 사전 큐레이션 중 (전체 이슈 정리)..."]);
+        try {
+          curation = await runPreCuration(allIssuesForCuration, kbResult.kb["Cell_PE"] || kbResult.kb["Elec_PE"] || "", reportType, categoryMsgs);
+          // ★ 큐 #19 폴백버그 수정(방안A): date 미정의 ReferenceError 차단 — selDates[0](YY/M/D) → YYYY-MM-DD 변환(GapLog report_date 일관)
+          const _reportDate = selDates[0] ? dateStrToIso(selDates[0]) : "";
+          await _logCurationDiag(curation, _reportDate);  // ★ 큐 #19 ⑦: 큐레이션 진단 GapLog 적재
+          setProgress(p => [...p, `✅ PE 큐레이션 완료`]);
+        } catch (e) {
+          // ★ 큐 #19 폴백버그 수정(방안B): 에러 swallow 방지 — try 내부(_logCurationDiag 포함) 실패 원인 콘솔 노출
+          console.error(`[큐레이션 try-catch 트리거 / runAnalysis 폴백경로]`, e?.message, e?.stack);
+          setProgress(p => [...p, `⚠️ PE 큐레이션 실패 - 폴백 사용`]);
+          curation = buildFallbackCuration(allIssuesForCuration, categoryMsgs);
+        }
+      }
+      // ★ 큐 #19 ⑧: crack 조각미회수 추출 (재사용/폴백 무관 — 품질 메시지에서 직접)
+      if (curation) curation.fragmentLost = extractFragmentLost(categoryMsgs);
+
+      setProgress(p => [...p, `🏷️ 5-카테고리: 장기부동 ${taggedResult.counts.LONG_DOWNTIME} / 반복 ${taggedResult.counts.HIGH_FREQUENCY} / 조건변경 ${taggedResult.counts.CONDITION_CHANGE} / 테스트 ${taggedResult.counts.TEST_PM} / 품질 ${taggedResult.counts.QUALITY_NG}`]);
+
+      // 모드 분류 + 건별 논의 (영역 11: 간단 모드 폐기, 항상 페르소나 논의)
+      const allDiscussions = [];
+
+      // 본문 논의 처리 — 영역 11: 사용자 추가 이슈 = DEEP, 자동 선정 = tags 기반
+      {
+        for (let i = 0; i < keyIssues.length; i++) {
+          const issue = keyIssues[i];
+          const isAutoSelected = autoSelectedIds.includes(getIssueId(issue));
+          const hasLongTag = (issue.tags || []).includes("LONG_DOWNTIME");
+          const hasFreqTag = (issue.tags || []).includes("HIGH_FREQUENCY");
+          // 영역 11-7-2: 사용자 추가 이슈는 무조건 DEEP
+          // 자동 선정 이슈: LONG_DOWNTIME → DEEP, HIGH_FREQUENCY만 → STANDARD
+          const modeInfo = !isAutoSelected
+            ? { mode: "DEEP", reason: "사용자 추가 (체크박스 선택)", source: "user" }
+            : classifyDiscussionMode(issue, hasLongTag, hasFreqTag);
+          const mStyle = MODE_STYLE[modeInfo.mode];
+
+          setProgress(p => [...p, `${mStyle.label} [${i+1}/${keyIssues.length}] ${issue.eq} (${modeInfo.reason})`]);
+
+          const result = await runIssueDiscussion(issue, modeInfo, kbResult.kb, reportType, allowedAgents, (msg) => {
+            setProgress(p => [...p, `   ${msg}`]);
+          });
+          allDiscussions.push(result);
+          setDiscussions([...allDiscussions]);
+        }
+
+        // 영역 11: 사용자가 체크하지 않은 이슈는 본문 논의 안 함 (LITE 루프 폐기)
+        // 만약 향후 자동 LITE 처리 추가 원하면 여기에 다시 작성 가능
+      }
+
+      // ★ §7-A: 과거 조치이력 자동조회 — 선정 이슈별 병렬 조회 → 각 논의(d.__history)에 부착
+      //    report.discussions = allDiscussions 로 전파되어 화면(DiscussionCard)·HTML(buildPersonaConvHtml) 양쪽에서 렌더
+      setProgress(p => [...p, "🔧 과거 동일이슈 조치이력 조회 중..."]);
+      await Promise.all(allDiscussions.map(async (d) => {
+        try { d.__history = await lookupHistory(d.issue); }
+        catch (e) { d.__history = null; console.error("[이력조회]", d.issue?.eq, e?.message || e); }
+      }));
+      const _histHit = allDiscussions.filter(d => d.__history && d.__history.matched).length;
+      setProgress(p => [...p, `✅ 과거 조치이력 ${_histHit}건 매칭 (미매칭은 패널 생략)`]);
+
+      // 보고서 생성
+      setProgress(p => [...p, "📄 보고서 생성 중..."]);
+      // ★ 영역 8-D: selRange가 있으면 풍부한 라벨 사용, 없으면 기존 방식 폴백
+      const dateStr = (selRange && selRange.start && selRange.end)
+        ? buildRangeLabel(selRange)
+        : (selDates.length > 1 ? `${selDates[0]}~${selDates[selDates.length-1]}` : selDates[0]);
+      const allIssuesForAnalytics = allIssuesFlat;
+
+      // 영역 11: 단일 흐름 — 페르소나 보고서 생성
+      // generateReport는 priority 객체를 기대하지만 평면 배열도 받도록 호환 처리
+      // (우선 평면 배열을 priority 형태로 wrap해서 호환 — 기존 generateReport 시그니처 유지)
+      const priorityCompat = {
+        urgent: keyIssues.filter(i => (i.tags || []).includes("LONG_DOWNTIME")),
+        important: keyIssues.filter(i => (i.tags || []).includes("HIGH_FREQUENCY") && !(i.tags || []).includes("LONG_DOWNTIME")),
+        normal: [],
+      };
+
+      // ★ 영역 11-E + 12-AI1 + 12-AQ: 6번 "가장 주목할 사항" + 7번 "액션 후속 사항" 생성 (Sonnet + Background)
+      setProgress(p => [...p, "💡 6번 인사이트 + 7번 액션 후속 사항 생성 중 (Sonnet · Background, 약 30~60초 소요)..."]);
+      let insightsAndActions = { section6_insights: [], section7_actions: [] };
+      try {
+        // ★ 12-AQ: Background 모드 — 진행 메시지를 setProgress에 노출
+        const onBgProgress = (msg) => setProgress(p => [...p, `   ${msg}`]);
+        // generateInsightsAndActions는 내부에서 console.log만 하므로, 추가 진행 표시는 setProgress 직접 호출
+        // (현재 시그니처 변경 최소화 — onProgress는 console에만 출력, setProgress는 시작/종료만)
+        insightsAndActions = await generateInsightsAndActions(
+          curation, allDiscussions, taggedResult,
+          kbResult.kb["Cell_PE"] || kbResult.kb["Elec_PE"] || "",
+          reportType, categoryMsgs  // ★ AI1: raw 메시지 전달
+        );
+        setProgress(p => [...p, `✅ 인사이트 ${insightsAndActions.section6_insights.length}건 / 액션 ${insightsAndActions.section7_actions.length}건 생성 완료`]);
+      } catch (e) {
+        console.error("[6/7번 생성 실패]", e);
+        setProgress(p => [...p, `⚠️ 6/7번 LLM 생성 실패 — 룰 기반 폴백 사용`]);
+        insightsAndActions = buildFallbackInsightsAndActions(curation, taggedResult);
+      }
+
+      const report = await generateReport(dateStr, selDates, allDiscussions, priorityCompat, reportType, kbResult.kb, allIssuesForAnalytics, selectedProcess, curation);
+      // ★ 보고서에 공정/참여 에이전트 정보 추가
+      report.process = selectedProcess;
+      report.allowedAgents = allowedAgents;
+      report.range = selRange;  // 영역 8: 보고서에 범위 정보 보존
+      report.tagged = taggedResult;  // 영역 9: 5-카테고리 결과 보존
+      // ★ 영역 11-E: 6/7번 결과 보존
+      report.insights = insightsAndActions.section6_insights;
+      report.actions = insightsAndActions.section7_actions;
+      report.curation = curation;  // 메인 페이지에서 1~5번 표시 위해
+      report.discussions = allDiscussions;  // ★ Phase 2: 페르소나 매칭용
+      setMinutes(report);
+      // ★ 큐 #15 Phase 3 검증용: 콘솔에서 compareAndLogGaps 호출 시 사용
+      if (typeof window !== "undefined") window._latestReport = report;
+
+      // ★ 큐 #15 Phase 4/5c: 자동 비교 (일일 레포트만, 비동기 — 화면 흐름 안 막음)
+      setAutoCompareStatus(null);  // 새 레포트 — 이전 비교 상태 초기화
+      runAutoCompare(report, selDates, selectedProcess, setProgress, {
+        setStatus: setAutoCompareStatus,
+        refreshBadge: refreshUpdateBadge,
+      }).catch(e => console.error("[큐 #15 자동비교] 예외:", e));
+
+      // 시트 저장 — 영역 12-X5 (3): 새 4축 필드 + 페르소나 say 통합 컬럼
+      setProgress(p => [...p, "💾 구글 시트 저장 중..."]);
+
+      // 사회자 4축 합의 + say 통합 (DEEP/STANDARD/LITE)
+      const buildSheetSummary = (group, mode) => {
+        return (group || []).map(d => {
+          const m = d.moderator || {};
+          const eq = d.issue?.eq || "?";
+          // 4축 합의 (있으면 우선)
+          const axes = [
+            m["근본원인_합의"] && `근본원인:${m["근본원인_합의"].slice(0, 60)}`,
+            m["조치안_평가_합의"] && `조치평가:${m["조치안_평가_합의"].slice(0, 60)}`,
+            m["개선안_합의"] && `개선:${m["개선안_합의"].slice(0, 60)}`,
+            m["재발방지책_합의"] && `재발방지:${m["재발방지책_합의"].slice(0, 60)}`,
+          ].filter(Boolean).join(" / ");
+          // 4축 없으면 옛 호환
+          const fallback = m.consensus || m.summary || m.supplement || "-";
+          return `[${eq}] ${axes || fallback}`;
+        }).join(" || ");
+      };
+
+      const deepSummary = buildSheetSummary(report.grouped?.DEEP, "DEEP");
+      const stdSummary = buildSheetSummary(report.grouped?.STANDARD, "STANDARD");
+      const liteSummary = buildSheetSummary(report.grouped?.LITE, "LITE");
+
+      // 페르소나 say 발언 통합 (모든 discussion에서 say 추출)
+      const personaSayCombined = (allDiscussions || []).map(d => {
+        const eq = d.issue?.eq || "?";
+        const says = (d.opinions || []).map(o => {
+          const p = PERSONAS[o.persona]?.label || o.persona;
+          const say = (o.opinion?.say || o.opinion?.근본원인 || "").slice(0, 100);
+          return say ? `${p}: ${say}` : null;
+        }).filter(Boolean).join(" | ");
+        return says ? `[${eq}] ${says}` : null;
+      }).filter(Boolean).join(" || ").slice(0, 1500);
+
+      const saved = await saveToSheets({
+        date: dateStr,
+        agenda: `[${selectedProcess} 공정] ${report.agenda}`,
+        issue_summary: `5-카테고리 LD${taggedResult.counts.LONG_DOWNTIME}/HF${taggedResult.counts.HIGH_FREQUENCY}/CC${taggedResult.counts.CONDITION_CHANGE}/TP${taggedResult.counts.TEST_PM}/QN${taggedResult.counts.QUALITY_NG} | 본문논의 ${keyIssues.length}건 (자동 ${autoCount} + 사용자 추가 ${manualCount}) | DEEP${report.grouped.DEEP.length} STANDARD${report.grouped.STANDARD.length} LITE${report.grouped.LITE.length}`,
+        pe_opinion: deepSummary.slice(0, 800),  // 4축 통합 (이전 500 → 800 확대)
+        me_opinion: stdSummary.slice(0, 800),
+        te_opinion: liteSummary.slice(0, 500),
+        discussion: personaSayCombined,  // ★ 페르소나 say 통합 (영역 12-X5)
+        action_items: (report.actions || []).map(a => `[${a.priority}] ${a.action}`).join(" | ").slice(0, 800),  // 7번 액션
+        minutes_full: JSON.stringify({
+          process: selectedProcess,
+          agents: allowedAgents,
+          analytics: report.analytics,
+          modeStats: { DEEP: report.grouped.DEEP.length, STANDARD: report.grouped.STANDARD.length, LITE: report.grouped.LITE.length },
+          tagged: taggedResult.counts,
+          insightsCount: (report.insights || []).length,
+          actionsCount: (report.actions || []).length,
+        }).slice(0, 1500),
+      });
+      setSheetSaved(saved);
+      setStep(4);
+      setProgress(p => [...p, "✅ 완료!"]);
+
+    } catch(e) { setError(e.message); }
+    finally {
+      setRunning(false);
+      // ★ 영역 12-AZ-8: Wake Lock 해제 + 리스너 정리
+      document.removeEventListener("visibilitychange", handleVisibilityChange);
+      if (wakeLock !== null) {
+        try {
+          await wakeLock.release();
+          wakeLock = null;
+          console.log("[12-AZ-8] Wake Lock 명시적 해제 (보고서 생성 종료)");
+        } catch (e) {
+          console.warn("[12-AZ-8] Wake Lock 해제 실패:", e?.message);
+        }
+      }
+    }
+  };
+
+  // ─── ★ 영역 12-AK: Teams 자동송부 인프라 (Phase E 사양 14.5 / 14.3 / 14.4) ────────
+  // α: 수동 버튼 (Phase B/C/D 독립 — 즉시 동작)
+  // β: 알람 룰 4종 골격 (Phase B 후 활성화)
+  // γ: 일일 레포트 골격 (Phase D 후 활성화)
+  // 보안: Webhook URL은 클라이언트 미보유 — Apps Script Properties Service 경유
+
+  // 12-AK-1: 메인 레포트 → 단순 텍스트 변환 (Q3=a, 최소 변환)
+  // 12-AS-1: 메인 레포트 → 구조화된 페이로드 객체 (옵션 3 풀 디자인용)
+  // 이전 12-AK-1 reportToTeamsText는 텍스트 한 덩어리 → 12-AS에서 객체로 변경
+  const reportToTeamsPayload = () => {
+    if (!minutes) return null;
+    const cur = minutes.curation || {};
+    const insights = minutes.insights || [];
+    const actions = minutes.actions || [];
+    const tagged = minutes.tagged || { issues: [], counts: {} };
+    const issuesCount = (tagged.issues || []).length;
+    // ★ 큐 #19 ③: 30분+ full stop 강제 편입 — LLM 큐레이션(cur.longDowntime)이 빠뜨린 30분+ 건을 룰로 보강
+    // (예: 5/21 STK-1-D4 92분, 5/20 STK-3-D6 33분, 5/19 FI-4-1/MAG-2-A 55분 — LLM이 longDowntime에 안 담은 누락분)
+    const _normLongKey = (eq, dur) => `${String(eq || "").toUpperCase().replace(/\s/g, "")}|${Number(dur) || 0}`;
+    const _curLong30 = (cur.longDowntime || []).filter(it => Number(it.duration || it.durMin || 0) >= 30);
+    const _curLongKeys = new Set((cur.longDowntime || []).map(it => _normLongKey(it.equipment || it.eq, it.duration || it.durMin)));
+    const _ruleLong30 = (tagged.issues || [])
+      .filter(it => Number(it.durMin || it.duration || 0) >= 30)
+      .filter(it => !_curLongKeys.has(_normLongKey(it.eq || it.equipment, it.durMin || it.duration)))
+      // 룰 보강분 내부 (eq+dur) 중복 제거 (dedup으로 대부분 제거되나 방어)
+      .filter((it, idx, arr) => arr.findIndex(x => _normLongKey(x.eq || x.equipment, x.durMin || x.duration) === _normLongKey(it.eq || it.equipment, it.durMin || it.duration)) === idx);
+    const long30 = [..._curLong30, ..._ruleLong30];
+    if (_ruleLong30.length > 0) console.log(`[generateReport] ★ 30분+ 룰 보강 ${_ruleLong30.length}건: ${_ruleLong30.map(x => (x.eq || x.equipment) + "(" + (x.durMin || x.duration) + "분)").join(", ")}`);
+
+    // TOP 5 (score 기준)
+    const scoredIssues = (tagged.issues || [])
+      .filter(it => typeof it.score === "number")
+      .sort((a, b) => b.score - a.score)
+      .slice(0, 5)
+      .map((it, i) => ({
+        rank: i + 1,
+        score: it.score,
+        equipment: it.eq || it.equipment || "?",
+        problem: (it.problem || it.text || "").slice(0, 80),
+        durationMin: it.durMin || it.duration || 0,
+      }));
+
+    // 인사이트 5개로 truncate (Q5=a)
+    const trimmedInsights = insights.slice(0, 5).map((ins, i) => {
+      if (typeof ins === "string") {
+        return { rank: i + 1, title: ins.slice(0, 80), bulletPoints: [], confidence: "", evidence: "" };
+      }
+      return {
+        rank: i + 1,
+        title: (ins.title || "").slice(0, 100),
+        bulletPoints: (ins.bulletPoints || []).slice(0, 3).map(bp => String(bp || "").slice(0, 200)),
+        confidence: ins.confidence || "",
+        evidence: (ins.evidence || "").slice(0, 80),
+      };
+    });
+
+    // 액션 7개로 truncate, P0 우선 (Q5=a)
+    const sortedActions = [...actions].sort((a, b) => {
+      const order = { P0: 0, P1: 1, P2: 2 };
+      return (order[a.priority] ?? 9) - (order[b.priority] ?? 9);
+    });
+    const trimmedActions = sortedActions.slice(0, 7).map(a => ({
+      priority: a.priority || "P2",
+      action: (a.action || "").slice(0, 100),
+      context: (a.context || "").slice(0, 60),
+    }));
+
+    return {
+      title: minutes.title || "AZS Factory 일일 이슈 레포트",
+      date: minutes.date || "",
+      summary_text: (cur.summary_text || "").slice(0, 400),
+      criticalSummary: (cur.criticalSummary || []).slice(0, 4).map(s => String(s).slice(0, 200)),
+      stats: {
+        totalIssues: issuesCount,
+        longDowntime30: long30.length,
+        recurringCategories: (cur.recurringByCategory || []).length,
+        conditionChangeGroups: (cur.conditionChangeGroups || []).length,
+      },
+      topIssues: scoredIssues,
+      insights: trimmedInsights,
+      actions: trimmedActions,
+      sentAt: new Date().toLocaleString("ko-KR"),
+    };
+  };
+
+  // 옛 텍스트 함수 호환 (deprecated — 향후 제거 가능)
+  // eslint-disable-next-line no-unused-vars
+  const reportToTeamsText = () => {
+    const p = reportToTeamsPayload();
+    if (!p) return "";
+    const lines = [];
+    lines.push(`📊 ${p.title}\n📅 ${p.date}\n`);
+    if (p.summary_text) lines.push(`📋 핵심 요약\n${p.summary_text}\n`);
+    if (p.topIssues.length > 0) {
+      lines.push(`🚨 핵심 이슈 TOP ${p.topIssues.length}`);
+      p.topIssues.forEach(it => lines.push(`${it.rank}. [${it.score}점] ${it.equipment} — ${it.problem} (${it.durationMin}분)`));
+    }
+    return lines.join("\n");
+  };
+
+  // 12-AK-2: Teams 발송 핸들러 (Apps Script proxy POST)
+  const [teamsSending, setTeamsSending] = useState(false);
+  const [teamsResult, setTeamsResult] = useState(null);  // {ok, msg}
+  const sendToTeams = async () => {
+    if (!minutes || teamsSending) return;
+    const APPS_SCRIPT_URL = import.meta.env.VITE_APPS_SCRIPT_URL || "";
+    const SHARED_SECRET = import.meta.env.VITE_TEAMS_SHARED_SECRET || "";
+    if (!APPS_SCRIPT_URL) {
+      setTeamsResult({ ok: false, msg: "VITE_APPS_SCRIPT_URL 환경변수 미설정 — SETUP.md 참조" });
+      setTimeout(() => setTeamsResult(null), 5000);
+      return;
+    }
+    setTeamsSending(true);
+    setTeamsResult(null);
+    try {
+      // 12-AS: 구조화된 payload (Apps Script가 6섹션 Adaptive Card로 변환)
+      const reportData = reportToTeamsPayload();
+      if (!reportData) {
+        setTeamsResult({ ok: false, msg: "❌ 레포트 데이터 없음" });
+        setTeamsSending(false);
+        setTimeout(() => setTeamsResult(null), 5000);
+        return;
+      }
+
+      // ★ 12-BE: HTML 문자열 생성 (Drive 적재용)
+      let htmlString = null;
+      try {
+        htmlString = downloadHtml(true);  // returnOnly 모드
+      } catch (htmlErr) {
+        console.error("[12-BE] HTML 생성 실패:", htmlErr);
+        // HTML 생성 실패해도 발송은 진행 (단순 카드만 발송, Drive 적재 스킵)
+      }
+
+      const payload = {
+        action: "send_report",
+        secret: SHARED_SECRET,
+        version: "v3",  // ★ 12-AS: 구조화 payload 버전 (Apps Script가 v3 인식 시 풀 디자인 사용)
+        report: reportData,
+        // ★ 12-BE (γ 단계1): HTML 문자열 + 보고서 종류 — Apps Script가 Drive 적재 후 카드에 링크 추가
+        html: htmlString,
+        reportType: minutes.reportType || "daily",
+        // 옛 호환 필드 (Apps Script가 v3 미인식 시 fallback)
+        title: reportData.title,
+        date: reportData.date,
+        text: reportToTeamsText(),
+        meta: {
+          issuesCount: reportData.stats.totalIssues,
+          insightsCount: reportData.insights.length,
+          actionsCount: reportData.actions.length,
+        },
+      };
+      const res = await fetch(APPS_SCRIPT_URL, {
+        method: "POST",
+        // Apps Script Web App: text/plain로 전송 (CORS preflight 우회)
+        headers: { "Content-Type": "text/plain;charset=utf-8" },
+        body: JSON.stringify(withAuthBody(payload)),
+      });
+      const data = await res.json().catch(() => ({}));
+      if (res.ok && data.ok) {
+        // ★ 12-BE: Drive URL 받으면 토스트에 포함
+        const driveMsg = data.driveUrl
+          ? `✅ Drive 저장 + Teams 발송 완료`
+          : `✅ Teams 채널에 발송 완료${htmlString ? " (Drive 저장 실패)" : ""}`;
+        setTeamsResult({ ok: true, msg: driveMsg, driveUrl: data.driveUrl || null });
+      } else {
+        setTeamsResult({ ok: false, msg: `❌ 발송 실패: ${data.error || res.status}` });
+      }
+    } catch (e) {
+      setTeamsResult({ ok: false, msg: `❌ 네트워크 오류: ${e?.message || e}` });
+    } finally {
+      setTeamsSending(false);
+      setTimeout(() => setTeamsResult(null), 8000);  // Drive URL 확인 시간 위해 6 → 8초
+    }
+  };
+
+  // 12-AK-3: 알람 룰 4종 골격 (β — Phase B 실시간 데이터 후 활성화)
+  // 입력: 신규 메시지 1건 + 현재 누적 부동 상태
+  // 출력: 발송할 알람 텍스트 배열 (없으면 빈 배열)
+  // eslint-disable-next-line no-unused-vars
+  const evaluateAlarmRules = (msg, contextState = {}) => {
+    if (!msg || typeof msg.text !== "string") return [];
+    const alarms = [];
+    const text = msg.text.toLowerCase();
+
+    // 룰 1: 안전·환경 키워드
+    const SAFETY_KEYWORDS = ["위험", "사고", "fire", "환경", "safety", "danger", "emergency", "injury"];
+    if (SAFETY_KEYWORDS.some(kw => text.includes(kw))) {
+      alarms.push({ rule: "safety", level: "🚨", text: `🚨 안전·환경 키워드 감지\n${msg.text.slice(0, 300)}` });
+    }
+    // 룰 2: 장기부동 60분↑
+    const dur = Number(msg.durMin || msg.duration || 0);
+    if (dur >= 60) {
+      alarms.push({ rule: "long_downtime", level: "🚨", text: `🚨 장기부동 ${dur}분\n${msg.equipment || "?"} — ${msg.problem || msg.text}` });
+    }
+    // 룰 3: Full Stop
+    if (/full[\s_]?stop/i.test(msg.text)) {
+      alarms.push({ rule: "full_stop", level: "🚨", text: `🚨 Full Stop 발생\n${msg.text.slice(0, 300)}` });
+    }
+    // 룰 4: 점수 임계값 (잠정 20, Phase E 시작 시 시뮬레이션 후 확정)
+    const SCORE_THRESHOLD = 20;
+    if (typeof msg.score === "number" && msg.score >= SCORE_THRESHOLD) {
+      alarms.push({ rule: "high_score", level: "🚨", text: `🚨 고위험 점수 ${msg.score}점\n${msg.equipment || "?"} — ${msg.problem || msg.text}` });
+    }
+    return alarms;
+  };
+
+  // 12-AK-4: 일일 레포트 텍스트 변환 (γ — Phase D Sheets 데이터 후 활성화)
+  // cron 07:00 호출용 — Apps Script 측에서 자체 분석 후 호출하므로 이 함수는 React 측 미호출
+  // 골격만 유지 (스펙 가이드 역할)
+  // eslint-disable-next-line no-unused-vars
+  const composeDailyReport = (analysisResult) => {
+    // analysisResult: Phase D에서 Sheets 조회 후 분석한 결과 (현재 minutes와 동일 구조 가정)
+    // 향후 Apps Script 또는 Netlify Function이 React 분석 로직을 호출 → 이 함수에 주입 → 텍스트 반환
+    if (!analysisResult) return "";
+    // 임시: reportToTeamsText와 동일 로직 재사용 가능 (Phase D 시점에 분기)
+    return "[Phase D 후 활성화] 일일 레포트 자동 생성 골격";
+  };
+
+  // ─── ★ 영역 11-H: HTML 다운로드 (메인 1~7번) ──────────────────────────────────
+  // ★ 12-BE: returnOnly=true 면 HTML 문자열만 반환 (다운로드 X)
+  // sendToTeams에서 html을 payload에 포함시키기 위함
+  const downloadHtml = (returnOnly = false) => {
+    if (!minutes) return null;
+    const title = minutes.title || "AZS Factory 일일 이슈 레포트";
+    const cur = minutes.curation || {};
+    const insights = minutes.insights || [];
+    const actions = minutes.actions || [];
+    const periodLabel = minutes.date || "";
+    const tagged = minutes.tagged || { issues: [], counts: {} };
+    const issuesCount = (tagged.issues || []).length;
+
+    // 헬퍼: HTML 이스케이프
+    const esc = (s) => String(s || "").replace(/&/g, "&amp;").replace(/</g, "&lt;").replace(/>/g, "&gt;").replace(/"/g, "&quot;");
+
+    // ★ 영역 12-AL: 중복 제거 — 동일 discussion이 여러 섹션에 표시되지 않도록 Set으로 추적
+    // 우선순위: 1번 장기부동 > 2번 큰 그룹 > 2번 작은 그룹 > 3,4번 영역 > 5번 품질 NG > 7번 액션
+    const printedDiscussionIds = new Set();
+    const discussionIdOf = (d) => {
+      if (!d || !d.issue) return null;
+      const eq = d.issue.eq || "?";
+      const dur = d.issue.durMin || 0;
+      const text = (d.issue.problem || d.issue.text || "").slice(0, 30);
+      return `${eq}|${dur}|${text}`;
+    };
+    const isAlreadyPrinted = (d) => {
+      const id = discussionIdOf(d);
+      return id && printedDiscussionIds.has(id);
+    };
+    const markPrinted = (d) => {
+      const id = discussionIdOf(d);
+      if (id) printedDiscussionIds.add(id);
+    };
+
+    // ★ Phase 2: 페르소나 대화 HTML 생성 헬퍼 (좌우 번갈아 + 색상 + 인용구 + 사회자 종합)
+    // 12-AL: 표시 즉시 markPrinted 호출 → 중복 표시 방지
+    const buildPersonaConvHtml = (matched) => {
+      if (!matched) return "";
+      markPrinted(matched);  // ★ 12-AL: 표시 추적
+      const opinions = matched.opinions || [];
+      const m = matched.moderator || {};
+      const mode = matched.modeInfo?.mode || "?";
+
+      // 입장 색상
+      const stanceColors = {
+        "동의": "#27ae60", "부분동의": "#d68910", "반대": "#c0392b",
+        "추가의견": "#7c3aed", "초기분석": "#2980b9",
+      };
+      const stanceBg = {
+        "동의": "rgba(39,174,96,0.15)", "부분동의": "rgba(214,137,16,0.15)",
+        "반대": "rgba(192,57,43,0.15)", "추가의견": "rgba(124,58,237,0.15)",
+        "초기분석": "rgba(41,128,185,0.15)",
+      };
+
+      // 메시지 (좌우 번갈아)
+      const messages = opinions.map((o, idx) => {
+        const p = PERSONAS[o.persona] || {};
+        const op = o.opinion || {};
+        const isLeft = idx % 2 === 0;
+        const stance = op.stance || "초기분석";
+        const sayText = op.say || op.근본원인 || "(발언 데이터 없음)";
+        const quote = op.quote || op.previous_reference || "";
+        const replyTo = op.reply_to || "";
+        const stanceColor = stanceColors[stance] || "#7f8c8d";
+        const stanceBgColor = stanceBg[stance] || "rgba(127,140,141,0.15)";
+        const personaColor = p.color || "#7f8c8d";
+        const personaBgColor = p.bg || "rgba(127,140,141,0.15)";
+
+        const align = isLeft ? "flex-start" : "flex-end";
+        const flexDir = isLeft ? "row" : "row-reverse";
+        const radius = isLeft ? "4px 14px 14px 14px" : "14px 4px 14px 14px";
+
+        const nameLabels = `
+          <span style="font-weight:700;color:${personaColor};">${esc(p.label || o.persona)}</span>
+          <span style="font-size:0.85em;padding:1px 6px;border-radius:8px;background:${stanceBgColor};color:${stanceColor};font-weight:700;">${esc(stance)}</span>
+          ${replyTo ? `<span style="font-size:0.85em;padding:1px 6px;border-radius:8px;background:#ecf0f1;color:#7f8c8d;">↩ ${esc(replyTo)}</span>` : ""}
+        `;
+
+        const bubbleContent = `
+          ${quote ? `<div style="font-size:0.85em;font-style:italic;padding:4px 10px;margin-bottom:6px;border-left:3px solid rgba(0,0,0,0.3);background:rgba(0,0,0,0.18);border-radius:0 8px 8px 0;color:rgba(255,255,255,0.85);">"${esc(quote)}"</div>` : ""}
+          <div>${esc(sayText)}</div>
+        `;
+
+        return `
+        <div style="display:flex;flex-direction:${flexDir};margin-bottom:14px;gap:8px;justify-content:${align};">
+          <div style="flex-shrink:0;width:38px;height:38px;border-radius:50%;display:flex;align-items:center;justify-content:center;font-size:18px;font-weight:700;background:${personaBgColor};color:${personaColor};">
+            ${esc(p.icon || "?")}
+          </div>
+          <div style="max-width:70%;text-align:${isLeft ? "left" : "right"};">
+            <div style="font-size:0.8em;margin-bottom:4px;display:flex;gap:6px;align-items:center;justify-content:${isLeft ? "flex-start" : "flex-end"};flex-wrap:wrap;">
+              ${nameLabels}
+            </div>
+            <div style="padding:10px 14px;border-radius:${radius};font-size:0.92em;line-height:1.6;background:${personaColor};color:white;text-align:left;">
+              ${bubbleContent}
+            </div>
+          </div>
+        </div>`;
+      }).join("");
+
+      // 사회자 종합
+      const modParts = [];
+      if (m["근본원인_합의"]) modParts.push(`<div style="margin:5px 0;"><b style="color:#c0392b;display:inline-block;min-width:130px;">🎯 근본원인 합의:</b> ${esc(m["근본원인_합의"])}</div>`);
+      if (m["조치안_평가_합의"]) modParts.push(`<div style="margin:5px 0;"><b style="color:#e67e22;display:inline-block;min-width:130px;">⚖️ 조치안 평가:</b> ${esc(m["조치안_평가_합의"])}</div>`);
+      if (m["개선안_합의"]) modParts.push(`<div style="margin:5px 0;"><b style="color:#2980b9;display:inline-block;min-width:130px;">💡 개선안 합의:</b> ${esc(m["개선안_합의"])}</div>`);
+      if (m["재발방지책_합의"]) modParts.push(`<div style="margin:5px 0;"><b style="color:#27ae60;display:inline-block;min-width:130px;">🛡️ 재발방지책:</b> ${esc(m["재발방지책_합의"])}</div>`);
+      if (m["충돌점"] && m["충돌점"] !== "없음") modParts.push(`<div style="margin:5px 0;"><b style="color:#c0392b;display:inline-block;min-width:130px;">⚠️ 충돌점:</b> ${esc(m["충돌점"])}</div>`);
+      if (m["추가_논의_필요"] && m["추가_논의_필요"] !== "없음") modParts.push(`<div style="margin:5px 0;"><b style="color:#e67e22;display:inline-block;min-width:130px;">🔍 추가 논의:</b> ${esc(m["추가_논의_필요"])}</div>`);
+      if (Array.isArray(m.actions) && m.actions.length > 0) {
+        const actsHtml = m.actions.map(a => `<li><b>[${esc(a.priority || "-")}]</b> ${esc(a.action || "")} <span style="color:#666;">(${esc(a.owner || "-")} / ${esc(a.duration || "-")})</span></li>`).join("");
+        modParts.push(`<div style="margin-top:8px;"><b style="color:#2980b9;">📋 액션 플랜:</b><ul style="margin:4px 0;padding-left:20px;">${actsHtml}</ul></div>`);
+      }
+      if (m.consensus) modParts.push(`<div style="margin-top:10px;padding-top:8px;border-top:1px solid rgba(124,58,237,0.2);font-style:italic;color:#7c3aed;">💬 ${esc(m.consensus.slice(0, 200))}</div>`);
+
+      return `
+        <details style="margin-top:12px;padding-top:12px;border-top:1px dashed #bbb;">
+          <summary style="cursor:pointer;padding:6px 10px;background:rgba(124,58,237,0.08);border:1px solid rgba(124,58,237,0.25);border-radius:6px;font-weight:700;color:#7c3aed;">
+            💬 페르소나 논의 (${opinions.length}명 발언) · ${esc(mode)} 모드 · 사회자 종합 포함
+          </summary>
+          <div style="padding:14px 4px;">
+            ${messages}
+          </div>
+          <div style="margin-top:12px;padding:14px 18px;background:rgba(124,58,237,0.08);border:1px solid rgba(124,58,237,0.3);border-left:5px solid #7c3aed;border-radius:8px;">
+            <div style="color:#7c3aed;font-weight:700;margin-bottom:8px;">📋 사회자 종합 (${esc(mode)})</div>
+            ${modParts.join("")}
+          </div>
+        </details>
+        ${buildHistoryPanelHtml(matched.__history)}
+      `;
+    };
+
+    // discussions 매칭 헬퍼 (downloadHtml 안에서 사용)
+    const findMatchingDiscForCuration = (item) => {
+      const ds = minutes.discussions || [];
+      if (!item || !item.equipment) return null;
+      let m = ds.find(d => d.issue?.eq === item.equipment && item.durationMin && Math.abs((d.issue?.durMin || 0) - item.durationMin) < 5);
+      if (m) return m;
+      return ds.filter(d => d.issue?.eq === item.equipment).sort((a, b) => (b.issue?.durMin || 0) - (a.issue?.durMin || 0))[0] || null;
+    };
+
+    // 1번 장기부동 박스 — 영역 12-Y1: 새 필드 (splitDetail, recurrenceGap, collateralDamage, historyPattern, actionAnalysis)
+    // ★ 큐 #19 ③: 30분+ full stop 강제 편입 — LLM 큐레이션(cur.longDowntime)이 누락한 30분+ 건을 룰로 보강
+    // (예: 5/21 STK-1-D4 92분, 5/20 STK-3-D6 33분, 5/19 FI-4-1/MAG-2-A 55분)
+    const _normLongKey = (eq, dur) => `${String(eq || "").toUpperCase().replace(/\s/g, "")}|${Number(dur) || 0}`;
+    const _curLongKeys = new Set((cur.longDowntime || []).map(it => _normLongKey(it.equipment || it.eq, it.duration || it.durMin)));
+    const _ruleLong30 = (tagged.issues || [])
+      .filter(it => Number(it.durMin || it.duration || 0) >= 30)
+      .filter(it => !_curLongKeys.has(_normLongKey(it.eq || it.equipment, it.durMin || it.duration)))
+      .filter((it, idx, arr) => arr.findIndex(x => _normLongKey(x.eq || x.equipment, x.durMin || x.duration) === _normLongKey(it.eq || it.equipment, it.durMin || it.duration)) === idx);
+    if (_ruleLong30.length > 0) console.log(`[downloadHtml] ★ 30분+ 룰 보강 ${_ruleLong30.length}건: ${_ruleLong30.map(x => (x.eq || x.equipment) + "(" + (x.durMin || x.duration) + "분)").join(", ")}`);
+    const ruleLong30Html = _ruleLong30.map(it => {
+      const _eq = it.eq || it.equipment || "?";
+      const _dur = it.durMin || it.duration || 0;
+      const _prob = String(it.prob || it.problem || it.text || "").replace(/\n/g, " ").slice(0, 140);
+      const _cause = String(it.cause || "").replace(/\n/g, " ").slice(0, 140);
+      const _occ = String(it.occurredAt || "").replace(/\n/g, " ").slice(0, 40);  // ★ 큐 #19 ④: 발생시각
+      return `
+      <div class="critical" style="border-left-color:#e67e22;">
+        <h3 style="margin-top:0;">🟠 ${esc(_eq)} — ${_dur}분 <span style="font-size:0.62em;font-weight:700;color:#e67e22;background:#fff3e0;padding:1px 8px;border-radius:8px;margin-left:6px;vertical-align:middle;">룰 보강</span></h3>
+        ${_occ ? `<p style="margin:4px 0;font-size:0.9em;color:#555;"><b>발생:</b> ${esc(_occ)} <span style="color:#999;font-size:0.92em;">(본문 Start Time)</span></p>` : ""}
+        <p style="margin:4px 0;"><b>문제:</b> ${esc(_prob) || "-"}</p>
+        ${_cause ? `<p style="margin:4px 0;color:#666;"><b>원인:</b> ${esc(_cause)}</p>` : ""}
+        <p style="font-size:0.84em;color:#999;margin:6px 0 0;">※ LLM 큐레이션이 누락한 30분+ full stop — 룰로 자동 편입 (페르소나 논의 없음)</p>
+      </div>`;
+    }).join("");
+
+    // ★ 큐 #19 ⑦: 큐레이션 진단 배지 (HTML 생성만 — GapLog 적재는 generateReport 본체 async에서 수행)
+    let curationBadge = "";
+    {
+      const _diags = (cur && cur._diagnostics) || [];
+      if (_diags.length > 0) {
+        const _fatal = _diags.filter(d => d.fatal);
+        const _parts = [...new Set(_diags.map(d => d.part))].join(", ");
+        const _types = [...new Set(_diags.map(d => d.errorType))].join(", ");
+        if (_fatal.length > 0) {
+          curationBadge = `<div style="background:#fff5f5;border:2px solid #c0392b;border-radius:6px;padding:10px 14px;margin:0 0 14px;color:#c0392b;font-weight:600;">⚠️ 이 레포트는 LLM 큐레이션 일부 실패로 <b>룰 백업</b>이 사용되었습니다 — 심층 분석(주목 패턴·품질 추세 등)이 누락되어 정밀도가 낮을 수 있습니다.<br><span style="font-weight:400;font-size:0.88em;">실패 Part: ${esc(_parts)} / 유형: ${esc(_types)}</span></div>`;
+        } else {
+          curationBadge = `<div style="background:#fffaf0;border:1px solid #e67e22;border-radius:6px;padding:8px 12px;margin:0 0 14px;color:#b9770e;font-size:0.9em;">ℹ️ 큐레이션 중 일부 Part가 Haiku fallback/부분복구로 처리됨 (${esc(_parts)}). 결과는 정상 생성되었으나 품질이 평소보다 낮을 수 있습니다.</div>`;
+        }
+      }
+    }
+
+    // ★ 큐 #19 ⑧(재작업): 전극 조각 미회수 별도 노출 — cur.fragmentLost(품질 메시지에서 직접 추출)
+    // crack은 BM downtime이 아니라 품질 메시지(image caption)라 tagged.issues에 없음 → curation.fragmentLost 사용
+    const _fragList = (cur.fragmentLost || []);
+    let fragmentLostHtml = "";
+    if (_fragList.length > 0) {
+      const _fragItems = _fragList.slice(0, 15).map(it => {
+        const _m = esc(String(it.machine || "?").slice(0, 30));
+        const _ph = esc(String(it.phenomenon || "").slice(0, 60));
+        const _r = esc(String(it.result || "").slice(0, 80));
+        const _t = it.time ? ` <span style="color:#999;">(${esc(String(it.time).slice(0, 20))})</span>` : "";
+        return `<li><b>${_m}</b>${_t}${_ph ? ` — ${_ph}` : ""}${_r ? `: <span style="color:#8e44ad;">${_r}</span>` : ""}</li>`;
+      }).join("");
+      fragmentLostHtml = `
+      <div class="critical" style="border-left-color:#8e44ad;background:#faf5ff;">
+        <h3 style="margin-top:0;">⚠️ 전극 조각 미회수 — 혼입 의심 (${_fragList.length}건)</h3>
+        <p style="margin:4px 0;">전극 크랙 후 조각이 회수되지 않은(미회수) 케이스입니다. 후공정 셀 혼입 가능성이 있어 <b>안전·품질 확인</b>이 필요합니다.</p>
+        <ul style="margin:6px 0 0;line-height:1.7;">${_fragItems}</ul>
+      </div>`;
+    }
+
+    const longDowntimeHtml = (cur.longDowntime || []).map((d) => {
+      const matchedDisc = findMatchingDiscForCuration(d);
+      const personaConvHtml = buildPersonaConvHtml(matchedDisc);
+
+      // 분할 보고 정밀 분석
+      // ★ 12-BB2: 방어 코드 — LLM이 다른 필드명(차수/분/시간 등)으로 응답해도 자동 매핑
+      const _normalizeSplit = (sd) => ({
+        order: sd.order ?? sd.차수 ?? sd.idx ?? sd.no ?? sd.seq ?? "?",
+        duration: sd.duration ?? sd.분 ?? sd.durationMin ?? sd.dur ?? sd.minutes ?? "?",
+        time: sd.time ?? sd.시간 ?? sd.timeRange ?? sd.startTime ?? "",
+        gapMin: sd.gapMin ?? sd.gap ?? sd.간격 ?? null,
+        description: sd.description ?? sd.desc ?? sd.설명 ?? sd.note ?? "",
+      });
+      const splitDetailHtml = (d.splitDetail || []).length > 0 ? `
+        <div style="margin-top:8px;padding:8px 12px;background:#fffbe6;border-left:3px solid #fbbf24;border-radius:4px;">
+          <div style="font-weight:700;color:#d97706;margin-bottom:4px;">📊 분할 보고 분석</div>
+          ${d.splitDetail.map(rawSd => {
+            const sd = _normalizeSplit(rawSd);
+            return `
+            <div style="font-size:0.92em;margin-bottom:3px;padding-left:8px;">
+              <b style="color:#e67e22;">${sd.order}차</b> — <b>${sd.duration}분</b> (${esc(String(sd.time))})
+              ${sd.gapMin ? `<span style="color:#c0392b;margin-left:6px;font-weight:700;">· 1차 후 ${sd.gapMin}분만에 재발</span>` : ""}
+              ${sd.description ? `<div style="margin-top:1px;color:#666;">→ ${esc(String(sd.description))}</div>` : ""}
+            </div>
+          `;}).join("")}
+        </div>
+      ` : "";
+
+      // 재발 간격 (단독)
+      const recurrenceGapHtml = (d.recurrenceGap && !(d.splitDetail || []).length) ? `
+        <div style="margin-top:6px;padding:6px 10px;background:#fffbe6;border-left:3px solid #fbbf24;border-radius:4px;color:#d97706;font-weight:700;">
+          ⏱️ ${esc(d.recurrenceGap)}
+        </div>
+      ` : "";
+
+      // 이력 패턴
+      const historyPatternHtml = d.historyPattern ? `
+        <div style="margin-top:6px;padding:6px 10px;background:#f0e6ff;border-left:3px solid #a78bfa;border-radius:4px;font-size:0.92em;">
+          <b style="color:#7c3aed;">🔍 이력 패턴:</b> ${esc(d.historyPattern)}
+        </div>
+      ` : "";
+
+      // 조치 분석
+      const actionAnalysisHtml = d.actionAnalysis ? `
+        <div style="margin-top:6px;padding:6px 10px;background:#fff5f5;border-left:3px solid #c0392b;border-radius:4px;font-size:0.92em;color:#c0392b;font-style:italic;">
+          ⚠️ ${esc(d.actionAnalysis)}
+        </div>
+      ` : "";
+
+      // ★ 영역 12-AW: Escalation Timeline (점수 상위 1건 = isTop에만)
+      // 매칭 critical 가상 issue의 _criticalGroup 멤버를 시간순 sub-table로 표시
+      // 매니저 발신자 → bold + 빨강 강조 (정답 형식)
+      let escalationTimelineHtml = "";
+      if (d.isTop) {
+        const matchedForTimeline = matchedDisc?.issue || null;
+        const groupMembers = (matchedForTimeline && matchedForTimeline._criticalGroup) || [];
+
+        if (groupMembers.length > 0) {
+          // 시간순 정렬
+          const sortedMembers = [...groupMembers].sort((a, b) => {
+            const aH = parseInt((a.time || "0:0").split(":")[0], 10) || 0;
+            const aMin = parseInt((a.time || "0:0").split(":")[1], 10) || 0;
+            const bH = parseInt((b.time || "0:0").split(":")[0], 10) || 0;
+            const bMin = parseInt((b.time || "0:0").split(":")[1], 10) || 0;
+            return (aH * 60 + aMin) - (bH * 60 + bMin);
+          });
+
+          // 매니저 발신자/멘션 강조 헬퍼
+          const isManagerSender = (sender) => {
+            const s = String(sender || "");
+            return KOREAN_MANAGER_NAMES.some(n => s.includes(n));
+          };
+          const isManagerInText = (text) => {
+            const t = String(text || "");
+            return KOREAN_MANAGER_NAMES.some(n => t.includes(n));
+          };
+
+          const rows = sortedMembers.map(m => {
+            const sender = m.sender || "?";
+            const isMgrSender = isManagerSender(sender);
+            const isMgrInText = isManagerInText(m.text);
+            const senderStyle = (isMgrSender || isMgrInText)
+              ? `font-weight:700;color:#c0392b;`
+              : ``;
+            const senderLabel = isMgrSender ? `<b>${esc(sender)}</b>` : esc(sender);
+            const contentText = (m.text || "").replace(/\n/g, " ").slice(0, 120);
+            return `
+              <tr>
+                <td style="white-space:nowrap;">${esc(m.time || "")}</td>
+                <td style="${senderStyle}">${senderLabel}</td>
+                <td>${esc(contentText)}${m.text && m.text.length > 120 ? "..." : ""}</td>
+              </tr>`;
+          }).join("");
+
+          escalationTimelineHtml = `
+            <h4 style="margin-top:12px;">Timeline & 한국 책임 직접 개입</h4>
+            <table>
+              <thead><tr><th style="width:14%;">시간</th><th style="width:24%;">발신</th><th>내용</th></tr></thead>
+              <tbody>${rows}</tbody>
+            </table>`;
+        }
+      }
+
+      return `
+      <div class="${d.isTop ? "critical" : "warning"}">
+        <h3 style="margin-top:0;">${d.isTop ? "🔴 [TOP] " : "🔴 "}${esc(d.title || `${d.equipment} ${d.durationMin}분`)}</h3>
+        <table>
+          <tbody>
+            ${d.occurrence ? `<tr><th style="width:25%;">발생</th><td>${esc(d.occurrence)}</td></tr>` : ""}
+            ${d.alarm ? `<tr><th>알람</th><td><code>${esc(d.alarm)}</code></td></tr>` : ""}
+            ${d.splitNote ? `<tr><th>보고 형태</th><td><b>${esc(d.splitNote)}</b></td></tr>` : ""}
+            ${d.rootCause ? `<tr><th>근본 원인</th><td><b>${esc(d.rootCause)}</b></td></tr>` : ""}
+            ${d.partReplaced ? `<tr><th>부품 교체</th><td><b>${esc(d.partReplaced)}</b></td></tr>` : ""}
+            ${d.collateralDamage ? `<tr><th>부수 피해</th><td><b style="color:#d97706;">${esc(d.collateralDamage)}</b></td></tr>` : ""}
+            ${d.pic ? `<tr><th>PIC</th><td>${esc(d.pic)}</td></tr>` : ""}
+            ${d.result ? `<tr><th>결과</th><td><span class="${(d.result || "").toLowerCase().includes("solved") ? "ok" : "progress"}">${esc(d.result)}</span></td></tr>` : ""}
+          </tbody>
+        </table>
+        ${splitDetailHtml}
+        ${recurrenceGapHtml}
+        ${historyPatternHtml}
+        ${(d.actionSequence || []).length > 0 ? `
+        <h4>적용 조치 (${d.actionSequence.length}단계)</h4>
+        <ol>${d.actionSequence.map(s => `<li>${esc(s)}</li>`).join("")}</ol>` : ""}
+        ${actionAnalysisHtml}
+        ${escalationTimelineHtml}
+        ${personaConvHtml}
+      </div>
+    `;
+    }).join("");
+
+    // ★ 영역 12-Y4: 만성 이슈 별도 섹션 HTML
+    const chronicIssuesHtml = (cur.chronicIssues || []).length > 0 ? `
+      <hr>
+      <h2>🔥 만성 이슈 추적 (별도)</h2>
+      <p class="meta">24시간 이상 open 상태이거나 여러 일자에 걸쳐 반복되는 만성 이슈입니다.</p>
+      ${(cur.chronicIssues).map(c => `
+        <div class="critical">
+          <h3 style="margin-top:0;">⚠️ ${esc(c.title || c.equipment || "")}</h3>
+          <table>
+            <tbody>
+              ${c.startedAt ? `<tr><th style="width:22%;">시작</th><td>${esc(c.startedAt)}</td></tr>` : ""}
+              ${c.currentStatus ? `<tr><th>현재 상태</th><td><b style="color:#d97706;">${esc(c.currentStatus)}</b></td></tr>` : ""}
+              ${c.managerInvolved ? `<tr><th>관련 관리</th><td><b style="color:#c0392b;">${esc(c.managerInvolved)}</b></td></tr>` : ""}
+            </tbody>
+          </table>
+          ${(c.history || []).length > 0 ? `<h4>이력</h4><ul>${c.history.map(h => `<li>${esc(h)}</li>`).join("")}</ul>` : ""}
+        </div>
+      `).join("")}
+    ` : "";
+
+    // ★ 영역 12-Y2: 조건변경 그룹 HTML
+    const conditionChangeGroupsHtml = (cur.conditionChangeGroups || []).length > 0 ? `
+      ${(cur.conditionChangeGroups).map(g => `
+        <h3>${esc(g.title || g.equipment || "")}${g.timeRange ? ` <span style="font-weight:400;color:#666;font-size:0.85em;">(${esc(g.timeRange)}${g.shift ? `, ${esc(g.shift)}` : ""})</span>` : ""}</h3>
+        ${g.picReason ? `<p class="meta">${esc(g.picReason)}</p>` : ""}
+        ${(g.parameters || []).length > 0 ? `
+          <table>
+            <thead><tr><th>파라미터</th><th>Before → After</th></tr></thead>
+            <tbody>
+              ${g.parameters.map(p => `<tr><td>${esc(p.parameter)}</td><td>${esc(p.before)} → <b>${esc(p.after)}</b></td></tr>`).join("")}
+            </tbody>
+          </table>
+        ` : ""}
+        ${g.verification ? `<p>→ <b class="ok">${esc(g.verification)}</b></p>` : ""}
+      `).join("")}
+    ` : "";
+
+    // ★ 영역 12-Y3: 1AB 만성 라인 HTML
+    const chronic1ABHtml = cur.chronic1AB && (cur.chronic1AB.title || (cur.chronic1AB.byEquipment || []).length) ? `
+      <div class="critical" style="margin-top:1em;">
+        <h3 style="margin-top:0;">🔥 ${esc(cur.chronic1AB.title || "Stacking 1-AB Sepa Run Issues (지속 모니터링)")}</h3>
+        ${cur.chronic1AB.patternSummary ? `<p>→ <i>${esc(cur.chronic1AB.patternSummary)}</i></p>` : ""}
+        ${(cur.chronic1AB.byEquipment || []).length > 0 ? `
+          <table>
+            <thead><tr><th>호기</th><th>다발 NG</th></tr></thead>
+            <tbody>
+              ${cur.chronic1AB.byEquipment.map(e => `<tr><td><b>${esc(e.equipment)}</b></td><td class="fail">${esc(e.ngList)}</td></tr>`).join("")}
+            </tbody>
+          </table>
+        ` : ""}
+      </div>
+    ` : "";
+
+    // ★ 영역 12-Y3: Line 3D Cutter CPC HTML
+    const line3DCutterCpcHtml = cur.line3DCutterCpc && cur.line3DCutterCpc.status ? `
+      <div class="info" style="margin-top:1em;">
+        <h4 style="margin-top:0;">📡 Line 3D Cutter CPC 이상 (모니터링)</h4>
+        <p>${esc(cur.line3DCutterCpc.status)}</p>
+        ${(cur.line3DCutterCpc.details || []).length > 0 ? `<ul>${cur.line3DCutterCpc.details.map(d => `<li>${esc(d)}</li>`).join("")}</ul>` : ""}
+      </div>
+    ` : "";
+
+    // ★ 영역 12-X6 (1) → 12-AL: 2~5번 섹션 매칭 페르소나 논의 헬퍼 (그룹 단위 통합) ───
+    const findDiscussionsByEquipments = (equipments) => {
+      const ds = minutes.discussions || [];
+      if (!ds.length || !equipments?.length) return [];
+      const eqSet = new Set(equipments.map(e => String(e || "").replace(/\s*\(×\d+\)/g, "").trim()).filter(Boolean));
+      return ds.filter(d => eqSet.has(d.issue?.eq || ""));
+    };
+    const findDiscussionsByEquipment = (equipment) => {
+      const ds = minutes.discussions || [];
+      if (!ds.length || !equipment) return [];
+      return ds.filter(d => d.issue?.eq === equipment);
+    };
+
+    // ★ 12-AL D2-c → 12-BD: 그룹 단위 표시 — 미표시 멤버 중 가장 부동시간 긴 1개를 대표로 표시
+    // + 그룹의 다른 멤버는 "이 그룹의 다른 N건은 [위치] 참조" 안내만 추가
+    // ★ 12-BD: synthesis 매개변수 추가 — LLM 그룹 종합 결과(pattern + implication) 표시
+    const buildGroupRepresentativeConv = (matches, groupLabel = "이 그룹", synthesis = null) => {
+      if (!matches?.length) return "";
+      // 미표시 멤버만 필터
+      const unprinted = matches.filter(m => !isAlreadyPrinted(m));
+      // 이미 표시된 멤버 수
+      const alreadyShown = matches.length - unprinted.length;
+
+      // ★ 12-BD: synthesis 결과 HTML (있으면 항상 표시 — 빈 안내 대체)
+      const synthHtml = (synthesis && (synthesis.pattern || synthesis.implication))
+        ? `<div style="margin-top:8px;padding:10px 14px;background:#fef3c7;border-left:3px solid #f59e0b;border-radius:4px;font-size:0.88em;color:#78350f;line-height:1.6;">
+            ${synthesis.pattern ? `<div><b>🔍 공통 패턴:</b> ${esc(synthesis.pattern)}</div>` : ""}
+            ${synthesis.implication ? `<div style="margin-top:4px;"><b>💡 시사점:</b> ${esc(synthesis.implication)}</div>` : ""}
+          </div>`
+        : "";
+
+      if (unprinted.length === 0) {
+        // 전부 다른 섹션에서 표시됨 → synthesis만 표시 (빈 안내 제거 — 12-BD)
+        return synthHtml;
+      }
+
+      // 대표 1개: 미표시 중 가장 부동시간 긴 것
+      const rep = unprinted.sort((a, b) => (b.issue?.durMin || 0) - (a.issue?.durMin || 0))[0];
+      const repEq = rep.issue?.eq || "?";
+      const repDur = rep.issue?.durMin || 0;
+
+      // 미표시 나머지도 markPrinted 처리 (이번 그룹에서 다 다뤘다고 간주)
+      unprinted.forEach(m => { if (m !== rep) markPrinted(m); });
+
+      // 안내 메시지
+      const noticeParts = [];
+      if (matches.length > 1) {
+        noticeParts.push(`이 ${esc(groupLabel)}는 총 ${matches.length}건 (대표: ${esc(repEq)} ${repDur}분)`);
+      }
+      if (alreadyShown > 0) {
+        noticeParts.push(`${alreadyShown}건은 1번 장기부동 또는 상위 섹션에 표시됨`);
+      }
+      if (unprinted.length > 1) {
+        const others = unprinted.filter(m => m !== rep).map(m => `${m.issue?.eq}(${m.issue?.durMin}분)`).join(", ");
+        noticeParts.push(`다른 ${unprinted.length - 1}건은 동일 패턴으로 간주: ${others}`);
+      }
+
+      const noticeHtml = noticeParts.length > 0
+        ? `<div style="margin-bottom:8px;padding:6px 10px;background:#fffbe6;border-left:3px solid #fbbf24;border-radius:4px;font-size:0.87em;color:#92400e;">📋 ${noticeParts.join(" · ")}</div>`
+        : "";
+
+      return synthHtml + noticeHtml + buildPersonaConvHtml(rep);
+    };
+
+    // 옛 호환 (단일 표시 — 1번 장기부동에서만 사용)
+    const buildMultiplePersonaConvs = (matches) => {
+      if (!matches?.length) return "";
+      // 미표시만 필터링 후 모두 표시 (3,4,5번 영역에서 사용)
+      const unprinted = matches.filter(m => !isAlreadyPrinted(m));
+      if (unprinted.length === 0) {
+        return `<div style="margin-top:6px;padding:6px 10px;background:#f5f5f5;border-left:3px solid #94a3b8;border-radius:4px;font-size:0.85em;color:#64748b;">📌 이 영역의 페르소나 논의 ${matches.length}건은 모두 상위 섹션에 표시되었습니다.</div>`;
+      }
+      return unprinted.map(m => buildPersonaConvHtml(m)).join("");
+    };
+
+    // ★ 12-AL: 그룹 정렬 — 큰 그룹 우선 (C-3), 그래야 큰 그룹의 멤버들이 작은 그룹보다 먼저 등록됨
+    const recurringByCategorySorted = [...(cur.recurringByCategory || [])]
+      .map(c => ({ ...c, _matches: findDiscussionsByEquipments(c.equipments || []) }))
+      .sort((a, b) => (b._matches?.length || 0) - (a._matches?.length || 0));
+    const recurringSameEquipmentSorted = [...(cur.recurringSameEquipment || [])]
+      .map(e => ({ ...e, _matches: findDiscussionsByEquipment(e.equipment) }))
+      .sort((a, b) => (b._matches?.length || 0) - (a._matches?.length || 0));
+
+    // ★ 12-BD: 그룹 종합 데이터
+    const groupSyntheses = cur.groupSyntheses || { byCategory: {}, byEquipment: {} };
+
+    // 2번 발생빈도 — 카테고리별 그룹 단위 표시
+    const recurringCatHtml = (cur.recurringByCategory || []).length > 0 ? `
+      <h3>카테고리별</h3>
+      <table>
+        <thead><tr><th>카테고리</th><th class="num">건수</th><th>해당 설비</th></tr></thead>
+        <tbody>
+          ${cur.recurringByCategory.map(c => `<tr><td><b>${esc(c.category)}</b></td><td class="num"><b>${c.count}</b></td><td>${esc((c.equipments || []).join(", "))}</td></tr>`).join("")}
+        </tbody>
+      </table>
+      ${recurringByCategorySorted.map(c => {
+        const matches = c._matches || [];
+        if (!matches.length) return "";
+        // ★ 12-BD: 1건 카테고리는 발생빈도 섹션에 표시 안 함 (가 옵션)
+        if ((c.count || 0) < 2 && matches.length < 2) return "";
+        const groupLabel = `[${c.category}] 카테고리`;
+        const synthesis = groupSyntheses.byCategory[c.category] || null;
+        const groupConv = buildGroupRepresentativeConv(matches, groupLabel, synthesis);
+        if (!groupConv) return "";  // 빈 결과면 헤더도 표시 안 함
+        return `<div style="margin-top:8px;padding-left:10px;border-left:3px solid #ddd;"><div style="font-size:0.88em;color:#666;margin-bottom:6px;"><b>📌 ${esc(groupLabel)}</b> 그룹 종합 (대표 1건):</div>${groupConv}</div>`;
+      }).join("")}` : "";
+
+    const recurringEqHtml = (cur.recurringSameEquipment || []).length > 0 ? `
+      <h3>동일 설비 다발</h3>
+      <ul>${cur.recurringSameEquipment.map(e => `<li><b>${esc(e.equipment)}</b>: ${e.count}건${e.detail ? ` — ${esc(e.detail)}` : ""}</li>`).join("")}</ul>
+      ${recurringSameEquipmentSorted.map(e => {
+        const matches = e._matches || [];
+        if (!matches.length) return "";
+        // ★ 12-BD: 1건 호기는 발생빈도 섹션에 표시 안 함
+        if ((e.count || 0) < 2 && matches.length < 2) return "";
+        const groupLabel = `[${e.equipment}] 호기`;
+        const synthesis = groupSyntheses.byEquipment[e.equipment] || null;
+        const groupConv = buildGroupRepresentativeConv(matches, groupLabel, synthesis);
+        if (!groupConv) return "";  // 빈 결과면 헤더도 표시 안 함
+        return `<div style="margin-top:8px;padding-left:10px;border-left:3px solid #ddd;"><div style="font-size:0.88em;color:#666;margin-bottom:6px;"><b>📌 ${esc(groupLabel)}</b> 그룹 종합 (대표 1건):</div>${groupConv}</div>`;
+      }).join("")}` : "";
+
+    // 3번 조건 변경 — 설비별 매칭 페르소나 논의
+    const cc = cur.conditionChanges || {};
+    const buildTable = (rows, headers, makeRow) => rows.length === 0 ? "" : `
+      <table>
+        <thead><tr>${headers.map(h => `<th>${h}</th>`).join("")}</tr></thead>
+        <tbody>${rows.map(makeRow).join("")}</tbody>
+      </table>`;
+    // 3번 영역에서 등장하는 모든 equipment 추출 → 매칭 논의 모음
+    const buildConditionChangePersonas = () => {
+      const eqs = new Set();
+      [...(cc.visionOffset || []), ...(cc.settingChange || []), ...(cc.cutter || []), ...(cc.other || [])].forEach(r => {
+        if (r.equipment) eqs.add(r.equipment);
+      });
+      const matches = findDiscussionsByEquipments([...eqs]);
+      if (!matches.length) return "";
+      return `<div style="margin-top:10px;padding-left:10px;border-left:3px solid #ddd;"><div style="font-size:0.88em;color:#666;margin-bottom:6px;"><b>📌 조건 변경 영역</b> 관련 페르소나 논의:</div>${buildMultiplePersonaConvs(matches)}</div>`;
+    };
+    const visionHtml = (cc.visionOffset || []).length > 0 ? `<h3>Vision Offset 적용</h3>${buildTable(cc.visionOffset, ["시간", "설비", "변경 내용", "사유"], r => `<tr><td>${esc(r.date)} ${esc(r.time)}</td><td><b>${esc(r.equipment)}</b></td><td>${esc(r.change)}</td><td>${esc(r.reason || "-")}</td></tr>`)}` : "";
+    const settingHtml = (cc.settingChange || []).length > 0 ? `<h3>Setting 변경 (Before → After)</h3>${buildTable(cc.settingChange, ["설비", "파라미터", "Before → After"], r => `<tr><td>${esc(r.equipment || "-")}</td><td>${esc(r.parameter)}</td><td>${esc(r.before)} → <b>${esc(r.after)}</b></td></tr>`)}` : "";
+    const cutterHtml = (cc.cutter || []).length > 0 ? `<h3>Cutter 조정</h3>${buildTable(cc.cutter, ["시간", "설비", "변경 내용"], r => `<tr><td>${esc(r.date)} ${esc(r.time)}</td><td><b>${esc(r.equipment)}</b></td><td>${esc(r.change)}</td></tr>`)}` : "";
+    const otherHtml = (cc.other || []).length > 0 ? `<h3>기타</h3>${buildTable(cc.other, ["날짜", "설비", "변경 내용", "담당"], r => `<tr><td>${esc(r.date)}</td><td>${esc(r.equipment)}</td><td>${esc(r.change)}</td><td>${esc(r.pic || "-")}</td></tr>`)}` : "";
+    const conditionChangePersonasHtml = buildConditionChangePersonas();
+
+    // 4번 테스트/PM — 설비별 매칭 페르소나 논의
+    const tp = cur.testPm || {};
+    const buildTestPmPersonas = () => {
+      const eqs = new Set();
+      [...(tp.fmvs || []), ...(tp.cutter || []), ...(tp.stackingSepa || [])].forEach(r => {
+        if (r.equipment) eqs.add(r.equipment);
+        if (r.equipments) String(r.equipments).split(/[,\s]+/).forEach(eq => eq && eqs.add(eq));
+      });
+      const matches = findDiscussionsByEquipments([...eqs]);
+      if (!matches.length) return "";
+      return `<div style="margin-top:10px;padding-left:10px;border-left:3px solid #ddd;"><div style="font-size:0.88em;color:#666;margin-bottom:6px;"><b>📌 테스트/PM 영역</b> 관련 페르소나 논의:</div>${buildMultiplePersonaConvs(matches)}</div>`;
+    };
+    const linePmHtml = (tp.linePM || []).length > 0 ? `<h3>Line PM 계획</h3>${buildTable(tp.linePM, ["일자", "라인", "상태"], r => `<tr><td>${esc(r.date)}</td><td><b>${esc(r.line)}</b></td><td>${esc(r.status)}</td></tr>`)}` : "";
+    const fmvsHtml = (tp.fmvs || []).length > 0 ? `<h3>FMVS (Vision Camera)</h3>${buildTable(tp.fmvs, ["일자", "작업", "대상 설비"], r => `<tr><td>${esc(r.date)}</td><td>${esc(r.action)}</td><td>${esc(r.equipments)}</td></tr>`)}` : "";
+    const cutterTestHtml = (tp.cutter || []).length > 0 ? `<h3>Cutter 테스트</h3>${buildTable(tp.cutter, ["시간", "항목", "결과"], r => `<tr><td>${esc(r.date)} ${esc(r.time)}</td><td>${esc(r.item)}</td><td>${esc(r.resultIcon || "")} ${esc(r.note || "")}</td></tr>`)}` : "";
+    const stackHtml = (tp.stackingSepa || []).length > 0 ? `<h3>Stacking Sepa Run</h3><ul>${tp.stackingSepa.map(s => `<li><b>${esc(s.date)} ${esc(s.equipment)}</b>: ${esc(s.issue)} ${esc(s.resultIcon || "")}</li>`).join("")}</ul>` : "";
+    const testPmPersonasHtml = buildTestPmPersonas();
+
+    // 5번 NG 품질 — 품질 관련 페르소나 논의 (QUALITY_NG tag)
+    const qng = cur.qualityNg || {};
+    const buildQualityPersonas = () => {
+      const ds = minutes.discussions || [];
+      const matches = ds.filter(d => (d.issue?.tags || []).includes("QUALITY_NG"));
+      if (!matches.length) return "";
+      return `<div style="margin-top:10px;padding-left:10px;border-left:3px solid #ddd;"><div style="font-size:0.88em;color:#666;margin-bottom:6px;"><b>📌 품질 NG 영역</b> 관련 페르소나 논의:</div>${buildMultiplePersonaConvs(matches)}</div>`;
+    };
+    const qualityTableHtml = (qng.table || []).length > 0 ? `
+      <table>
+        <thead><tr><th>일자</th><th class="num">Sepa Fold</th><th class="num">Electrode Expose</th><th class="num">Non Response</th><th class="num">Dim Overkill</th><th class="num">Contact NG</th></tr></thead>
+        <tbody>${qng.table.map(r => `<tr><td>${esc(r.date)}</td><td class="num">${r.sepaFold ?? "-"}</td><td class="num">${r.electrodeExpose ?? "-"}</td><td class="num">${r.nonResponse ?? "-"}</td><td class="num">${r.dimOverkill ?? "-"}</td><td class="num">${r.contactNg ?? "-"}</td></tr>`).join("")}</tbody>
+      </table>
+      ${qng.trend ? `<div class="info"><b>추세:</b> ${esc(qng.trend)}</div>` : ""}` : "<p>데이터 없음</p>";
+    const qualityPersonasHtml = buildQualityPersonas();
+
+    // 6번 인사이트
+    const insightsHtml = insights.length > 0 ? insights.map(ins => `
+      <h3>${esc(ins.title)}</h3>
+      <ul>${(ins.bulletPoints || []).map(bp => `<li>${esc(bp)}</li>`).join("")}</ul>
+      <p style="font-size:0.9em;color:#666;">
+        <b>${ins.confidence?.includes("가설") ? "🔬 가설 — 검증필요" : "✅ 확실"}</b>
+        ${ins.evidence ? ` · 📎 근거: ${esc(ins.evidence)}` : ""}
+      </p>`).join("") : "<p>인사이트 없음</p>";
+
+    // 7번 액션
+    const actionsHtml = actions.length > 0 ? `
+      <table>
+        <thead><tr><th class="center" style="width:10%;">우선순위</th><th>항목</th><th>비고</th><th style="width:18%;">근거</th></tr></thead>
+        <tbody>${actions.map(a => {
+          const pCls = a.priority === "P0" ? "p0" : a.priority === "P1" ? "p1" : "p2";
+          const pIcon = a.priority === "P0" ? "🚨" : a.priority === "P1" ? "🔴" : "🟡";
+          return `<tr><td class="center"><span class="priority ${pCls}">${pIcon} ${esc(a.priority)}</span></td><td><b>${esc(a.action)}</b>${a._ruleAdjusted ? `<div style="font-size:0.8em;color:#888;">※ ${esc(a._ruleAdjusted)}</div>` : ""}</td><td>${esc(a.context)}${a.confidence?.includes("가설") ? ` <span style="font-size:0.85em;color:#e67e22;">🔬 검증필요</span>` : ""}</td><td style="font-size:0.88em;color:#666;">${esc(a.evidence)}</td></tr>`;
+        }).join("")}</tbody>
+      </table>` : "<p>액션 항목 없음</p>";
+
+    // 영역 12-AJ: 유첨(페르소나 논의 모아보기) 제거 — 메인 1~5번 섹션의 inline 논의와 중복
+    // 페르소나 논의는 메인 섹션 각 이슈의 [💬 페르소나 논의] details 안에 그대로 유지됨
+
+    const html = `<!DOCTYPE html>
+<html lang="ko">
+<head>
+<meta charset="UTF-8">
+<title>${esc(title)}</title>
+<style>
+  body { font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", "Noto Sans KR", "Malgun Gothic", sans-serif;
+    max-width: 1100px; margin: 2em auto; padding: 0 1.5em; line-height: 1.65; color: #222; background: #fafafa; }
+  h1 { font-size: 1.9em; border-bottom: 3px solid #1a3a5c; padding-bottom: 0.3em; color: #1a3a5c; }
+  h2 { font-size: 1.45em; border-bottom: 1px solid #ccc; padding-bottom: 0.25em; margin-top: 2em; color: #1a3a5c; }
+  h3 { font-size: 1.18em; margin-top: 1.5em; color: #333; }
+  h4 { font-size: 1.02em; margin-top: 1.2em; color: #555; }
+  table { border-collapse: collapse; margin: 1em 0; width: 100%; font-size: 0.92em; background: #fff; }
+  th, td { border: 1px solid #bbb; padding: 7px 11px; text-align: left; vertical-align: top; }
+  th { background: #e8eef5; font-weight: 600; color: #1a3a5c; }
+  td.num, th.num { text-align: right; font-variant-numeric: tabular-nums; }
+  .center { text-align: center; }
+  code { background: #f0f0f0; padding: 1px 5px; border-radius: 3px; font-family: "SF Mono", Consolas, monospace; font-size: 0.88em; }
+  .meta { color: #666; font-size: 0.92em; }
+  .critical { background: #fff5f5; border-left: 5px solid #c0392b; padding: 1em 1.3em; margin: 1.2em 0; border-radius: 3px; }
+  .warning { background: #fffaf0; border-left: 5px solid #e67e22; padding: 1em 1.3em; margin: 1em 0; border-radius: 3px; }
+  .info { background: #f0f8ff; border-left: 5px solid #2980b9; padding: 0.9em 1.2em; margin: 1em 0; border-radius: 3px; }
+  .summary-box { background: #fff; border: 2px solid #1a3a5c; padding: 1em 1.3em; margin: 1.5em 0; border-radius: 5px; }
+  .ok { color: #27ae60; font-weight: 600; }
+  .progress { color: #d68910; font-weight: 600; }
+  .priority { font-weight: 700; }
+  .p0 { color: #c0392b; }
+  .p1 { color: #e67e22; }
+  .p2 { color: #d4ac0d; }
+</style>
+</head>
+<body>
+
+<h1>${esc(title)}</h1>
+${curationBadge}
+${fragmentLostHtml}
+<p class="meta"><b>분석 기간:</b> ${esc(periodLabel)}<br>
+<b>출처:</b> AZS Status Reports WhatsApp 그룹<br>
+<b>레코드:</b> ${(() => {
+  const rb = cur.recordBreakdown || {};
+  const parts = [];
+  if (rb.bmDowntime > 0) parts.push(`BM Downtime Bot ${rb.bmDowntime}건`);
+  if (rb.ubm > 0) parts.push(`UBM ${rb.ubm}건`);
+  if (rb.pdDowntime > 0) parts.push(`PD Downtime ${rb.pdDowntime}건`);
+  if (rb.other > 0) parts.push(`기타 ${rb.other}건`);
+  return parts.length > 0 ? parts.join(" + ") : `부동 이슈 ${issuesCount}건`;
+})()}</p>
+
+${cur.summary_text || (cur.criticalSummary || []).length > 0 ? `
+<div class="summary-box">
+<h3 style="margin-top:0;">📋 핵심 요약</h3>
+${cur.summary_text ? `<p><i>${esc(cur.summary_text)}</i></p>` : ""}
+${(cur.criticalSummary || []).length > 0 ? `<ul>${cur.criticalSummary.map(c => `<li>${esc(c)}</li>`).join("")}</ul>` : ""}
+</div>` : ""}
+
+<hr>
+<h2>🚨 1. 장기부동 건 — 상세</h2>
+${(longDowntimeHtml + ruleLong30Html) || "<p>장기부동 이슈 없음</p>"}
+
+${chronicIssuesHtml}
+
+<hr>
+<h2>🔁 2. 발생빈도 높은 이슈</h2>
+${recurringCatHtml}
+${recurringEqHtml}
+
+<hr>
+<h2>⚙️ 3. 설비/공정 조건 변경</h2>
+${conditionChangeGroupsHtml}
+${visionHtml}${settingHtml}${cutterHtml}${otherHtml}
+${!conditionChangeGroupsHtml && !visionHtml && !settingHtml && !cutterHtml && !otherHtml ? "<p>조건 변경 없음</p>" : ""}
+${conditionChangePersonasHtml}
+
+<hr>
+<h2>🧪 4. 테스트 / PM 활동</h2>
+${linePmHtml}${fmvsHtml}${cutterTestHtml}${stackHtml}
+${!linePmHtml && !fmvsHtml && !cutterTestHtml && !stackHtml ? "<p>테스트/PM 활동 없음</p>" : ""}
+${line3DCutterCpcHtml}
+${chronic1ABHtml}
+${testPmPersonasHtml}
+
+<hr>
+<h2>📊 5. 일일 NG 품질 실적</h2>
+${qualityTableHtml}
+${qualityPersonasHtml}
+
+<hr>
+<h2>⚠️ 6. 가장 주목할 사항</h2>
+${insightsHtml}
+
+<hr>
+<h2>📌 7. 액션 후속 사항</h2>
+${actionsHtml}
+
+<hr>
+<p class="meta" style="text-align:center;">— 레포트 종료 —<br>
+AZS Status Reports WhatsApp 데이터 기반 · ${new Date().toLocaleString("ko-KR")}</p>
+
+</body>
+</html>`;
+
+    // ★ 12-BE: HTML 문자열만 반환 (sendToTeams에서 호출 시)
+    if (returnOnly) return html;
+
+    const blob = new Blob([html], { type: "text/html;charset=utf-8" });
+    const url = URL.createObjectURL(blob);
+    const a = document.createElement("a");
+    a.href = url;
+    a.download = `${minutes.title || "AZS_레포트"}.html`;
+    document.body.appendChild(a);
+    a.click();
+    document.body.removeChild(a);
+    URL.revokeObjectURL(url);
+  };
+
+  const downloadTxt = () => {
+    if (!minutes) return;
+    let t = `${"═".repeat(52)}\n${minutes.title}\n${"═".repeat(52)}\n`;
+    t += `일시: ${minutes.date}\n참석: ${minutes.attendees}\n안건: ${minutes.agenda}\n`;
+    if (minutes.process && minutes.allowedAgents) {
+      t += `대상 공정: ${PROCESSES[minutes.process]?.label || minutes.process}\n`;
+      if (true) {  // 영역 11: 항상 페르소나 정보 출력
+        t += `참여 에이전트 (${minutes.allowedAgents.length}명): ${minutes.allowedAgents.map(a => `${a}(${PERSONAS[a]?.label})`).join(", ")}\n`;
+      } else {
+        t += `생성 모드: 간단 (페르소나 논의 없음)\n`;
+      }
+    }
+
+    // ★ 영역 9-E: 간단모드 전용 출력
+    if (false) {  // 영역 11: 간단모드 TXT 분기 폐기
+      const s = minutes.simple;
+      t += `\n${"═".repeat(52)}\n📋 카테고리 분류 요약\n${"═".repeat(52)}\n`;
+      t += `🔴 장기부동 ${s.counts.LONG_DOWNTIME} / 🔁 반복 ${s.counts.HIGH_FREQUENCY} / ⚙️ 조건변경 ${s.counts.CONDITION_CHANGE} / 🧪 테스트PM ${s.counts.TEST_PM} / 🟣 품질NG ${s.counts.QUALITY_NG}\n`;
+
+      // 1. 일별
+      if (s.dailyOverview.length > 0) {
+        t += `\n[📊 일별 부동 현황]\n`;
+        s.dailyOverview.forEach(d => { t += `  ${d.date}: ${d.count}건 / ${d.totalMin}분\n`; });
+        t += `  합계: ${s.dailyOverview.reduce((a,b)=>a+b.count,0)}건 / ${s.dailyOverview.reduce((a,b)=>a+b.totalMin,0)}분\n`;
+      }
+      // 2. 장기부동
+      if (s.longDowntime.length > 0) {
+        t += `\n[🔴 장기부동 (${s.threshold}분 이상, ${s.longDowntime.length}건)]\n`;
+        s.longDowntime.forEach(i => {
+          t += `  ${i.date} ${i.time} | ${i.eq || "-"} | ${i.durMin}분 (점수${i.score}) | ${(i.prob || "").slice(0,80)}\n`;
+        });
+      }
+      // 3. 반복 (3축)
+      if (s.eqRanked.length > 0) {
+        t += `\n[🔁 반복 — 설비별 TOP ${s.eqRanked.length}]\n`;
+        s.eqRanked.forEach(e => { t += `  ${e.equipment}: ${e.count}회\n`; });
+      }
+      if (s.alarmRanked.length > 0) {
+        t += `\n[🔁 반복 — 알람별 TOP ${s.alarmRanked.length}]\n`;
+        s.alarmRanked.forEach(a => { t += `  ${a.count}회 | ${a.alarm.slice(0,90)}\n`; });
+      }
+      if (s.causeCategoryRanked.length > 0) {
+        t += `\n[🔁 반복 — 원인 카테고리]\n`;
+        s.causeCategoryRanked.forEach(c => { t += `  ${c.category}: ${c.count}회\n`; });
+      }
+      // 4. 조건변경
+      if (s.conditionChanges.length > 0) {
+        t += `\n[⚙️ 설비/공정 조건 변경 (${s.conditionChanges.length}건)]\n`;
+        s.conditionChanges.forEach(c => { t += `  ${c.date} ${c.time} | ${c.item} | ${c.who || "-"}\n`; });
+      }
+      // 5. 테스트
+      if (s.testPm.length > 0) {
+        t += `\n[🧪 테스트 / PM (${s.testPm.length}건)]\n`;
+        s.testPm.forEach(p => { t += `  ${p.date} ${p.time} | ${p.item} | ${p.purpose || "-"}\n`; });
+      }
+      // 6. 품질
+      if (s.qualityNg.length > 0) {
+        t += `\n[🟣 품질 / NG (${s.qualityNg.length}건)]\n`;
+        s.qualityNg.forEach(q => { t += `  ${q.date} ${q.time} | ${q.item} | ${q.note || "-"}\n`; });
+      }
+      // 7. 미해결
+      if (s.unresolved.length > 0) {
+        t += `\n[🚨 미해결 / 모니터링 필요 (${s.unresolved.length}건)]\n`;
+        s.unresolved.forEach(i => {
+          t += `  ${i.date} ${i.time} | ${i.eq || "-"} | ${(i.prob || "").slice(0,80)} | ${(i.result || "-").slice(0,60)}\n`;
+        });
+      }
+      // 8. 인사이트
+      if (s.insights.length > 0) {
+        t += `\n[💡 핵심 시사점]\n`;
+        s.insights.forEach((ins, idx) => { t += `  ${idx+1}. ${ins}\n`; });
+      }
+      t += `\n${"═".repeat(52)}\n생성: ${new Date().toLocaleString("ko-KR")}\n`;
+      // 간단모드는 여기서 종료
+      const blob = new Blob([t], {type:"text/plain;charset=utf-8"});
+      const a = document.createElement("a");
+      a.href = URL.createObjectURL(blob);
+      a.download = `회의록_${minutes.date.replace(/[\s/~]/g,"_").replace(/[()]/g,"")}_간단.txt`;
+      a.click();
+      return;
+    }
+
+    // ★ PE 사전 큐레이션
+    if (minutes.curation) {
+      t += `\n${"═".repeat(52)}\n📝 PE 사전 큐레이션\n${"═".repeat(52)}\n`;
+      t += `\n${minutes.curation.summary_text}\n`;
+
+      if (minutes.curation.daily_table?.length > 0) {
+        t += `\n[일자별 주요 이슈]\n`;
+        minutes.curation.daily_table.forEach(row => {
+          t += `  ${row.date} | ${row.equipment} | ${row.issue} | ${row.action} | ${row.downtime}분\n`;
+        });
+      }
+
+      if (minutes.curation.long_downtime?.length > 0) {
+        t += `\n[장기 부동 (${minutes.curation.long_downtime.length}건)]\n`;
+        minutes.curation.long_downtime.forEach(d => {
+          t += `  • ${d.equipment}: ${d.reason} (${d.duration_note}, ${d.status})\n`;
+        });
+      }
+
+      if (minutes.curation.recurring?.length > 0) {
+        t += `\n[반복 발생 항목 (${minutes.curation.recurring.length}건)]\n`;
+        minutes.curation.recurring.forEach(r => {
+          t += `  • ${r.item} (${r.count}회) - ${r.lines?.join(", ")}\n`;
+          if (r.cause) t += `    원인: ${r.cause}\n`;
+        });
+      }
+
+      // ★ 영역 5-I: 큐레이션 이력 카테고리 3종
+      if (minutes.curation.quality_issues?.length > 0) {
+        t += `\n[품질 이슈 이력 (${minutes.curation.quality_issues.length}건)]\n`;
+        minutes.curation.quality_issues.forEach(q => {
+          t += `  • ${q.date} ${q.time} | ${q.item}`;
+          if (q.note && q.note !== "-") t += ` (${q.note})`;
+          t += `\n`;
+        });
+      }
+
+      if (minutes.curation.process_changes?.length > 0) {
+        t += `\n[공정/설비 조건변경 이력 (${minutes.curation.process_changes.length}건)]\n`;
+        minutes.curation.process_changes.forEach(c => {
+          t += `  • ${c.date} ${c.time} | ${c.item}`;
+          if (c.who && c.who !== "-") t += ` (${c.who})`;
+          t += `\n`;
+        });
+      }
+
+      if (minutes.curation.tests_inspections?.length > 0) {
+        t += `\n[테스트/양산외 생산 이력 (${minutes.curation.tests_inspections.length}건)]\n`;
+        minutes.curation.tests_inspections.forEach(test => {
+          t += `  • ${test.date} ${test.time} | ${test.item}`;
+          if (test.purpose && test.purpose !== "-") t += ` (${test.purpose})`;
+          t += `\n`;
+        });
+      }
+    }
+
+    // ★ 영역 5-I: 참고용 — 선정 기준 / 점수 공식 / 모드 정의
+    t += `\n${"─".repeat(52)}\n[참고: 선정 기준 / 점수 공식 / 모드 정의]\n${"─".repeat(52)}\n`;
+    t += `① 본문 논의 대상\n`;
+    t += `   - 장기부동 (60분↑ OR Result에 "not solved")\n`;
+    t += `   - 반복 (동일 호기/부품 2회↑)\n`;
+    t += `   - Full Stop (라인 완전정지)\n`;
+    t += `   → 점수 상위 ${MAX_ISSUES}건 선정 (공정변경·테스트·품질은 큐레이션 이력만)\n`;
+    t += `② 점수 공식\n`;
+    t += `   score = 부동(분)/30 + 반복횟수×3 + 안전환경(+10) + 미해결(+5) + FullStop(+5)\n`;
+    t += `③ 논의 모드\n`;
+    t += `   - DEEP    : 안전·환경·품질통제·출하고객·라인정지 키워드 OR 긴급 → 8필드 풀 논의\n`;
+    t += `   - STANDARD: 중요 (반복/FullStop/부품반복) → 3필드 액션플랜\n`;
+    t += `   - LITE    : 일반 (완료/단순) → 압축 평가\n`;
+
+    // 시간/빈도 분석
+    if (minutes.analytics) {
+      t += `\n${"═".repeat(52)}\n📊 이슈 분석 요약\n${"═".repeat(52)}\n`;
+      t += `\n⏰ 시간대별 발생 TOP 5\n`;
+      minutes.analytics.timeOfDay.forEach((b, i) => {
+        t += `  ${i+1}. ${b.label}  ${b.count}건\n`;
+      });
+      t += `\n🔁 발생 빈도 TOP 5 (설비 × 공정)\n`;
+      minutes.analytics.categoryFreq.forEach((c, i) => {
+        t += `  ${i+1}. ${c.key}  ${c.count}건\n`;
+      });
+    }
+
+    // ★ 이슈별 상세 카드 (모드별 차등)
+    if (minutes.detailCards?.length > 0) {
+      t += `\n${"═".repeat(52)}\n📋 이슈별 상세 분석 카드\n${"═".repeat(52)}\n`;
+      minutes.detailCards.forEach((card, i) => {
+        t += `\n[${i+1}] ${card.header}${card.isPostAction ? " ✓ 기조치" : ""} [${card.mode}]\n`;
+        t += `${"─".repeat(40)}\n`;
+        t += `분류 사유: ${card.modeReason}\n`;
+        if (card.fallbackLevel !== "primary") {
+          t += `⚠️ 사회자 폴백: ${card.fallbackLevel}\n`;
+        }
+        t += `\n현상: ${card["현상"]}\n`;
+        t += `원인: ${card["원인"]}\n`;
+
+        if (card.mode === "DEEP") {
+          t += `즉시 조치: ${card["즉시조치"]}\n`;
+          t += `★ 기존 조치 적절성: ${card["기존조치_적절성"]}\n`;
+          t += `재발 방지책: ${card["재발방지책"]}\n`;
+          t += `보완책: ${card["보완책"]}\n`;
+          t += `\n발언자별 의견:\n`;
+          (card["발언자별의견"] || []).forEach(v => {
+            t += `  ${v.icon} ${v.label} [${v.stance}]: ${v.summary}\n`;
+          });
+          t += `\n합의/반대 지점: ${card["합의반대지점"]}\n`;
+        } else {
+          t += `대책: ${card["대책"]}\n`;
+        }
+      });
+    }
+
+    // 모드별 건별 논의 결과 (페르소나 원본 의견)
+    if (discussions.length > 0) {
+      t += `\n${"═".repeat(52)}\n💬 건별 논의 원본 (페르소나 의견 + 사회자 종합)\n${"═".repeat(52)}\n`;
+      for (const mode of ["DEEP", "STANDARD", "LITE"]) {
+        const items = (minutes.grouped?.[mode]) || [];
+        if (items.length === 0) continue;
+        t += `\n${MODE_STYLE[mode].label} (${items.length}건)\n${"─".repeat(40)}\n`;
+        items.forEach((d, i) => {
+          t += `\n[${mode}-${i+1}] ${d.issue.eq} (${d.issue.durMin}분, ${d.issue.time})${d.isPostAction ? " ✓ 기조치" : ""}\n`;
+          t += `  분류: ${d.modeInfo.reason} (${d.modeInfo.source})\n`;
+          if (d.router) t += `  발언 순서: ${d.router.order.join(" → ")} (${d.router.reason})\n`;
+          if (d.moderator?._fallback_level && d.moderator._fallback_level !== "primary") {
+            t += `  ⚠️ 사회자 폴백: ${d.moderator._fallback_level}\n`;
+          }
+
+          // 페르소나 의견 (6필드, 대화체)
+          if (d.opinions.length > 0) {
+            t += `\n  ── 페르소나 의견 (대화체) ──\n`;
+            d.opinions.forEach(o => {
+              const p = PERSONAS[o.persona];
+              const op = o.opinion || {};
+              t += `\n  ${p.icon} ${p.label} (${o.persona}) [${op.stance || "-"}]\n`;
+              if (op.previous_reference && op.previous_reference !== "") {
+                t += `     💬 인용: "${op.previous_reference}"\n`;
+              }
+              t += `     📌 현상: ${op["현상"] || "-"}\n`;
+              t += `     🔍 원인: ${op["원인"] || "-"}\n`;
+              t += `     ⚡ 대책: ${op["대책"] || "-"}\n`;
+              if (op["기존조치_평가"] && op["기존조치_평가"] !== "해당없음" && op["기존조치_평가"] !== "-") {
+                t += `     🔁 기조치 평가: ${op["기존조치_평가"]}\n`;
+              }
+            });
+          }
+
+          // 사회자 종합
+          t += `\n  ── 사회자 종합 ──\n`;
+          const m = d.moderator;
+          if (m.type === "deep") {
+            t += `     【합의】 ${m.consensus}\n`;
+            t += `     【차이】 ${m.differences}\n`;
+            t += `     【충돌】 ${m.conflicts}\n`;
+            t += `     【권고】 ${m.recommendation}\n`;
+            t += `     【추가】 ${m.needsMore}\n`;
+          } else if (m.type === "standard") {
+            t += `     요약: ${m.summary}\n`;
+            (m.actions || []).forEach((a, ai) => {
+              t += `     액션${ai+1}: [${a.priority}] ${a.action} (담당:${a.owner}, ${a.duration})\n`;
+            });
+            t += `     추가확인: ${m.needsMore}\n`;
+          } else {
+            t += `     보완점: ${m.supplement}\n`;
+            t += `     재발우려: ${m.recurRisk}\n`;
+            t += `     재발방지: ${m.prevention}\n`;
+          }
+          t += `${"─".repeat(40)}\n`;
+        });
+      }
+    }
+
+    // 보고서 섹션
+    t += `\n${"═".repeat(52)}\n종합 보고서\n${"═".repeat(52)}\n`;
+    for (const s of minutes.sections||[]) {
+      t += `\n${s.heading}\n${"─".repeat(28)}\n`;
+      for (const item of s.items||[]) t += `  · ${item}\n`;
+    }
+    t += `\n${"─".repeat(52)}\n※ AI 생성 보고서`;
+    Object.assign(document.createElement("a"), {
+      href: URL.createObjectURL(new Blob([t], { type:"text/plain;charset=utf-8" })),
+      download:`${minutes.title}.txt`,
+    }).click();
+  };
+
+  // ─── ★ 영역 7: 자유 채팅방 백엔드 ─────────────────────────────────────────────
+  // 7-E: STEP에 따라 가용 컨텍스트 빌드 (이슈 데이터 자동 적응)
+  const buildChatContext = () => {
+    const parts = [];
+    parts.push(`현재 단계: STEP ${step}`);
+    if (step === 0) {
+      parts.push("아직 WhatsApp 파일이 업로드되지 않았습니다. 일반적인 공정 상담만 가능합니다.");
+    } else if (step >= 1 && allMsgs.length > 0) {
+      parts.push(`업로드된 메시지: ${allMsgs.length}건, 발생 일자 수: ${dates.length}일`);
+      if (selRange && selRange.start && selRange.end) {
+        parts.push(`분석 대상 기간: ${buildRangeLabel(selRange)}`);
+      } else if (selDates.length > 0) {
+        parts.push(`분석 대상 일자: ${selDates.join(", ")}`);
+      }
+    }
+    if (priority && Array.isArray(priority)) {
+      // 영역 11: priority는 평면 배열. tags로 분류 표시.
+      const longCount = priority.filter(i => (i.tags || []).includes("LONG_DOWNTIME")).length;
+      const freqCount = priority.filter(i => (i.tags || []).includes("HIGH_FREQUENCY")).length;
+      parts.push(`이슈 분류: 전체 ${priority.length}건 | 장기부동 ${longCount}건 / 반복 ${freqCount}건`);
+      // ★ 영역 12-BG-4 (큐 #13 단계 1): 상위 15 → 30건 + image_analyses 통합
+      const top = priority.filter(i =>
+        (i.tags || []).includes("LONG_DOWNTIME") || (i.tags || []).includes("HIGH_FREQUENCY")
+      ).slice(0, 30);
+      if (top.length > 0) {
+        parts.push("\n[주요 이슈 목록 (상위 30건, tag 보유)]");
+        top.forEach((d, i) => {
+          parts.push(`${i+1}. [${d.date} ${d.time}] ${d.eq || "-"} | ${d.durMin}분 | Problem: ${d.prob || "-"} | Cause: ${d.cause || "-"} | Result: ${d.result || "-"}`);
+          // ★ 12-BG-4 큐 #13: 첨부 이미지 분석 inline 표시 (있을 때만)
+          const imgs = (d.image_analyses || []).filter(a => a && String(a).trim());
+          if (imgs.length > 0) {
+            parts.push(`   📷 ${imgs.slice(0, 3).map(a => String(a).slice(0, 80)).join("; ")}`);
+          }
+        });
+      }
+    }
+    if (preCuration) {
+      parts.push(`\n[PE 사전 큐레이션 요약]\n${preCuration.summary_text || ""}`);
+      if (preCuration.long_downtime?.length > 0) {
+        parts.push(`장기부동 ${preCuration.long_downtime.length}건, 반복 ${preCuration.recurring?.length || 0}건, 품질 ${preCuration.quality_issues?.length || 0}건, 공정변경 ${preCuration.process_changes?.length || 0}건, 테스트 ${preCuration.tests_inspections?.length || 0}건`);
+      }
+    }
+    if (minutes && step === 4) {
+      parts.push(`\n[STEP 4 보고서 완성됨 — ${minutes.detailCards?.length || 0}건 이슈 분석 완료]`);
+    }
+    return parts.join("\n");
+  };
+
+  // 7-D: @멘션 파싱 + 라우터 (멘션 우선, 없으면 Haiku로 자동 선택)
+  const extractMentions = (text) => {
+    // @PE, @EE, @FA, @Cell_PE, @Elec_EE 등 모두 지원
+    // chatAgents 코드와 매칭되는 것만 채택
+    const mentions = new Set();
+    const tokens = (text.match(/@\w+/g) || []).map(t => t.slice(1));
+    for (const tok of tokens) {
+      // 정확 매칭 우선
+      const exact = chatAgents.find(a => a === tok || a.toLowerCase() === tok.toLowerCase());
+      if (exact) { mentions.add(exact); continue; }
+      // 후위 매칭 (PE → Cell_PE 또는 Elec_PE 모두)
+      const suffix = chatAgents.filter(a => a.endsWith(`_${tok}`) || a.endsWith(`_${tok.toUpperCase()}`));
+      suffix.forEach(s => mentions.add(s));
+    }
+    return Array.from(mentions);
+  };
+
+  const routeChatQuestion = async (userText) => {
+    if (chatAgents.length === 1) return [chatAgents[0]];
+    const mentioned = extractMentions(userText);
+    if (mentioned.length > 0) return mentioned;
+    // 자동 라우터 (Haiku)
+    const agentList = chatAgents.map(a => `${a} (${PERSONAS[a]?.role || ""})`).join("\n");
+    const sys = `당신은 멀티 에이전트 채팅방의 라우터입니다. 사용자 질문을 보고 가장 적합한 에이전트 1~2명을 골라 코드를 JSON으로 반환하세요. 다른 텍스트 금지.`;
+    const userMsg = `[참석 에이전트]
+${agentList}
+
+[사용자 질문]
+${userText}
+
+다음 형식으로 출력:
+{"agents":["코드1","코드2"]}  // 1명만 적합하면 1개, 최대 2명까지`;
+    try {
+      const raw = await callClaudeRaw(sys, userMsg, { model: MODEL_FAST, max_tokens: 200 });
+      const parsed = safeJSON(raw);
+      const picked = (parsed.agents || []).filter(a => chatAgents.includes(a));
+      if (picked.length > 0) return picked.slice(0, 2);
+    } catch {/* 폴백 */}
+    // 폴백: 첫 번째 에이전트 1명
+    return [chatAgents[0]];
+  };
+
+  // 7-D: 단일 에이전트 응답 생성
+  const generateAgentReply = async (agentCode, userText, history) => {
+    const persona = PERSONAS[agentCode];
+    if (!persona) return "(에이전트를 찾을 수 없음)";
+    // ★ 영역 12-AX: KB cap 5000 → 50000자 확장 (세부 데이터 검색 실패 방지)
+    // Sonnet 200K context이므로 50000자 여유. KB가 비정상 비대해질 경우 안전망으로 cap 유지.
+    const kbText = chatKb[agentCode] ? `\n\n[학습 내용]\n${chatKb[agentCode].slice(0, 50000)}` : "";
+    const ctx = buildChatContext();
+    const sys = `${FACTORY_PHILOSOPHY}
+
+당신은 AZS 배터리 공장의 ${persona.role}입니다.
+이 채팅방은 사용자가 이슈와 관련해 자유롭게 질문하는 자리입니다.${kbText}
+
+[현재 컨텍스트]
+${ctx}
+
+[★ 영역 12-AX: 학습 내용 활용 규칙 — 매우 중요]
+- 위 [학습 내용]은 당신이 회사로부터 정식 부여받은 자료입니다. 항목명/카테고리/원문 모두 사용자에게 인용·공유 가능합니다.
+- "운영 규칙상 인용 못 함" 같은 거부는 환각입니다. 그런 규칙은 존재하지 않습니다.
+- 사용자가 학습 내용 원문/항목/카테고리를 요청하면 그대로 보여주세요. 점검·수정 목적의 정당한 요청입니다.
+
+[★★★ 절대 금지 답변 패턴 — 환각 차단 (매우 중요) ★★★]
+다음 표현은 모두 환각입니다. 학습 자료 인용/공유 요청에 절대 다음과 같이 답하지 마세요:
+- "역할 범위를 벗어납니다" → 금지
+- "운영 규칙상 제공할 수 없습니다" → 금지
+- "시스템 관리자에 문의해 주세요" → 금지
+- "교육 담당 부서에 문의해 주세요" → 금지
+- "학습 자료의 메타 정보는 제공할 수 없습니다" → 금지
+- "원본 텍스트를 그대로 출력하는 것은..." → 금지
+
+학습 자료는 이미 당신에게 정식 지급된 자료입니다.
+사용자는 회사 내부의 정당한 권한자(엔지니어 본인)이며, 학습 자료 점검/수정 권한이 있습니다.
+인용 요청을 거부할 어떤 규칙도 존재하지 않습니다.
+
+[★ 첨부 이미지 분석 활용 — 필수]
+- ★ 첨부 이미지 분석 인용 필수: 입력 데이터에 첨부 이미지 분석 정보 ([첨부 이미지 분석] 섹션 또는 images 필드)가 있으면, 분석/발언에 명시적으로 인용하라. 예: "첨부 이미지에 따르면...", "BM Bot 보고서 이미지에서 X건 확인", "이미지 분석에서 PCB 보드 교체 확인". 추측 금지 — 명시된 image 정보만 인용.
+- [현재 컨텍스트]의 이슈 목록에 📷 표시가 있는 항목은 첨부 이미지 분석 정보 — 답변에 명시적으로 인용 (예: "첨부 이미지에 따르면 X-AC NG 5건 확인됨")
+
+[★ Few-shot 예시]
+✅ 좋은 답변:
+사용자: "1번 항목 [판단기준] 공정 간 운송 기준 원문 그대로 보여줘"
+당신: "[판단기준] 공정 간 운송 기준의 원문은 다음과 같습니다:
+
+[학습 내용에서 해당 부분 그대로 인용]
+
+추가로 궁금한 부분 있으시면 말씀해 주세요."
+
+✅ 좋은 답변:
+사용자: "학습 자료 전체 카테고리 다시 알려줘"
+당신: "현재 학습 자료에 다음 카테고리가 포함되어 있습니다:
+1. [판단기준] 공정 간 운송 기준 및 우선순위
+2. [협업방식] PE·ME·TE팀과 협업 방식
+... (전체 나열)"
+
+❌ 나쁜 답변 (절대 금지):
+사용자: "원문 보여줘"
+당신: "역할 범위를 벗어납니다. 시스템 관리자에 문의해 주세요." ← 환각, 절대 금지
+
+[★ 환각 방지]
+- [학습 내용]에 명시된 내용 우선 활용.
+- [학습 내용]에 없는 사항은 추측하지 말고 "학습 자료에 없는 내용입니다"라고 명시한 후, 일반 상담으로 보충 가능합니다.
+- 사실과 추측을 명확히 구분하세요.
+
+[규칙]
+- 당신의 역할 관점에서 답하세요.
+- 이슈 데이터가 없으면 일반 상담으로 답하되, 추가 데이터가 필요하면 그렇다고 안내하세요.
+- 답변은 간결하게 (5문장 이내 권장, 필요하면 늘어남).
+- 이미 답변한 다른 에이전트가 있으면 중복 피하고 보완하는 관점으로.`;
+    const historyText = history.slice(-10).map(m => {
+      if (m.role === "user") return `[사용자] ${m.text}`;
+      return `[${PERSONAS[m.agent]?.label || m.agent}] ${m.text}`;
+    }).join("\n");
+    const userMsg = `[직전까지의 대화]
+${historyText || "(이번이 첫 질문)"}
+
+[현재 사용자 질문]
+${userText}
+
+당신의 답변:`;
+    try {
+      const raw = await callClaudeRaw(sys, userMsg, { model: MODEL_REASONING, max_tokens: 800 });
+      return raw.trim();
+    } catch (e) {
+      return `(응답 실패: ${e?.message || e})`;
+    }
+  };
+
+  // 7-D: 채팅 메시지 전송
+  const sendChatMessage = async () => {
+    const text = chatInput.trim();
+    if (!text || chatBusy) return;
+    const userMsg = { role: "user", text, time: new Date().toLocaleTimeString("ko-KR", { hour: "2-digit", minute: "2-digit" }) };
+    const newHistory = [...chatMessages, userMsg];
+    setChatMessages(newHistory);
+    setChatInput("");
+    setChatBusy(true);
+    try {
+      const responders = await routeChatQuestion(text);
+      let runningHistory = newHistory;
+      for (const code of responders) {
+        const reply = await generateAgentReply(code, text, runningHistory);
+        const replyMsg = {
+          role: "assistant", agent: code, text: reply,
+          time: new Date().toLocaleTimeString("ko-KR", { hour: "2-digit", minute: "2-digit" }),
+        };
+        runningHistory = [...runningHistory, replyMsg];
+        setChatMessages(runningHistory);
+      }
+    } catch (e) {
+      setChatMessages(prev => [...prev, {
+        role: "assistant", agent: "system",
+        text: `(시스템 오류: ${e?.message || e})`,
+        time: new Date().toLocaleTimeString("ko-KR", { hour: "2-digit", minute: "2-digit" }),
+      }]);
+    } finally {
+      setChatBusy(false);
+    }
+  };
+
+  // 7-D: 채팅방 개설 (에이전트 선택 후 KB 로드)
+  const openChatRoom = async () => {
+    if (chatAgents.length === 0) return;
+    setChatBusy(true);
+    try {
+      const kbResult = await loadSelectedKnowledge(chatAgents);
+      setChatKb(kbResult.kb || {});
+    } catch {
+      setChatKb({});  // KB 로드 실패해도 진행
+    }
+    setChatStage("active");
+    setChatBusy(false);
+  };
+
+  // 7-F: 대화 내용 TXT 다운로드
+  const downloadChatTxt = () => {
+    if (chatMessages.length === 0) return;
+    const stamp = new Date().toLocaleString("ko-KR");
+    let t = `AZS 자유 채팅방 대화 기록\n생성: ${stamp}\n참석 에이전트: ${chatAgents.map(a => `${a}(${PERSONAS[a]?.label || a})`).join(", ")}\n${"═".repeat(52)}\n\n`;
+    chatMessages.forEach(m => {
+      if (m.role === "user") {
+        t += `[${m.time}] 사용자\n  ${m.text}\n\n`;
+      } else {
+        const label = PERSONAS[m.agent]?.label || m.agent;
+        t += `[${m.time}] ${label}\n  ${m.text.replace(/\n/g, "\n  ")}\n\n`;
+      }
+    });
+    const blob = new Blob([t], { type: "text/plain;charset=utf-8" });
+    const url = URL.createObjectURL(blob);
+    Object.assign(document.createElement("a"), {
+      href: url, download: `chat_${new Date().toISOString().slice(0,10)}.txt`,
+    }).click();
+    URL.revokeObjectURL(url);
+  };
+
+  // 7-D: 채팅방 닫기 (대화 초기화)
+  const closeChatRoom = () => {
+    if (chatMessages.length > 0 && !window.confirm("대화가 사라집니다. TXT 저장 안 하셨다면 먼저 저장하세요. 그래도 닫을까요?")) return;
+    setChatOpen(false);
+    setChatStage("setup");
+    setChatAgents([]);
+    setChatMessages([]);
+    setChatInput("");
+    setChatKb({});
+  };
+
+  const reset = () => {
+    // ★ 12-AZ-6: STEP 0 제거 → 끝에 handleEnterTabMode()로 STEP 1(날짜) 자동 진입
+    setAllMsgs([]); setDates([]); setSelDates([]);
+    setSelRange({ start: null, end: null, unit: "day" });
+    setClassified(null); setPriority(null); setKbStats(null);
+    setDiscussions([]); setMinutes(null); setProgress([]);
+    setError(""); setSheetSaved(false); setReportType("daily");  // ★ 디폴트를 daily로
+    setTaggedIssues(null);
+    setSelectedProcess("Cell"); setExtraAgents([]);
+    // ★ 영역 6: 큐레이션 캐시 + 선택 상태 초기화
+    setPreCuration(null); setPreCategoryMsgs(null);
+    setAutoSelectedIds([]); setSelectedIssueIds([]);
+    setCurating(false);
+    // ★ 영역 7: 채팅방 상태 초기화
+    setChatOpen(false); setChatStage("setup"); setChatAgents([]);
+    setChatMessages([]); setChatInput(""); setChatKb({}); setChatBusy(false);
+    // ★ 큐 #20 Phase 5a UI: 패턴 분석 state 초기화
+    setPatternsResult(null); setPatternsLoading(false);
+    setPatternsExpanded(false); setPatternsLastRunAt(0);
+    setCloseStatus({});  // ★ 큐 #20: gap 닫기 진행 상태 초기화
+    // ★ 큐 #21: 칩/인풋/전체 토글도 초기값으로 복원 (reset 직후 다시 분석할 때 편의)
+    {
+      const today = new Date();
+      const dates = [];
+      for (let i = 6; i >= 0; i--) {
+        const d = new Date(today);
+        d.setDate(d.getDate() - i);
+        dates.push(`${d.getFullYear()}-${String(d.getMonth()+1).padStart(2,"0")}-${String(d.getDate()).padStart(2,"0")}`);
+      }
+      setPatternsDateChips(dates);
+      setPatternsAddInput("");
+      setPatternsUseAll(false);
+    }
+    // ★ 12-AZ-6: messages 탭 모드 + STEP 1 자동 진입
+    handleEnterTabMode();
+  };
+
+  // ─── 큐 #22 Phase B-1: 인증 분기 (authenticated 외 모두 별도 화면) ───
+  if (authStatus === "loading") {
+    return (
+      <div style={{
+        minHeight:"100vh", display:"flex", alignItems:"center", justifyContent:"center",
+        background:"linear-gradient(150deg,#03060d,#060d1c 55%,#040810)",
+        color:"#94a3b8", fontFamily:"'Noto Sans KR','Malgun Gothic',sans-serif",
+      }}>
+        <div style={{textAlign:"center"}}>
+          <div style={{fontSize:14, marginBottom:8}}>인증 상태 확인 중...</div>
+          <Spinner/>
+        </div>
+      </div>
+    );
+  }
+
+  if (authStatus === "unauthenticated") {
+    return <LoginScreen authError={authError} />;
+  }
+
+  if (authStatus === "forbidden") {
+    return <ForbiddenScreen email={authUserEmail} reason={authError} onLogout={handleLogout} />;
+  }
+
+  // 이하 인증 통과 — 기존 UI 진입
+  return (
+    <div style={{
+      minHeight:"100vh",
+      background:"linear-gradient(150deg,#03060d,#060d1c 55%,#040810)",
+      fontFamily:"'Noto Sans KR','Malgun Gothic',sans-serif", color:"#e2e8f0",
+    }}>
+      {/* Header */}
+      <div style={{
+        background:"rgba(3,6,13,0.96)", backdropFilter:"blur(12px)",
+        borderBottom:"1px solid rgba(34,211,238,0.12)",
+        padding:"12px 20px", position:"sticky", top:0, zIndex:100,
+        display:"flex", alignItems:"center", gap:12,
+      }}>
+        <div style={{
+          width:34, height:34, borderRadius:8,
+          background:"linear-gradient(135deg,#3b82f6,#22d3ee)",
+          display:"flex", alignItems:"center", justifyContent:"center", fontSize:17,
+        }}>🏭</div>
+        <div>
+          <div style={{fontSize:13,fontWeight:800,color:"#f1f5f9"}}>AZS · 논의 시스템 v3.1 · PE 큐레이션 + 대화형 논의</div>
+          <div style={{fontSize:9,color:"#22d3ee",letterSpacing:2,fontWeight:700}}>Cell · Elec · FA · Vision  |  AZS</div>
+        </div>
+        {step > 0 && (
+          <button onClick={reset} style={{
+            marginLeft:"auto", padding:"5px 12px",
+            background:"rgba(51,65,85,0.4)", border:"1px solid rgba(51,65,85,0.5)",
+            borderRadius:6, color:"#64748b", fontSize:11, cursor:"pointer",
+          }}>처음으로</button>
+        )}
+        {/* ★ 큐 #22: 우측 상단 사용자 정보 + 로그아웃 */}
+        <div style={{
+          marginLeft: step > 0 ? 6 : "auto",
+          display:"flex", alignItems:"center", gap:6,
+          fontSize:10, color:"#94a3b8",
+        }}>
+          <div style={{display:"flex", flexDirection:"column", alignItems:"flex-end", lineHeight:1.3}}>
+            <span style={{color:"#cbd5e1", fontWeight:700}}>{authUserName || authUserEmail.split("@")[0]}</span>
+            <span style={{fontSize:9, color:"#64748b"}}>{authUserEmail}</span>
+          </div>
+          <button onClick={handleLogout} style={{
+            padding:"4px 10px", fontSize:10,
+            background:"rgba(239,68,68,0.08)", border:"1px solid rgba(239,68,68,0.3)",
+            borderRadius:5, color:"#fca5a5", cursor:"pointer", fontWeight:700,
+          }} title="로그아웃">로그아웃</button>
+        </div>
+      </div>
+
+      <StepBar step={step}/>
+
+      <div style={{maxWidth:720, margin:"0 auto", padding:"24px 18px 60px"}}>
+
+        {/* STEP 1: 날짜 선택 (영역 12-AZ-6: 첫 페이지로 변경, 업로드 단계 제거) */}
+        {step===1 && (
+          <div>
+            <div style={{marginBottom:16}}>
+              <div style={{fontSize:17,fontWeight:800,color:"#f1f5f9",marginBottom:4}}>
+                {dataSource === "tab" ? "📡 분석할 일자 선택 (messages 탭)" : "날짜 범위 선택"}
+              </div>
+              <div style={{fontSize:12,color:"#475569"}}>
+                {dataSource === "tab"
+                  ? "지난 8개월 (~250일) 중 어제 1일이 기본 선택됨 · 변경 가능 · 인니 시간 기준"
+                  : `총 ${dates.length}일치 데이터 · 시작/끝 날짜 선택 (또는 빠른 선택 / 단위 변경)`}
+              </div>
+            </div>
+
+            <DateRangePicker
+              availableDates={dates}
+              selRange={selRange}
+              onChange={(r)=>{
+                setSelRange({ start: r.start, end: r.end, unit: r.unit });
+                setSelDates(r.dates || []);
+              }}
+            />
+
+            <div style={{display:"flex",gap:10, marginTop:12}}>
+              <button onClick={handleDateConfirm} disabled={selDates.length===0 || tabFetchLoading} style={{
+                flex:1, padding:"12px",
+                background: tabFetchLoading
+                  ? "#475569"
+                  : (selDates.length>0?"linear-gradient(135deg,#3b82f6,#22d3ee)":"rgba(51,65,85,0.3)"),
+                border:"none", borderRadius:8,
+                color:selDates.length>0?"#fff":"#374151",
+                fontSize:13, fontWeight:800,
+                cursor: tabFetchLoading ? "wait" : (selDates.length>0?"pointer":"not-allowed"),
+              }}>
+                {tabFetchLoading
+                  ? "messages 탭 조회 중..."
+                  : (selDates.length > 0
+                      ? (dataSource === "tab"
+                          ? `messages 탭 조회 (${selDates.length}일) →`
+                          : `보고서 종류 선택 (${selDates.length}일) →`)
+                      : "기간을 선택하세요")}
+              </button>
+            </div>
+
+            {/* ★ 12-AZ-6: 파일 업로드 보조 버튼 (옵션) */}
+            <div onClick={()=>fileRef.current?.click()} style={{
+              marginTop:14, padding:"10px 14px",
+              border:"1.5px dashed rgba(51,65,85,0.5)", borderRadius:8,
+              background:"rgba(34,211,238,0.02)",
+              fontSize:11, color:"#94a3b8", textAlign:"center", cursor:"pointer",
+              display:"flex", alignItems:"center", justifyContent:"center", gap:6,
+            }}>
+              <input ref={fileRef} type="file" accept=".txt,.zip" onChange={handleFile} style={{display:"none"}}/>
+              <span>📂</span>
+              <span>파일 업로드 (옵션) — .txt / .zip 백업 직접 분석</span>
+            </div>
+
+            {/* ★ 12-AZ-6: 안내 박스 (STEP 0에서 이동) */}
+            <div style={{
+              marginTop:12, padding:"10px 14px",
+              background:"rgba(34,211,238,0.05)",
+              border:"1px solid rgba(34,211,238,0.2)", borderRadius:8,
+              fontSize:11, color:"#22d3ee", lineHeight:1.7,
+            }}>
+              💡 날짜 기준: 06:00 이전 메시지는 전날 생산분으로 처리됩니다<br/>
+              📅 messages 탭 직접 조회 — zip 적재 25/10/1 ~ 현재까지 가능<br/>
+              🆕 v3.1: PE 사전 큐레이션 + 대화체 논의 + 이슈 상세 카드 + 기조치 평가
+            </div>
+          </div>
+        )}
+
+        {/* STEP 2: 보고서 종류 선택 */}
+        {step===2 && (
+          <div>
+            <div style={{marginBottom:20}}>
+              <div style={{fontSize:17,fontWeight:800,color:"#f1f5f9",marginBottom:4}}>어떤 문서를 만들까요?</div>
+              <div style={{fontSize:12,color:"#475569"}}>
+                선택한 보고서 종류에 맞게 AI가 논의를 진행합니다
+                {reportType==="weekly" && (
+                  <span style={{color:"#22d3ee"}}> · 주간 선택 시 해당 주 날짜 자동 선택</span>
+                )}
+              </div>
+            </div>
+
+            <div style={{display:"grid",gridTemplateColumns:"1fr 1fr",gap:12,marginBottom:16}}>
+              {REPORT_TYPES.map(rt => (
+                <button key={rt.id} onClick={()=>handleReportTypeSelect(rt.id)} style={{
+                  padding:"18px 16px", textAlign:"left",
+                  background: reportType===rt.id ? "rgba(167,139,250,0.15)" : "rgba(20,30,50,0.7)",
+                  border:`2px solid ${reportType===rt.id ? "#a78bfa" : "rgba(51,65,85,0.5)"}`,
+                  borderRadius:12, color: reportType===rt.id ? "#a78bfa" : "#64748b",
+                  cursor:"pointer", transition:"all 0.2s",
+                  transform: reportType===rt.id ? "translateY(-2px)" : "none",
+                }}>
+                  <div style={{fontSize:28,marginBottom:8}}>{rt.icon}</div>
+                  <div style={{fontSize:13,fontWeight:800,marginBottom:4}}>{rt.label}</div>
+                  <div style={{fontSize:10,opacity:0.7,lineHeight:1.5}}>{rt.desc}</div>
+                </button>
+              ))}
+            </div>
+
+            {reportType==="weekly" && selDates.length > 1 && (
+              <div style={{
+                padding:"10px 14px", background:"rgba(34,211,238,0.06)",
+                border:"1px solid rgba(34,211,238,0.2)", borderRadius:8,
+                fontSize:11, color:"#22d3ee", marginBottom:16,
+              }}>
+                📅 해당 주 자동 선택: {selDates.join(", ")}
+              </div>
+            )}
+
+            {/* 영역 11: 모드 토글 폐기 (간단/상세 모드 폐기) */}
+
+            <div style={{display:"flex",gap:10}}>
+              <BackBtn onClick={()=>setStep(1)} label="← 날짜 선택"/>
+              <button onClick={handleReportConfirm} style={{
+                flex:1, padding:"12px",
+                background:"linear-gradient(135deg,#a78bfa,#7c3aed)",
+                border:"none", borderRadius:8, color:"#fff",
+                fontSize:13, fontWeight:800, cursor:"pointer",
+              }}>이슈 브리핑 시작 →</button>
+            </div>
+          </div>
+        )}
+
+        {/* STEP 3: 이슈 확인 */}
+        {step===3 && classified && priority && (
+          <div>
+            <div style={{marginBottom:14}}>
+              <div style={{fontSize:17,fontWeight:800,color:"#f1f5f9",marginBottom:4}}>
+                AZS Factory 이슈 브리핑
+              </div>
+              <div style={{fontSize:11,color:"#94a3b8",lineHeight:1.6}}>
+                <strong style={{color:"#cbd5e1"}}>분석 기간:</strong> {buildProductionRangeLabel(selDates)}
+              </div>
+            </div>
+
+            {/* ★ 공정 선택 */}
+            <div style={{
+              background:"rgba(34,211,238,0.06)",
+              border:"1px solid rgba(34,211,238,0.2)",
+              borderRadius:10, padding:"14px 16px", marginBottom:12,
+            }}>
+              <div style={{fontSize:11,color:"#22d3ee",fontWeight:800,marginBottom:10}}>
+                🏭 분석 대상 공정 선택
+              </div>
+              <div style={{display:"flex",gap:10}}>
+                {Object.entries(PROCESSES).map(([key, proc]) => (
+                  <button key={key} onClick={()=>{
+                    setSelectedProcess(key);
+                    // 공정 변경 시 같은 공정의 추가 선택은 자동 제거
+                    setExtraAgents(prev => prev.filter(a => !PROCESSES[key].auto.includes(a)));
+                  }} style={{
+                    flex:1, padding:"10px 14px",
+                    background: selectedProcess===key ? "rgba(34,211,238,0.2)" : "rgba(15,23,42,0.6)",
+                    border:`1.5px solid ${selectedProcess===key ? "#22d3ee" : "rgba(51,65,85,0.5)"}`,
+                    borderRadius:8,
+                    color: selectedProcess===key ? "#22d3ee" : "#94a3b8",
+                    fontSize:12, fontWeight:700, cursor:"pointer",
+                    textAlign:"left",
+                  }}>
+                    <div>{proc.icon} {proc.label}</div>
+                    <div style={{fontSize:9,opacity:0.8,marginTop:3}}>
+                      자동 참여: {proc.auto.map(a => a.replace(`${key}_`,"")).join(" / ")}
+                    </div>
+                  </button>
+                ))}
+              </div>
+            </div>
+
+            {/* ★ 자동 참여 표시 (변경 불가) */}
+            <div style={{
+              background:"rgba(15,23,42,0.5)",
+              border:"1px solid rgba(51,65,85,0.4)",
+              borderRadius:10, padding:"12px 14px", marginBottom:12,
+            }}>
+              <div style={{fontSize:10,color:"#94a3b8",fontWeight:700,marginBottom:8}}>
+                ✅ 자동 참여 (변경 불가)
+              </div>
+              <div style={{display:"flex",gap:6,flexWrap:"wrap"}}>
+                {PROCESSES[selectedProcess].auto.map(code => {
+                  const p = PERSONAS[code];
+                  return (
+                    <span key={code} style={{
+                      fontSize:11, padding:"4px 10px",
+                      background:p.bg, color:p.color, fontWeight:700,
+                      border:`1px solid ${p.color}`, borderRadius:14,
+                    }}>{p.icon} {p.label}</span>
+                  );
+                })}
+              </div>
+            </div>
+
+            {/* ★ 추가 참여 에이전트 선택 (그룹 분류) */}
+            <div style={{
+              background:"rgba(167,139,250,0.05)",
+              border:"1px solid rgba(167,139,250,0.2)",
+              borderRadius:10, padding:"12px 14px", marginBottom:14,
+            }}>
+              <div style={{fontSize:10,color:"#a78bfa",fontWeight:700,marginBottom:10}}>
+                ➕ 추가 참여 에이전트 선택 (선택사항)
+                {extraAgents.length > 0 && (
+                  <span style={{marginLeft:8,color:"#cbd5e1"}}>
+                    {extraAgents.length}명 추가됨
+                  </span>
+                )}
+              </div>
+
+              {/* 다른 공정 자문 */}
+              <div style={{marginBottom:10}}>
+                <div style={{fontSize:9,color:"#64748b",fontWeight:700,marginBottom:6}}>
+                  ── 다른 공정 자문 ({PROCESSES[PROCESSES[selectedProcess].otherProcess].label})
+                </div>
+                <div style={{display:"flex",gap:6,flexWrap:"wrap"}}>
+                  {PROCESSES[PROCESSES[selectedProcess].otherProcess].auto.map(code => {
+                    const p = PERSONAS[code];
+                    const checked = extraAgents.includes(code);
+                    return (
+                      <label key={code} style={{
+                        fontSize:11, padding:"4px 10px",
+                        background: checked ? p.bg : "rgba(15,23,42,0.4)",
+                        color: checked ? p.color : "#64748b",
+                        border:`1px solid ${checked ? p.color : "rgba(51,65,85,0.5)"}`,
+                        borderRadius:14, cursor:"pointer", fontWeight: checked ? 700 : 400,
+                        display:"flex", alignItems:"center", gap:5,
+                      }}>
+                        <input
+                          type="checkbox"
+                          checked={checked}
+                          onChange={() => {
+                            setExtraAgents(prev =>
+                              checked ? prev.filter(a => a !== code) : [...prev, code]
+                            );
+                          }}
+                          style={{margin:0, cursor:"pointer"}}
+                        />
+                        {p.icon} {p.label}
+                      </label>
+                    );
+                  })}
+                </div>
+              </div>
+
+              {/* 공통 에이전트 */}
+              <div>
+                <div style={{fontSize:9,color:"#64748b",fontWeight:700,marginBottom:6}}>
+                  ── 공통 에이전트
+                </div>
+                <div style={{display:"flex",gap:6,flexWrap:"wrap"}}>
+                  {COMMON_AGENTS.map(code => {
+                    const p = PERSONAS[code];
+                    const checked = extraAgents.includes(code);
+                    return (
+                      <label key={code} style={{
+                        fontSize:11, padding:"4px 10px",
+                        background: checked ? p.bg : "rgba(15,23,42,0.4)",
+                        color: checked ? p.color : "#64748b",
+                        border:`1px solid ${checked ? p.color : "rgba(51,65,85,0.5)"}`,
+                        borderRadius:14, cursor:"pointer", fontWeight: checked ? 700 : 400,
+                        display:"flex", alignItems:"center", gap:5,
+                      }}>
+                        <input
+                          type="checkbox"
+                          checked={checked}
+                          onChange={() => {
+                            setExtraAgents(prev =>
+                              checked ? prev.filter(a => a !== code) : [...prev, code]
+                            );
+                          }}
+                          style={{margin:0, cursor:"pointer"}}
+                        />
+                        {p.icon} {p.label}
+                      </label>
+                    );
+                  })}
+                </div>
+              </div>
+
+              {/* ★ 큐 #21: PLC 분석 그룹 (자동참여 → 수동 선택으로 변경, 기본 체크 해제) */}
+              <div style={{marginTop:10}}>
+                <div style={{fontSize:9,color:"#64748b",fontWeight:700,marginBottom:6}}>
+                  ── PLC 분석 (선택 시 참여)
+                </div>
+                <div style={{display:"flex",gap:6,flexWrap:"wrap"}}>
+                  {PLC_AGENTS.map(code => {
+                    const p = PERSONAS[code];
+                    const checked = extraAgents.includes(code);
+                    return (
+                      <label key={code} style={{
+                        fontSize:11, padding:"4px 10px",
+                        background: checked ? p.bg : "rgba(15,23,42,0.4)",
+                        color: checked ? p.color : "#64748b",
+                        border:`1px solid ${checked ? p.color : "rgba(51,65,85,0.5)"}`,
+                        borderRadius:14, cursor:"pointer", fontWeight: checked ? 700 : 400,
+                        display:"flex", alignItems:"center", gap:5,
+                      }}>
+                        <input
+                          type="checkbox"
+                          checked={checked}
+                          onChange={() => {
+                            setExtraAgents(prev =>
+                              checked ? prev.filter(a => a !== code) : [...prev, code]
+                            );
+                          }}
+                          style={{margin:0, cursor:"pointer"}}
+                        />
+                        {p.icon} {p.label}
+                      </label>
+                    );
+                  })}
+                </div>
+              </div>
+
+              <div style={{fontSize:9,color:"#475569",marginTop:8,lineHeight:1.5}}>
+                💡 추가한 에이전트는 모든 DEEP/STANDARD 이슈에 참여합니다. (LITE는 사회자 단독)
+              </div>
+            </div>
+
+            {kbStats && (
+              <div style={{
+                background: kbStats.failed>0 ? "rgba(245,158,11,0.06)" : "rgba(52,211,153,0.06)",
+                border:`1px solid ${kbStats.failed>0 ? "rgba(245,158,11,0.25)" : "rgba(52,211,153,0.25)"}`,
+                borderRadius:8, padding:"8px 12px", marginBottom:12,
+                fontSize:10, display:"flex", gap:10, alignItems:"center", flexWrap:"wrap",
+              }}>
+                <span style={{color:kbStats.failed>0?"#f59e0b":"#34d399",fontWeight:800}}>
+                  {kbStats.failed>0?"⚠️ 학습 일부 로드 실패":"✅ 학습 로드 완료"}
+                </span>
+                {Object.entries(kbStats).filter(([k]) => PERSONAS[k]).map(([k, count]) => {
+                  const p = PERSONAS[k];
+                  return (
+                    <span key={k} style={{color:p.color}}>{p.icon}{k}:{count}건</span>
+                  );
+                })}
+              </div>
+            )}
+
+            <div style={{display:"flex",gap:8,marginBottom:14, flexWrap:"wrap"}}>
+              {[
+                {label:"🔴 장기부동",count:taggedIssues?.counts?.LONG_DOWNTIME || 0,color:"#ef4444",bg:"rgba(239,68,68,0.08)",border:"rgba(239,68,68,0.25)"},
+                {label:"🔁 반복",count:taggedIssues?.counts?.HIGH_FREQUENCY || 0,color:"#f59e0b",bg:"rgba(245,158,11,0.08)",border:"rgba(245,158,11,0.25)"},
+                {label:"⚙️ 조건변경",count:taggedIssues?.counts?.CONDITION_CHANGE || 0,color:"#34d399",bg:"rgba(52,211,153,0.08)",border:"rgba(52,211,153,0.25)"},
+                {label:"🧪 테스트/PM",count:taggedIssues?.counts?.TEST_PM || 0,color:"#22d3ee",bg:"rgba(34,211,238,0.08)",border:"rgba(34,211,238,0.25)"},
+                {label:"🟣 품질NG",count:taggedIssues?.counts?.QUALITY_NG || 0,color:"#a78bfa",bg:"rgba(167,139,250,0.08)",border:"rgba(167,139,250,0.25)"},
+              ].map(p => (
+                <div key={p.label} style={{
+                  flex:1, minWidth:90, background:p.bg, border:`1px solid ${p.border}`,
+                  borderRadius:8, padding:"10px", textAlign:"center",
+                }}>
+                  <div style={{fontSize:20,fontWeight:800,color:p.color}}>{p.count}</div>
+                  <div style={{fontSize:10,color:p.color,fontWeight:700}}>{p.label}</div>
+                </div>
+              ))}
+            </div>
+
+            {/* ★ 영역 5-G: 큐레이션 이력 카테고리 카운트 (참고 표시) */}
+            {classified && (classified.qualityMsgs?.length || classified.processChangeMsgs?.length || classified.testMsgs?.length || classified.ambiguousMsgs?.length) > 0 && (
+              <div style={{
+                background:"rgba(15,23,42,0.5)", border:"1px solid rgba(100,116,139,0.25)",
+                borderRadius:10, padding:"10px 12px", marginBottom:12,
+              }}>
+                <div style={{fontSize:10,color:"#94a3b8",fontWeight:800,marginBottom:8}}>
+                  📦 큐레이션 이력 카테고리 (본문 논의 외 — 보고서 상단에 정리됨)
+                </div>
+                <div style={{display:"flex",gap:8}}>
+                  {[
+                    {label:"🧪 품질",count:classified.qualityMsgs?.length || 0,color:"#a78bfa",bg:"rgba(167,139,250,0.08)",border:"rgba(167,139,250,0.2)"},
+                    {label:"⚙️ 공정변경",count:classified.processChangeMsgs?.length || 0,color:"#34d399",bg:"rgba(52,211,153,0.08)",border:"rgba(52,211,153,0.2)"},
+                    {label:"🔬 테스트",count:classified.testMsgs?.length || 0,color:"#22d3ee",bg:"rgba(34,211,238,0.08)",border:"rgba(34,211,238,0.2)"},
+                    {label:"🔀 모호",count:classified.ambiguousMsgs?.length || 0,color:"#94a3b8",bg:"rgba(100,116,139,0.08)",border:"rgba(100,116,139,0.2)"},
+                  ].map(c => (
+                    <div key={c.label} style={{
+                      flex:1, background:c.bg, border:`1px solid ${c.border}`,
+                      borderRadius:6, padding:"6px 8px", textAlign:"center",
+                    }}>
+                      <div style={{fontSize:14,fontWeight:800,color:c.color}}>{c.count}</div>
+                      <div style={{fontSize:9,color:c.color,fontWeight:700}}>{c.label}</div>
+                    </div>
+                  ))}
+                </div>
+                {(classified.ambiguousMsgs?.length || 0) > 0 && (
+                  <div style={{fontSize:9,color:"#64748b",marginTop:6}}>
+                    ※ 모호 {classified.ambiguousMsgs.length}건은 분석 시작 시 AI(Haiku)가 카테고리 판정
+                  </div>
+                )}
+              </div>
+            )}
+
+            <div style={{
+              background:"rgba(167,139,250,0.06)", border:"1px solid rgba(167,139,250,0.2)",
+              borderRadius:10, padding:"12px 14px", marginBottom:12,
+            }}>
+              <div style={{fontSize:10,color:"#a78bfa",fontWeight:800,marginBottom:8}}>
+                🔍 차등 논의 모드 안내 · 참여 {PROCESSES[selectedProcess].auto.length + extraAgents.length}명
+              </div>
+              <div style={{fontSize:11,color:"#cbd5e1",lineHeight:1.7}}>
+                🔴 DEEP: 사용자 추가 또는 LONG_DOWNTIME tag → 5섹션 풀 논의<br/>
+                🟡 STANDARD: HIGH_FREQUENCY tag만 → 액션 플랜<br/>
+                🟢 LITE: 자동 분류 → 압축 평가<br/>
+                <span style={{color:"#a78bfa",fontWeight:800}}>
+                  체크박스로 선택한 이슈만 본문 논의 대상
+                </span>
+              </div>
+              <div style={{fontSize:9,color:"#475569",marginTop:6}}>
+                ※ 안전·환경·SAR/NCR/HOLD 키워드 감지 시 자동 DEEP 강제
+              </div>
+            </div>
+
+            {/* ★ 영역 6-C: 큐레이션 로딩 표시 (사전 실행 중일 때만) */}
+            {curating && (
+              <div style={{
+                background:"rgba(59,130,246,0.05)", border:"1px solid rgba(59,130,246,0.25)",
+                borderRadius:10, padding:"14px 16px", marginBottom:12,
+                display:"flex", alignItems:"center", gap:10,
+              }}>
+                <Spinner/>
+                <div style={{fontSize:11,color:"#93c5fd"}}>
+                  PE 사전 큐레이션 실행 중... (전체 이슈 정리, 약 30초 소요)
+                </div>
+              </div>
+            )}
+
+            {/* ★ 영역 11-K: 이슈 브리핑 (HTML 1~5번) — 인라인 체크박스 통합 */}
+            {!curating && preCuration && taggedIssues && (
+              <div style={{marginBottom:14}}>
+                <div style={{
+                  display:"flex", alignItems:"center", justifyContent:"space-between",
+                  marginBottom:10, padding:"4px 0",
+                }}>
+                  <div style={{fontSize:12,fontWeight:800,color:"#22d3ee"}}>
+                    📋 이슈 브리핑 — 본문에서 직접 체크하여 논의 대상 선정
+                  </div>
+                  <div style={{fontSize:10,color:"#22d3ee",fontWeight:700}}>
+                    선택 {selectedIssueIds.length}건 / 자동 {autoSelectedIds.length}건 / 전체 {(taggedIssues.issues || []).length}건
+                  </div>
+                </div>
+
+                {/* 일괄 액션 버튼 */}
+                <div style={{display:"flex",gap:6,marginBottom:10, flexWrap:"wrap"}}>
+                  <button onClick={()=>setSelectedIssueIds((taggedIssues.issues || []).map(getIssueId))} style={{
+                    fontSize:9, padding:"3px 8px", borderRadius:4,
+                    background:"rgba(34,211,238,0.1)", border:"1px solid rgba(34,211,238,0.3)",
+                    color:"#22d3ee", cursor:"pointer", fontWeight:700,
+                  }}>전체 선택</button>
+                  <button onClick={()=>setSelectedIssueIds([])} style={{
+                    fontSize:9, padding:"3px 8px", borderRadius:4,
+                    background:"rgba(100,116,139,0.1)", border:"1px solid rgba(100,116,139,0.3)",
+                    color:"#94a3b8", cursor:"pointer", fontWeight:700,
+                  }}>전체 해제</button>
+                  <button onClick={()=>setSelectedIssueIds([...autoSelectedIds])} style={{
+                    fontSize:9, padding:"3px 8px", borderRadius:4,
+                    background:"rgba(245,158,11,0.1)", border:"1px solid rgba(245,158,11,0.3)",
+                    color:"#f59e0b", cursor:"pointer", fontWeight:700,
+                  }}>자동 선정만 (⭐)</button>
+                </div>
+
+                <BriefingDisplay
+                  curation={preCuration}
+                  allIssues={taggedIssues.issues || []}
+                  selectedIds={selectedIssueIds}
+                  autoSelectedIds={autoSelectedIds}
+                  onToggle={toggleIssueSelection}
+                  onToggleMany={(ids, shouldCheck) => {
+                    setSelectedIssueIds(prev => {
+                      if (shouldCheck) {
+                        const next = new Set(prev);
+                        ids.forEach(id => next.add(id));
+                        return Array.from(next);
+                      } else {
+                        return prev.filter(id => !ids.includes(id));
+                      }
+                    });
+                  }}
+                />
+              </div>
+            )}
+
+            <div style={{
+              background:"rgba(167,139,250,0.06)", border:"1px solid rgba(167,139,250,0.2)",
+              borderRadius:8, padding:"10px 14px", marginBottom:14,
+              display:"flex", alignItems:"center", justifyContent:"space-between",
+            }}>
+              <span style={{fontSize:11,color:"#a78bfa",fontWeight:700}}>
+                {REPORT_TYPES.find(r=>r.id===reportType)?.icon} {REPORT_TYPES.find(r=>r.id===reportType)?.label}
+              </span>
+              <button onClick={()=>setStep(2)} style={{
+                background:"transparent", border:"1px solid rgba(167,139,250,0.3)",
+                borderRadius:5, color:"#a78bfa", fontSize:10, cursor:"pointer", padding:"2px 8px",
+              }}>변경</button>
+            </div>
+
+            {/* ★ 큐 #15 Phase 5c: 자동 비교 고정 상태 (자리 비워도 남음) */}
+            {autoCompareStatus && (
+              <div style={{
+                background: autoCompareStatus.state === "done" ? "rgba(52,211,153,0.08)"
+                          : autoCompareStatus.state === "failed" ? "rgba(239,68,68,0.08)"
+                          : autoCompareStatus.state === "skipped" ? "rgba(148,163,184,0.08)"
+                          : "rgba(167,139,250,0.08)",
+                border: `1px solid ${autoCompareStatus.state === "done" ? "rgba(52,211,153,0.3)"
+                          : autoCompareStatus.state === "failed" ? "rgba(239,68,68,0.3)"
+                          : autoCompareStatus.state === "skipped" ? "rgba(148,163,184,0.3)"
+                          : "rgba(167,139,250,0.3)"}`,
+                borderRadius:8, padding:"10px 14px", marginBottom:14,
+                display:"flex", alignItems:"center", gap:8, fontSize:12, fontWeight:600,
+                color: autoCompareStatus.state === "done" ? "#34d399"
+                     : autoCompareStatus.state === "failed" ? "#ef4444"
+                     : autoCompareStatus.state === "skipped" ? "#94a3b8" : "#a78bfa",
+              }}>
+                {autoCompareStatus.state === "running" && <Spinner/>}
+                {autoCompareStatus.state === "running" && `🔍 품질 비교 중... (${autoCompareStatus.date}) — 백그라운드 진행, 자리 비우셔도 됩니다`}
+                {autoCompareStatus.state === "done" && `✅ 품질 비교 완료 (${autoCompareStatus.date}, gap ${autoCompareStatus.gapCount}건 적재)`}
+                {autoCompareStatus.state === "skipped" && `ℹ️ 이미 비교된 날짜 (${autoCompareStatus.date}) — 비교 생략`}
+                {autoCompareStatus.state === "failed" && `⚠️ 품질 비교 실패${autoCompareStatus.date ? ` (${autoCompareStatus.date})` : ""} — ${autoCompareStatus.message || ""}`}
+              </div>
+            )}
+
+            {/* ★ 큐 #15 Phase 5c: 업데이트 준비 배지 (open gap 누적 3일치 이상) */}
+            {updateReady && updateReady.ready && (
+              <div style={{
+                background:"rgba(251,191,36,0.1)", border:"1px solid rgba(251,191,36,0.4)",
+                borderRadius:8, padding:"10px 14px", marginBottom:8,
+                display:"flex", alignItems:"center", gap:8, fontSize:12, fontWeight:700, color:"#fbbf24",
+              }}>
+                🔧 로직 업데이트 준비됨 (누적 {updateReady.dateCount}일치)
+              </div>
+            )}
+
+            {/* ★ 큐 #20 Phase 5a UI: 패턴 분석 버튼 + in-place 패널 */}
+            {updateReady && updateReady.ready && (
+              <div style={{marginBottom:14}}>
+                {/* ★ 큐 #21: 칩 UI — 캡슐 + 우측 ❌ + 일자 추가 + 전체 분석 토글 */}
+                <div style={{
+                  fontSize:10, color:"#a78bfa", fontWeight:700, marginBottom:6,
+                  display:"flex", alignItems:"center", justifyContent:"space-between", gap:8, flexWrap:"wrap",
+                }}>
+                  <span>📅 분석 대상 일자 {patternsUseAll ? "(전체 모드 — 칩 무시)" : `(${patternsDateChips.length}개 선택, ❌ 탭하여 제거)`}</span>
+                  <label style={{
+                    fontSize:9, color: patternsUseAll ? "#34d399" : "#64748b", cursor:"pointer",
+                    display:"flex", alignItems:"center", gap:4, fontWeight:600,
+                  }}>
+                    <input
+                      type="checkbox"
+                      checked={patternsUseAll}
+                      onChange={(e) => setPatternsUseAll(e.target.checked)}
+                      disabled={patternsLoading}
+                      style={{margin:0, cursor:"pointer"}}
+                    />
+                    🌐 전체 분석으로 전환
+                  </label>
+                </div>
+
+                {/* 칩 영역 */}
+                <div style={{
+                  display:"flex", gap:6, flexWrap:"wrap",
+                  padding:"8px 10px", marginBottom:6,
+                  background:"rgba(15,23,42,0.4)",
+                  border:`1px solid ${patternsDateChips.length === 0 && !patternsUseAll ? "rgba(245,158,11,0.5)" : "rgba(124,58,237,0.25)"}`,
+                  borderRadius:6, minHeight:36, alignItems:"center",
+                  opacity: patternsUseAll ? 0.4 : 1,
+                  transition: "opacity 0.2s",
+                }}>
+                  {patternsDateChips.length === 0 ? (
+                    <span style={{fontSize:10, color: patternsUseAll ? "#64748b" : "#fbbf24"}}>
+                      {patternsUseAll
+                        ? "전체 분석 모드 — 누적 open gap 전부 분석"
+                        : "⚠️ 분석할 일자가 없습니다 — 아래 인풋으로 일자 추가 또는 전체 분석으로 전환"}
+                    </span>
+                  ) : (
+                    [...patternsDateChips].sort().map(d => (
+                      <span key={d} style={{
+                        display:"inline-flex", alignItems:"center", gap:4,
+                        padding:"3px 4px 3px 10px", fontSize:10, fontFamily:"monospace",
+                        background:"rgba(124,58,237,0.18)", color:"#c4b5fd",
+                        border:"1px solid rgba(124,58,237,0.35)", borderRadius:14,
+                        fontWeight:600,
+                      }}>
+                        {d}
+                        <button
+                          onClick={() => setPatternsDateChips(prev => prev.filter(x => x !== d))}
+                          disabled={patternsLoading || patternsUseAll}
+                          title="이 일자 제거"
+                          style={{
+                            width:18, height:18, padding:0, marginLeft:2,
+                            background:"rgba(0,0,0,0.2)", color:"#c4b5fd",
+                            border:"none", borderRadius:9,
+                            cursor: (patternsLoading || patternsUseAll) ? "default" : "pointer",
+                            fontSize:11, lineHeight:"18px", fontWeight:700,
+                          }}
+                        >×</button>
+                      </span>
+                    ))
+                  )}
+                </div>
+
+                {/* + 일자 추가 인풋 */}
+                <div style={{
+                  display:"flex", gap:6, marginBottom:10, alignItems:"center",
+                  opacity: patternsUseAll ? 0.4 : 1,
+                }}>
+                  <input
+                    type="text"
+                    value={patternsAddInput}
+                    onChange={(e) => setPatternsAddInput(e.target.value)}
+                    onKeyDown={(e) => {
+                      if (e.key === "Enter") {
+                        e.preventDefault();
+                        const v = patternsAddInput.trim();
+                        if (/^\d{4}-\d{2}-\d{2}$/.test(v) && !patternsDateChips.includes(v)) {
+                          setPatternsDateChips(prev => [...prev, v]);
+                          setPatternsAddInput("");
+                        }
+                      }
+                    }}
+                    placeholder="YYYY-MM-DD (예: 2026-05-19)"
+                    disabled={patternsLoading || patternsUseAll}
+                    style={{
+                      flex:1, padding:"5px 8px", fontSize:10,
+                      background:"rgba(15,23,42,0.6)", border:"1px solid rgba(124,58,237,0.3)",
+                      borderRadius:5, color:"#cbd5e1", fontFamily:"monospace",
+                    }}
+                  />
+                  <button
+                    onClick={() => {
+                      const v = patternsAddInput.trim();
+                      if (/^\d{4}-\d{2}-\d{2}$/.test(v) && !patternsDateChips.includes(v)) {
+                        setPatternsDateChips(prev => [...prev, v]);
+                        setPatternsAddInput("");
+                      }
+                    }}
+                    disabled={patternsLoading || patternsUseAll || !/^\d{4}-\d{2}-\d{2}$/.test(patternsAddInput.trim()) || patternsDateChips.includes(patternsAddInput.trim())}
+                    style={{
+                      padding:"5px 12px", fontSize:10,
+                      background:"rgba(124,58,237,0.15)", border:"1px solid rgba(124,58,237,0.4)",
+                      borderRadius:5, color:"#c4b5fd", cursor:"pointer", fontWeight:700,
+                      whiteSpace:"nowrap",
+                    }}
+                  >+ 일자 추가</button>
+                </div>
+
+                <div style={{display:"flex", gap:8, marginBottom: patternsExpanded ? 10 : 0}}>
+                  <button
+                    onClick={()=>runPatternAnalysis()}
+                    disabled={patternsLoading || (!patternsUseAll && patternsDateChips.length === 0)}
+                    style={{
+                    flex:1, padding:"9px 14px",
+                    background: patternsLoading ? "rgba(100,116,139,0.4)"
+                              : (!patternsUseAll && patternsDateChips.length === 0) ? "rgba(100,116,139,0.3)"
+                              : "linear-gradient(135deg,#7c3aed,#a78bfa)",
+                    border:"none", borderRadius:7, color:"#fff",
+                    fontSize:12, fontWeight:800,
+                    cursor: patternsLoading ? "wait" : "pointer",
+                    display:"flex", alignItems:"center", justifyContent:"center", gap:6,
+                  }}>
+                    {patternsLoading ? <><Spinner/>패턴 분석 중... (Sonnet, 30~60초)</>
+                      : patternsResult && !patternsResult._error
+                        ? `🔍 패턴 분석 결과 보기 (${patternsResult.patternCount}개 식별됨)`
+                        : "🔍 누적 Gap 패턴 분석 실행"}
+                  </button>
+                  {patternsResult && patternsExpanded && (
+                    <button onClick={()=>setPatternsExpanded(false)} style={{
+                      padding:"9px 14px", background:"transparent",
+                      border:"1px solid rgba(167,139,250,0.4)", borderRadius:7,
+                      color:"#a78bfa", fontSize:12, fontWeight:700, cursor:"pointer",
+                    }}>접기</button>
+                  )}
+                </div>
+
+                {patternsExpanded && patternsResult && (
+                  <div style={{
+                    background:"rgba(124,58,237,0.05)",
+                    border:"1px solid rgba(124,58,237,0.25)",
+                    borderRadius:8, padding:"14px 16px",
+                  }}>
+                    {patternsResult._error ? (
+                      <div style={{color:"#fca5a5", fontSize:12, lineHeight:1.7}}>
+                        ❌ 분석 실패: {patternsResult._error}
+                      </div>
+                    ) : (
+                      <>
+                        {/* 헤더: 메타 정보 */}
+                        <div style={{
+                          display:"flex", justifyContent:"space-between", alignItems:"center",
+                          paddingBottom:10, marginBottom:10,
+                          borderBottom:"1px solid rgba(124,58,237,0.2)",
+                          flexWrap:"wrap", gap:8,
+                        }}>
+                          <div style={{fontSize:11, color:"#cbd5e1"}}>
+                            <b style={{color:"#a78bfa"}}>📊 분석 대상:</b> open gap {patternsResult.gapCount}건
+                            {patternsResult.totalGapCount && patternsResult.totalGapCount !== patternsResult.gapCount && (
+                              <span style={{color:"#64748b"}}> (전체 {patternsResult.totalGapCount}건 중 필터링)</span>
+                            )}
+                            {" · "}
+                            <b style={{color:"#a78bfa"}}>식별 패턴:</b> {patternsResult.patternCount}개 ·{" "}
+                            <b style={{color:"#a78bfa"}}>소요:</b> {patternsResult.elapsedSec}초
+                            {patternsResult._dateFilter && (
+                              <div style={{fontSize:9, color:"#94a3b8", marginTop:3, fontFamily:"monospace"}}>
+                                🆕 일자 필터: {patternsResult._dateFilter.join(", ")}
+                              </div>
+                            )}
+                          </div>
+                          <div style={{display:"flex", gap:6}}>
+                            <button onClick={downloadPatternsHtml} style={{
+                              padding:"4px 10px", fontSize:10,
+                              background:"rgba(52,211,153,0.1)", border:"1px solid rgba(52,211,153,0.3)",
+                              borderRadius:5, color:"#34d399", cursor:"pointer", fontWeight:700,
+                            }}>📥 HTML 저장</button>
+                            <button onClick={()=>runPatternAnalysis({force:true})} disabled={patternsLoading} style={{
+                              padding:"4px 10px", fontSize:10,
+                              background:"rgba(245,158,11,0.1)", border:"1px solid rgba(245,158,11,0.3)",
+                              borderRadius:5, color:"#fbbf24", cursor:patternsLoading?"wait":"pointer", fontWeight:700,
+                            }} title="쿨다운 무시하고 다시 분석">🔄 재분석</button>
+                          </div>
+                        </div>
+
+                        {/* 전체 요약 */}
+                        {patternsResult.summary && (
+                          <div style={{
+                            fontSize:11, color:"#cbd5e1", lineHeight:1.7,
+                            padding:"10px 12px", marginBottom:12,
+                            background:"rgba(15,23,42,0.5)", borderLeft:"3px solid #a78bfa",
+                            borderRadius:5,
+                          }}>
+                            <b style={{color:"#a78bfa"}}>📋 요약:</b> {patternsResult.summary}
+                          </div>
+                        )}
+
+                        {/* 패턴 카드 (severity → gap_count 정렬) */}
+                        {(() => {
+                          const sorted = [...patternsResult.patterns].sort((a,b) => {
+                            const order = { high:0, medium:1, low:2 };
+                            const sa = order[a.severity] ?? 9, sb = order[b.severity] ?? 9;
+                            if (sa !== sb) return sa - sb;
+                            return (b.gap_count || 0) - (a.gap_count || 0);
+                          });
+                          const sevStyle = (s) =>
+                            s === "high"   ? { color:"#fca5a5", bg:"rgba(192,57,43,0.15)", border:"#c0392b", icon:"🚨", label:"HIGH" } :
+                            s === "medium" ? { color:"#fdba74", bg:"rgba(230,126,34,0.15)", border:"#e67e22", icon:"🔴", label:"MEDIUM" } :
+                                             { color:"#fde047", bg:"rgba(212,172,13,0.15)", border:"#d4ac0d", icon:"🟡", label:"LOW" };
+                          return sorted.map((p, i) => {
+                            const sty = sevStyle(p.severity);
+                            const pid = p.pattern_id || `idx-${p.title?.slice(0,20)}`;
+                            const cs = closeStatus[pid] || { stage: "idle" };
+                            const isDone = cs.stage === "done";
+                            const idsCount = (p.affected_gap_ids || []).length;
+                            return (
+                              <div key={i} style={{
+                                background: isDone ? "rgba(15,23,42,0.3)" : "rgba(15,23,42,0.5)",
+                                border:`1px solid ${sty.border}40`,
+                                borderLeft:`5px solid ${sty.border}`,
+                                borderRadius:6, padding:"10px 14px", marginBottom:8,
+                                opacity: isDone ? 0.55 : 1,  // ★ 큐 #20: 닫힌 패턴 회색처리
+                                transition: "opacity 0.3s",
+                              }}>
+                                <div style={{
+                                  display:"flex", alignItems:"center", justifyContent:"space-between",
+                                  marginBottom:6, gap:8, flexWrap:"wrap",
+                                }}>
+                                  <div style={{fontSize:12, fontWeight:800, color:sty.color, flex:1, minWidth:0}}>
+                                    {i+1}. {p.title}
+                                  </div>
+                                  <div style={{display:"flex", gap:6, flexShrink:0}}>
+                                    <span style={{
+                                      fontSize:9, padding:"2px 8px",
+                                      background:sty.bg, color:sty.color, fontWeight:800,
+                                      borderRadius:10,
+                                    }}>{sty.icon} {sty.label}</span>
+                                    <span style={{
+                                      fontSize:9, padding:"2px 8px",
+                                      background:"rgba(124,58,237,0.2)", color:"#c4b5fd",
+                                      borderRadius:10, fontWeight:700,
+                                    }}>{p.gap_count}건</span>
+                                  </div>
+                                </div>
+
+                                <div style={{fontSize:10.5, color:"#cbd5e1", lineHeight:1.7}}>
+                                  {p.hypothesis && (
+                                    <div style={{marginBottom:4}}>
+                                      <b style={{color:"#fca5a5"}}>🎯 원인 가설:</b> {p.hypothesis}
+                                    </div>
+                                  )}
+                                  {p.affected_code_area && (
+                                    <div style={{marginBottom:4}}>
+                                      <b style={{color:"#93c5fd"}}>📍 영향 코드:</b>{" "}
+                                      <code style={{
+                                        background:"rgba(0,0,0,0.3)", padding:"1px 6px", borderRadius:3,
+                                        fontSize:10, color:"#93c5fd",
+                                      }}>{p.affected_code_area}</code>
+                                    </div>
+                                  )}
+                                  {p.recommended_action && (
+                                    <div style={{marginBottom:4}}>
+                                      <b style={{color:"#86efac"}}>💡 권장 액션:</b> {p.recommended_action}
+                                    </div>
+                                  )}
+                                  {p.pattern_id && (
+                                    <div style={{fontSize:9, color:"#64748b", marginTop:4}}>
+                                      ID: <code style={{fontSize:9}}>{p.pattern_id}</code>
+                                      {p.affected_gap_ids?.length > 0 && (
+                                        <>{" · "}gap IDs: <span style={{fontFamily:"monospace"}}>{p.affected_gap_ids.slice(0,5).join(", ")}{p.affected_gap_ids.length > 5 ? ` (+${p.affected_gap_ids.length-5})` : ""}</span></>
+                                      )}
+                                    </div>
+                                  )}
+                                </div>
+
+                                {/* ★ 큐 #20 P6 사이클: gap 닫기 UI 행 (인라인 2단계 확인) */}
+                                {idsCount > 0 && (
+                                  <div style={{
+                                    marginTop:10, paddingTop:8,
+                                    borderTop:`1px dashed ${sty.border}40`,
+                                    display:"flex", alignItems:"center", gap:8, flexWrap:"wrap",
+                                  }}>
+                                    {cs.stage === "idle" && (
+                                      <button onClick={()=>closeGapsForPattern(p, "request")} style={{
+                                        padding:"5px 12px", fontSize:10,
+                                        background:"rgba(52,211,153,0.1)", border:"1px solid rgba(52,211,153,0.4)",
+                                        borderRadius:5, color:"#34d399", cursor:"pointer", fontWeight:700,
+                                      }}>🔒 이 패턴의 gap {idsCount}건 닫기 (resolved)</button>
+                                    )}
+                                    {cs.stage === "confirming" && (
+                                      <>
+                                        <span style={{fontSize:10, color:"#fbbf24", fontWeight:700}}>
+                                          ⚠️ {idsCount}건을 resolved로 닫습니다. 확정하시겠습니까?
+                                        </span>
+                                        <button onClick={()=>closeGapsForPattern(p, "confirm")} style={{
+                                          padding:"5px 12px", fontSize:10,
+                                          background:"linear-gradient(135deg,#10b981,#34d399)", border:"none",
+                                          borderRadius:5, color:"#fff", cursor:"pointer", fontWeight:800,
+                                        }}>✓ 확정</button>
+                                        <button onClick={()=>closeGapsForPattern(p, "cancel")} style={{
+                                          padding:"5px 12px", fontSize:10,
+                                          background:"transparent", border:"1px solid rgba(100,116,139,0.4)",
+                                          borderRadius:5, color:"#94a3b8", cursor:"pointer", fontWeight:700,
+                                        }}>✕ 취소</button>
+                                      </>
+                                    )}
+                                    {cs.stage === "closing" && (
+                                      <span style={{fontSize:10, color:"#a78bfa", display:"flex", alignItems:"center", gap:6}}>
+                                        <Spinner/> Apps Script gaplog.update 호출 중...
+                                      </span>
+                                    )}
+                                    {cs.stage === "done" && (
+                                      <div style={{display:"flex", flexDirection:"column", gap:2}}>
+                                        <span style={{fontSize:10, color:"#34d399", fontWeight:700}}>
+                                          ✅ {cs.result?.updatedCount || idsCount}건 closed
+                                          {cs.result?.closed_at && ` · ${new Date(cs.result.closed_at).toLocaleString("ko-KR", { month:"2-digit", day:"2-digit", hour:"2-digit", minute:"2-digit" })}`}
+                                        </span>
+                                        {cs.result?.resolved_in_cycle && (
+                                          <span style={{fontSize:9, color:"#94a3b8", fontFamily:"monospace"}}>
+                                            🏷️ {cs.result.resolved_in_cycle}
+                                          </span>
+                                        )}
+                                      </div>
+                                    )}
+                                    {cs.stage === "error" && (
+                                      <>
+                                        <span style={{fontSize:10, color:"#fca5a5", fontWeight:700}}>
+                                          ❌ 실패: {cs.error?.slice(0, 100)}
+                                        </span>
+                                        <button onClick={()=>closeGapsForPattern(p, "request")} style={{
+                                          padding:"3px 10px", fontSize:9,
+                                          background:"rgba(245,158,11,0.1)", border:"1px solid rgba(245,158,11,0.3)",
+                                          borderRadius:4, color:"#fbbf24", cursor:"pointer", fontWeight:700,
+                                        }}>🔄 다시 시도</button>
+                                      </>
+                                    )}
+                                  </div>
+                                )}
+                              </div>
+                            );
+                          });
+                        })()}
+
+                        <div style={{
+                          fontSize:9, color:"#64748b", marginTop:10, textAlign:"center", fontStyle:"italic",
+                        }}>
+                          ※ 패턴 분석 결과는 정보 제공용입니다. 실제 코드 패치는 별도 의사결정 후 진행하세요.
+                        </div>
+                      </>
+                    )}
+                  </div>
+                )}
+              </div>
+            )}
+
+
+            {progress.length > 0 && (
+              <div style={{
+                background:"rgba(15,23,42,0.7)", border:"1px solid rgba(51,65,85,0.3)",
+                borderRadius:10, padding:"14px 16px", marginBottom:14,
+                maxHeight:280, overflowY:"auto",
+              }}>
+                {progress.map((p,i) => (
+                  <div key={i} style={{
+                    fontSize:11, color: p.startsWith("✅") ? "#34d399" : p.startsWith("⚠️") ? "#f59e0b" : p.startsWith("🚨") ? "#ef4444" : "#94a3b8",
+                    marginBottom:6, display:"flex", alignItems:"center", gap:8,
+                  }}>
+                    {i === progress.length-1 && running && <Spinner/>}
+                    {p}
+                  </div>
+                ))}
+              </div>
+            )}
+
+            {error && (
+              <div style={{
+                padding:"10px 14px", background:"rgba(239,68,68,0.08)",
+                border:"1px solid rgba(239,68,68,0.25)", borderRadius:8,
+                fontSize:11, color:"#fca5a5", marginBottom:12,
+                wordBreak:"break-all", lineHeight:1.6, whiteSpace:"pre-wrap",
+              }}>❌ {error}</div>
+            )}
+
+            <div style={{display:"flex",gap:10}}>
+              <BackBtn onClick={()=>setStep(2)} label="← 보고서 변경"/>
+              <button onClick={runAnalysis} disabled={running || curating || selectedIssueIds.length === 0} style={{
+                flex:1, padding:"12px",
+                background:(running||curating||selectedIssueIds.length===0)?"rgba(51,65,85,0.3)":"linear-gradient(135deg,#3b82f6,#22d3ee)",
+                border:"none", borderRadius:8,
+                color:(running||curating||selectedIssueIds.length===0)?"#374151":"#fff",
+                fontSize:13, fontWeight:800,
+                cursor:(running||curating||selectedIssueIds.length===0)?"not-allowed":"pointer",
+                display:"flex", alignItems:"center", justifyContent:"center", gap:8,
+              }}>
+                {running ? <><Spinner/>분석 진행 중...</>
+                  : curating ? <><Spinner/>큐레이션 준비 중...</>
+                  : selectedIssueIds.length === 0 ? "⚠️ 논의할 이슈 1건 이상 선택하세요"
+                  : `🔍 차등 논의 및 보고서 생성 (${selectedIssueIds.length}건) →`}
+              </button>
+            </div>
+          </div>
+        )}
+
+        {/* STEP 4: 결과 */}
+        {step===4 && minutes && (
+          <div>
+            <div style={{marginBottom:14}}>
+              <div style={{fontSize:17,fontWeight:800,color:"#f1f5f9",marginBottom:4}}>보고서 완성</div>
+              {sheetSaved && (
+                <div style={{fontSize:11,color:"#34d399"}}>✅ 구글 시트에 자동 저장 완료</div>
+              )}
+            </div>
+
+            {/* ★ 공정 / 참여 에이전트 정보 */}
+            {minutes.process && minutes.allowedAgents && (
+              <div style={{
+                background:"rgba(34,211,238,0.06)",
+                border:"1px solid rgba(34,211,238,0.2)",
+                borderRadius:10, padding:"10px 14px", marginBottom:14,
+                display:"flex", gap:12, alignItems:"center", flexWrap:"wrap",
+              }}>
+                <span style={{fontSize:11,fontWeight:800,color:"#22d3ee"}}>
+                  {PROCESSES[minutes.process]?.icon} {PROCESSES[minutes.process]?.label}
+                </span>
+                <span style={{fontSize:10,color:"#94a3b8"}}>참여 {minutes.allowedAgents.length}명:</span>
+                <div style={{display:"flex",gap:4,flexWrap:"wrap"}}>
+                  {minutes.allowedAgents.map(code => {
+                    const p = PERSONAS[code];
+                    return (
+                      <span key={code} style={{
+                        fontSize:10, padding:"2px 8px",
+                        background:p.bg, color:p.color, fontWeight:700,
+                        borderRadius:10,
+                      }}>{p.icon} {code}</span>
+                    );
+                  })}
+                </div>
+              </div>
+            )}
+
+            {/* ★ 영역 5: 선정 기준 / 모드 정의 / 점수 공식 (드롭다운 — 평소 숨김) */}
+            <div style={{marginBottom:14}}>
+              <button onClick={()=>setShowCriteriaBox(v=>!v)} style={{
+                width:"100%",
+                background:"rgba(15,23,42,0.5)",
+                border:"1px solid rgba(100,116,139,0.3)",
+                borderRadius:8, padding:"8px 12px",
+                color:"#94a3b8", fontSize:11, fontWeight:700,
+                cursor:"pointer", textAlign:"left",
+                display:"flex", alignItems:"center", justifyContent:"space-between",
+              }}>
+                <span>📋 본문 논의 선정 기준 / 논의 모드 정의 / 점수 공식 (참고용)</span>
+                <span style={{fontSize:10,color:"#64748b"}}>{showCriteriaBox ? "▲ 접기" : "▼ 펼치기"}</span>
+              </button>
+              {showCriteriaBox && (
+                <div style={{
+                  marginTop:6,
+                  background:"rgba(15,23,42,0.6)",
+                  border:"1px solid rgba(100,116,139,0.25)",
+                  borderRadius:8, padding:"12px 14px",
+                  fontSize:10.5, color:"#cbd5e1", lineHeight:1.7,
+                }}>
+                  <div style={{marginBottom:10}}>
+                    <div style={{fontSize:11,fontWeight:800,color:"#22d3ee",marginBottom:4}}>① 본문 논의 대상 선정 기준</div>
+                    <div style={{paddingLeft:8,color:"#94a3b8"}}>
+                      • <b style={{color:"#cbd5e1"}}>장기부동</b>: 부동시간 60분 이상 OR Result에 "not solved" 포함<br/>
+                      • <b style={{color:"#cbd5e1"}}>반복</b>: 동일 호기 2회 이상 OR 동일 부품 2회 이상<br/>
+                      • <b style={{color:"#cbd5e1"}}>Full Stop</b>: 라인 완전정지 이슈<br/>
+                      → 위 3가지 후보 중 점수 상위 <b style={{color:"#cbd5e1"}}>{MAX_ISSUES}건</b> 선정<br/>
+                      <span style={{color:"#64748b"}}>※ 공정/설비 조건변경 · Test/양산외 생산 · 품질이슈는 본문 논의 대신 큐레이션 이력으로만 정리</span>
+                    </div>
+                  </div>
+                  <div style={{marginBottom:10}}>
+                    <div style={{fontSize:11,fontWeight:800,color:"#22d3ee",marginBottom:4}}>② 점수 공식</div>
+                    <div style={{paddingLeft:8,color:"#94a3b8",fontFamily:"monospace",background:"rgba(0,0,0,0.2)",padding:"6px 8px",borderRadius:4}}>
+                      score = 부동(분)/30 + 반복횟수×3 + 안전환경(+10) + 미해결(+5) + FullStop(+5)<br/>
+                      &nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp; + 장기부동≥60분(+8) + 장기부동≥120분(+5)
+                    </div>
+                    <div style={{paddingLeft:8,color:"#64748b",marginTop:4,fontSize:10}}>
+                      예: 부동 90분 + 반복 2회 + 안전키워드 → 3 + 6 + 10 = 19점
+                    </div>
+                  </div>
+                  <div>
+                    <div style={{fontSize:11,fontWeight:800,color:"#22d3ee",marginBottom:4}}>③ 논의 모드 정의 (DEEP / STANDARD / LITE)</div>
+                    <div style={{paddingLeft:8,color:"#94a3b8"}}>
+                      • <b style={{color:"#ef4444"}}>DEEP</b>: 안전·환경·품질통제·출하고객·라인정지 키워드 감지 OR 긴급 이슈<br/>
+                      &nbsp;&nbsp;&nbsp;→ 8필드 상세 카드 + 다중 페르소나 논의<br/>
+                      • <b style={{color:"#f59e0b"}}>STANDARD</b>: 중요 이슈 (반복 / Full Stop / 부품 반복교체)<br/>
+                      &nbsp;&nbsp;&nbsp;→ 3필드 카드 + 페르소나 논의<br/>
+                      • <b style={{color:"#94a3b8"}}>LITE</b>: 일반 이슈 (완료/단순)<br/>
+                      &nbsp;&nbsp;&nbsp;→ 압축 평가 (간단 코멘트)
+                    </div>
+                  </div>
+                </div>
+              )}
+            </div>
+
+            {/* ★ 영역 9-E: 간단 모드 — SimpleReport 컴포넌트 (페르소나 논의/큐레이션 박스/기존 보고서 모두 대체) */}
+            {/* 영역 11: 단일 흐름 — SimpleReport 비활성 */}
+
+            {/* ★ 영역 11-F: STEP 4 메인 페이지 (사용자 레포트 1~7번 형태) */}
+            <MainReportPage minutes={minutes}/>
+
+            {/* ★ 영역 11-G: 유첨 (Appendix) — 페르소나 논의 카드 (page-break-before: always) */}
+            <div className="appendix-page-break" style={{
+              marginTop:30, paddingTop:20,
+              borderTop:"3px double rgba(100,116,139,0.5)",
+            }}>
+              <div style={{
+                fontSize:14, fontWeight:900, color:"#a78bfa",
+                padding:"10px 14px", background:"rgba(167,139,250,0.08)",
+                border:"1px solid rgba(167,139,250,0.25)", borderRadius:8,
+                marginBottom:14,
+              }}>
+                📎 전체 페르소나 논의 모아보기
+              </div>
+              <div style={{fontSize:10,color:"#94a3b8",marginBottom:12,fontStyle:"italic"}}>
+                각 이슈별 페르소나 논의는 메인 페이지의 1~5번 섹션에 직접 매칭되어 표시됩니다.<br/>
+                아래는 전체 페르소나 논의를 한 곳에서 통합 조회하는 영역입니다.
+              </div>
+            </div>
+
+            {/* 모드별 분석 결과 — 상세 모드만 표시 */}
+            {discussions.length > 0 && (
+              <div style={{marginBottom:16}}>
+                <div style={{
+                  fontSize:12, fontWeight:800, color:"#f1f5f9", marginBottom:10,
+                  padding:"8px 14px", background:"rgba(167,139,250,0.1)",
+                  border:"1px solid rgba(167,139,250,0.2)", borderRadius:8,
+                }}>
+                  🔍 차등 논의 결과 ({discussions.length}건) ·
+                  🔴{minutes.grouped?.DEEP?.length || 0}
+                  🟡{minutes.grouped?.STANDARD?.length || 0}
+                  🟢{minutes.grouped?.LITE?.length || 0}
+                </div>
+
+                {["DEEP", "STANDARD", "LITE"].map(modeKey => {
+                  const items = minutes.grouped?.[modeKey] || [];
+                  if (items.length === 0) return null;
+                  const mStyle = MODE_STYLE[modeKey];
+                  return (
+                    <div key={modeKey} style={{marginBottom:14}}>
+                      <div style={{
+                        fontSize:11,fontWeight:800,color:mStyle.color,
+                        padding:"6px 12px",background:mStyle.bg,
+                        border:`1px solid ${mStyle.border}`,borderRadius:6,
+                        marginBottom:8,
+                      }}>{mStyle.label} ({items.length}건)</div>
+
+                      {items.map((d, idx) => (
+                        <DiscussionCard key={idx} discussion={d}/>
+                      ))}
+                    </div>
+                  );
+                })}
+              </div>
+            )}
+
+            <div style={{display:"flex",gap:10,marginBottom:10}}>
+              <button onClick={() => downloadHtml()} style={{
+                flex:1, padding:"11px",
+                background:"linear-gradient(135deg,#3b82f6,#22d3ee)",
+                border:"none", borderRadius:8, color:"#fff",
+                fontSize:13, fontWeight:800, cursor:"pointer",
+              }}>📥 HTML 다운로드</button>
+              <button onClick={sendToTeams} disabled={teamsSending} style={{
+                flex:1, padding:"11px",
+                background: teamsSending ? "rgba(100,116,139,0.4)" : "linear-gradient(135deg,#8b5cf6,#ec4899)",
+                border:"none", borderRadius:8, color:"#fff",
+                fontSize:13, fontWeight:800, cursor: teamsSending ? "wait" : "pointer",
+                opacity: teamsSending ? 0.7 : 1,
+              }}>{teamsSending ? "⏳ 발송 중..." : "📤 Teams 발송"}</button>
+              <button onClick={()=>{setStep(3);setMinutes(null);setDiscussions([]);setProgress([]);}} style={{
+                flex:1, padding:"11px", background:"transparent",
+                border:"1.5px solid rgba(167,139,250,0.35)", borderRadius:8,
+                color:"#a78bfa", fontSize:13, fontWeight:800, cursor:"pointer",
+              }}>🔄 다시 분석</button>
+            </div>
+            {/* 12-AK-5: Teams 발송 결과 토스트 */}
+            {teamsResult && (
+              <div style={{
+                marginBottom: 10, padding: "9px 14px", borderRadius: 8,
+                background: teamsResult.ok ? "rgba(34,197,94,0.15)" : "rgba(239,68,68,0.15)",
+                border: `1px solid ${teamsResult.ok ? "rgba(34,197,94,0.4)" : "rgba(239,68,68,0.4)"}`,
+                color: teamsResult.ok ? "#86efac" : "#fca5a5",
+                fontSize: 12, fontWeight: 600, animation: "fadeUp 0.3s",
+              }}>{teamsResult.msg}</div>
+            )}
+            <button onClick={()=>{setStep(1);setMinutes(null);setDiscussions([]);setProgress([]);setReportType("daily");}} style={{
+              width:"100%", padding:"10px", background:"transparent",
+              border:"1.5px solid rgba(51,65,85,0.4)", borderRadius:8,
+              color:"#475569", fontSize:12, cursor:"pointer",
+            }}>← 날짜 다시 선택</button>
+          </div>
+        )}
+      </div>
+
+      <style>{`
+        @keyframes spin{to{transform:rotate(360deg)}}
+        @keyframes fadeUp{from{opacity:0;transform:translateY(5px)}to{opacity:1;transform:translateY(0)}}
+        *{box-sizing:border-box}
+        button:hover:not(:disabled){filter:brightness(1.1)}
+        ::-webkit-scrollbar{width:3px}
+        ::-webkit-scrollbar-thumb{background:rgba(34,211,238,0.2);border-radius:2px}
+      `}</style>
+      {/* ★ 영역 7-B: 플로팅 채팅 버튼 (모든 STEP 공통) */}
+      {!chatOpen && (
+        <button onClick={()=>setChatOpen(true)} style={{
+          position:"fixed", right:24, bottom:24, zIndex:9999,
+          width:60, height:60, borderRadius:"50%",
+          background:"linear-gradient(135deg,#3b82f6,#22d3ee)",
+          border:"2px solid rgba(255,255,255,0.2)", cursor:"pointer",
+          boxShadow:"0 8px 24px rgba(34,211,238,0.5), 0 0 0 4px rgba(34,211,238,0.15)",
+          fontSize:26, color:"#fff",
+          display:"flex", alignItems:"center", justifyContent:"center",
+        }} title="자유 채팅방 열기">💬</button>
+      )}
+
+      {/* ★ 영역 7-C: 채팅창 모달 */}
+      {chatOpen && (
+        <div style={{
+          position:"fixed", right:24, bottom:24, zIndex:9999,
+          width:"min(440px, calc(100vw - 48px))",
+          height:"min(640px, calc(100vh - 48px))",
+          background:"rgba(3,6,13,0.97)",
+          border:"1px solid rgba(34,211,238,0.3)",
+          borderRadius:14,
+          boxShadow:"0 10px 40px rgba(0,0,0,0.6)",
+          display:"flex", flexDirection:"column",
+          overflow:"hidden",
+        }}>
+          {/* 헤더 */}
+          <div style={{
+            padding:"12px 16px",
+            borderBottom:"1px solid rgba(51,65,85,0.4)",
+            display:"flex", alignItems:"center", justifyContent:"space-between",
+            background:"rgba(15,23,42,0.6)",
+          }}>
+            <div style={{display:"flex",alignItems:"center",gap:8}}>
+              <span style={{fontSize:14}}>💬</span>
+              <div style={{fontSize:12,fontWeight:800,color:"#22d3ee"}}>
+                {chatStage === "setup" ? "채팅방 개설" : `자유 채팅방 (${chatAgents.length}명)`}
+              </div>
+            </div>
+            <div style={{display:"flex",gap:6}}>
+              {chatStage === "active" && chatMessages.length > 0 && (
+                <button onClick={downloadChatTxt} style={{
+                  fontSize:10, padding:"4px 10px", borderRadius:5,
+                  background:"rgba(52,211,153,0.1)", border:"1px solid rgba(52,211,153,0.3)",
+                  color:"#34d399", cursor:"pointer", fontWeight:700,
+                }} title="대화 내용 TXT 저장">💾 저장</button>
+              )}
+              <button onClick={closeChatRoom} style={{
+                fontSize:14, padding:"2px 10px", borderRadius:5,
+                background:"transparent", border:"1px solid rgba(100,116,139,0.4)",
+                color:"#94a3b8", cursor:"pointer",
+              }} title="채팅방 닫기">✕</button>
+            </div>
+          </div>
+
+          {/* 본문 */}
+          {chatStage === "setup" ? (
+            // 에이전트 선택 화면
+            <div style={{flex:1, padding:16, overflowY:"auto"}}>
+              <div style={{fontSize:11,color:"#cbd5e1",lineHeight:1.6,marginBottom:12}}>
+                대화에 참여할 에이전트를 선택하세요. (최소 1명)
+                <div style={{fontSize:10,color:"#64748b",marginTop:4}}>
+                  선택 후 KB가 로드되면 채팅이 시작됩니다.<br/>
+                  여러 명을 선택하면 질문에 따라 자동으로 답할 사람을 정하거나 <code style={{color:"#22d3ee"}}>@PE</code> 식으로 직접 지정할 수 있습니다.
+                </div>
+              </div>
+              <div style={{display:"grid",gridTemplateColumns:"repeat(2, 1fr)",gap:6,marginBottom:14}}>
+                {Object.entries(PERSONAS).map(([code, p]) => {
+                  const sel = chatAgents.includes(code);
+                  return (
+                    <button key={code} onClick={()=>setChatAgents(prev =>
+                      prev.includes(code) ? prev.filter(x => x !== code) : [...prev, code]
+                    )} style={{
+                      padding:"8px 10px", borderRadius:6,
+                      background: sel ? p.bg : "rgba(15,23,42,0.5)",
+                      border:`1px solid ${sel ? p.color : "rgba(51,65,85,0.4)"}`,
+                      color: sel ? p.color : "#94a3b8",
+                      fontSize:10, fontWeight:700, cursor:"pointer", textAlign:"left",
+                    }}>
+                      <div>{p.icon} {p.label}</div>
+                      <div style={{fontSize:8.5,opacity:0.75,marginTop:2}}>{code}</div>
+                    </button>
+                  );
+                })}
+              </div>
+              <button onClick={openChatRoom}
+                disabled={chatAgents.length === 0 || chatBusy} style={{
+                  width:"100%", padding:"10px",
+                  background: (chatAgents.length === 0 || chatBusy) ? "rgba(51,65,85,0.3)" : "linear-gradient(135deg,#3b82f6,#22d3ee)",
+                  border:"none", borderRadius:8,
+                  color: (chatAgents.length === 0 || chatBusy) ? "#475569" : "#fff",
+                  fontSize:12, fontWeight:800,
+                  cursor: (chatAgents.length === 0 || chatBusy) ? "not-allowed" : "pointer",
+                  display:"flex", alignItems:"center", justifyContent:"center", gap:8,
+                }}>
+                {chatBusy ? <><Spinner/>KB 로드 중...</> : `🚪 채팅방 개설 (${chatAgents.length}명)`}
+              </button>
+            </div>
+          ) : (
+            // 대화 화면
+            <>
+              {/* 참석자 표시 */}
+              <div style={{
+                padding:"6px 12px",
+                background:"rgba(15,23,42,0.4)",
+                borderBottom:"1px solid rgba(51,65,85,0.3)",
+                display:"flex", gap:4, flexWrap:"wrap", fontSize:9,
+              }}>
+                {chatAgents.map(code => {
+                  const p = PERSONAS[code];
+                  return (
+                    <span key={code} style={{
+                      padding:"2px 7px", borderRadius:9,
+                      background:p.bg, color:p.color, fontWeight:700,
+                    }}>{p.icon} {code}</span>
+                  );
+                })}
+              </div>
+
+              {/* 메시지 영역 */}
+              <div style={{flex:1, overflowY:"auto", padding:"12px 14px", background:"rgba(0,0,0,0.2)"}}>
+                {chatMessages.length === 0 ? (
+                  <div style={{fontSize:11,color:"#64748b",textAlign:"center",padding:"30px 0",lineHeight:1.7}}>
+                    👋 무엇이든 물어보세요.<br/>
+                    <span style={{fontSize:10}}>예: "Stacking 공정 반복 이슈 원인 분석해줘"<br/>
+                    "@PE 이 호기 점검 방법은?"</span>
+                  </div>
+                ) : chatMessages.map((m, i) => {
+                  if (m.role === "user") {
+                    return (
+                      <div key={i} style={{display:"flex",justifyContent:"flex-end",marginBottom:10}}>
+                        <div style={{
+                          maxWidth:"80%", padding:"8px 12px", borderRadius:"12px 12px 2px 12px",
+                          background:"rgba(34,211,238,0.15)", border:"1px solid rgba(34,211,238,0.3)",
+                          fontSize:11, color:"#e2e8f0", lineHeight:1.5, whiteSpace:"pre-wrap",
+                        }}>
+                          {m.text}
+                          <div style={{fontSize:8,color:"#64748b",marginTop:4,textAlign:"right"}}>{m.time}</div>
+                        </div>
+                      </div>
+                    );
+                  }
+                  const p = PERSONAS[m.agent] || { label: m.agent || "system", color: "#94a3b8", bg: "rgba(100,116,139,0.1)", icon: "⚙️" };
+                  return (
+                    <div key={i} style={{display:"flex",flexDirection:"column",marginBottom:10}}>
+                      <div style={{display:"flex",alignItems:"center",gap:6,marginBottom:3}}>
+                        <span style={{
+                          fontSize:9, padding:"2px 7px", borderRadius:9,
+                          background:p.bg, color:p.color, fontWeight:700,
+                        }}>{p.icon} {p.label}</span>
+                      </div>
+                      <div style={{
+                        maxWidth:"90%", padding:"8px 12px", borderRadius:"12px 12px 12px 2px",
+                        background:"rgba(15,23,42,0.7)", border:`1px solid ${p.color}33`,
+                        fontSize:11, color:"#e2e8f0", lineHeight:1.6, whiteSpace:"pre-wrap",
+                      }}>
+                        {m.text}
+                        <div style={{fontSize:8,color:"#64748b",marginTop:4}}>{m.time}</div>
+                      </div>
+                    </div>
+                  );
+                })}
+                {chatBusy && (
+                  <div style={{display:"flex",alignItems:"center",gap:8,padding:"6px 0",fontSize:10,color:"#94a3b8"}}>
+                    <Spinner/> 응답 생성 중...
+                  </div>
+                )}
+              </div>
+
+              {/* 입력창 */}
+              <div style={{
+                padding:"10px 12px",
+                borderTop:"1px solid rgba(51,65,85,0.4)",
+                background:"rgba(15,23,42,0.6)",
+                display:"flex", gap:8,
+              }}>
+                <textarea value={chatInput}
+                  onChange={(e)=>setChatInput(e.target.value)}
+                  onKeyDown={(e)=>{
+                    if (e.key === "Enter" && !e.shiftKey) {
+                      e.preventDefault();
+                      sendChatMessage();
+                    }
+                  }}
+                  placeholder="질문 입력 (Shift+Enter로 줄바꿈, @코드 멘션 가능)"
+                  rows={2}
+                  disabled={chatBusy}
+                  style={{
+                    flex:1, padding:"6px 10px", borderRadius:6,
+                    background:"rgba(0,0,0,0.3)",
+                    border:"1px solid rgba(51,65,85,0.5)",
+                    color:"#e2e8f0", fontSize:11, lineHeight:1.5,
+                    resize:"none", fontFamily:"inherit",
+                  }}/>
+                <button onClick={sendChatMessage}
+                  disabled={chatBusy || !chatInput.trim()} style={{
+                    padding:"0 14px", borderRadius:6,
+                    background: (chatBusy || !chatInput.trim()) ? "rgba(51,65,85,0.4)" : "linear-gradient(135deg,#3b82f6,#22d3ee)",
+                    border:"none",
+                    color: (chatBusy || !chatInput.trim()) ? "#475569" : "#fff",
+                    fontSize:11, fontWeight:800,
+                    cursor: (chatBusy || !chatInput.trim()) ? "not-allowed" : "pointer",
+                  }}>전송</button>
+              </div>
+            </>
+          )}
+        </div>
+      )}
+    </div>
+  );
+}
+
+// ─── 논의 카드 컴포넌트 ────────────────────────────────────────────────────────
+// ─── ★ 영역 8-B: 날짜 범위 선택 컴포넌트 (통합형: 빠른선택 + 캘린더 + 단위 토글) ──
+function DateRangePicker({ availableDates, selRange, onChange }) {
+  // availableDates: 데이터에 존재하는 생산일자 배열 (예: ["26/4/8","26/4/9",...])
+  // selRange: { start, end, unit }
+  const [unit, setUnit] = useState(selRange?.unit || "day");
+  const [start, setStart] = useState(selRange?.start || null);
+  const [end, setEnd] = useState(selRange?.end || null);
+  const [calMonth, setCalMonth] = useState(() => {
+    if (selRange?.start) {
+      const d = dateStrToDate(selRange.start);
+      return { y: d.getFullYear(), m: d.getMonth() };
+    }
+    if (availableDates?.length > 0) {
+      const d = dateStrToDate(availableDates[availableDates.length - 1]);
+      return { y: d.getFullYear(), m: d.getMonth() };
+    }
+    const now = new Date();
+    return { y: now.getFullYear(), m: now.getMonth() };
+  });
+
+  // availableDates가 비어있으면 빠른선택 기준일 = 오늘, 아니면 데이터의 가장 최신 일자
+  const todayBaseStr = availableDates?.length > 0 ? availableDates[availableDates.length - 1] : dateToDateStr(new Date());
+
+  // 변경사항 부모에게 통지 (start/end/unit 또는 dates까지 함께)
+  const commit = (s, e, u) => {
+    let dates = [];
+    if (s && e) dates = expandRange(s, e).filter(d => availableDates.includes(d));
+    onChange({ start: s, end: e, unit: u, dates });
+  };
+
+  const applyQuick = (preset) => {
+    const r = getQuickRange(preset, todayBaseStr);
+    if (!r) return;
+    const [s, e] = r;
+    setStart(s); setEnd(e);
+    commit(s, e, unit);
+    // 캘린더 보기를 해당 범위 끝달로 이동
+    const ed = dateStrToDate(e);
+    setCalMonth({ y: ed.getFullYear(), m: ed.getMonth() });
+  };
+
+  const handleDayClick = (dateStr) => {
+    if (!availableDates.includes(dateStr)) return;
+    if (!start || (start && end)) {
+      // 새 시작
+      setStart(dateStr); setEnd(null);
+      commit(dateStr, null, unit);
+    } else {
+      // 끝 지정 (시작보다 이전이면 swap)
+      const sd = dateStrToDate(start);
+      const cd = dateStrToDate(dateStr);
+      const [s, e] = cd >= sd ? [start, dateStr] : [dateStr, start];
+      setStart(s); setEnd(e);
+      commit(s, e, unit);
+    }
+  };
+
+  const handleUnitChange = (newUnit) => {
+    setUnit(newUnit);
+    // 단위 변경 시 시작/끝 정렬: 주 단위면 해당 주의 월~일, 월 단위면 1일~말일
+    if (start && end) {
+      if (newUnit === "week") {
+        const weeks = getWeeksInRange(start, end);
+        if (weeks.length > 0) {
+          const newS = weeks[0].start;
+          const newE = weeks[weeks.length - 1].end;
+          // availableDates 안에 있는 것으로 한정
+          const validS = availableDates.find(d => d >= newS) || newS;
+          const validE = [...availableDates].reverse().find(d => d <= newE) || newE;
+          setStart(validS); setEnd(validE);
+          commit(validS, validE, newUnit);
+          return;
+        }
+      }
+      if (newUnit === "month") {
+        const months = getMonthsInRange(start, end);
+        if (months.length > 0) {
+          const all = months.flatMap(m => m.dates).filter(d => availableDates.includes(d));
+          if (all.length > 0) {
+            setStart(all[0]); setEnd(all[all.length - 1]);
+            commit(all[0], all[all.length - 1], newUnit);
+            return;
+          }
+        }
+      }
+    }
+    commit(start, end, newUnit);
+  };
+
+  // 주/월 단위면 체크박스 목록 표시 (혼합 방식)
+  const renderWeekList = () => {
+    if (!availableDates || availableDates.length === 0) return null;
+    const weeks = getWeeksInRange(availableDates[0], availableDates[availableDates.length - 1]);
+    return (
+      <div style={{maxHeight:280, overflowY:"auto", padding:"4px"}}>
+        {weeks.map(w => {
+          const weekDates = expandRange(w.start, w.end).filter(d => availableDates.includes(d));
+          if (weekDates.length === 0) return null;
+          const isSelected = start && end && start <= w.end && end >= w.start;
+          return (
+            <div key={w.key} onClick={()=>{
+              const validS = weekDates[0];
+              const validE = weekDates[weekDates.length - 1];
+              setStart(validS); setEnd(validE);
+              commit(validS, validE, "week");
+            }} style={{
+              display:"flex", alignItems:"center", gap:10,
+              padding:"8px 10px", borderRadius:6, cursor:"pointer", marginBottom:4,
+              background: isSelected ? "rgba(34,211,238,0.1)" : "rgba(15,23,42,0.4)",
+              border:`1px solid ${isSelected ? "rgba(34,211,238,0.3)" : "rgba(51,65,85,0.3)"}`,
+            }}>
+              <div style={{
+                width:16, height:16, borderRadius:3,
+                background: isSelected ? "#22d3ee" : "transparent",
+                border:`2px solid ${isSelected ? "#22d3ee" : "rgba(51,65,85,0.6)"}`,
+                display:"flex", alignItems:"center", justifyContent:"center",
+                fontSize:9, color:"#fff", flexShrink:0,
+              }}>{isSelected ? "✓" : ""}</div>
+              <div style={{flex:1, fontSize:11, color: isSelected ? "#22d3ee" : "#cbd5e1"}}>
+                <div style={{fontWeight:700}}>{w.label}</div>
+                <div style={{fontSize:9, color:"#64748b"}}>{w.start} ~ {w.end} · 데이터 {weekDates.length}일</div>
+              </div>
+            </div>
+          );
+        })}
+      </div>
+    );
+  };
+
+  const renderMonthList = () => {
+    if (!availableDates || availableDates.length === 0) return null;
+    const months = getMonthsInRange(availableDates[0], availableDates[availableDates.length - 1]);
+    return (
+      <div style={{maxHeight:280, overflowY:"auto", padding:"4px"}}>
+        {months.map(mo => {
+          const monthDates = mo.dates.filter(d => availableDates.includes(d));
+          if (monthDates.length === 0) return null;
+          // ★ 영역 12-BJ: 같은 문자열 비교 버그 — Date 객체 비교로 변경
+          const isSelected = start && end && monthDates.some(d => {
+            const dd = dateStrToDate(d);
+            const ss = dateStrToDate(start);
+            const ee = dateStrToDate(end);
+            return dd >= ss && dd <= ee;
+          });
+          return (
+            <div key={mo.key} onClick={()=>{
+              const validS = monthDates[0];
+              const validE = monthDates[monthDates.length - 1];
+              setStart(validS); setEnd(validE);
+              commit(validS, validE, "month");
+            }} style={{
+              display:"flex", alignItems:"center", gap:10,
+              padding:"8px 10px", borderRadius:6, cursor:"pointer", marginBottom:4,
+              background: isSelected ? "rgba(34,211,238,0.1)" : "rgba(15,23,42,0.4)",
+              border:`1px solid ${isSelected ? "rgba(34,211,238,0.3)" : "rgba(51,65,85,0.3)"}`,
+            }}>
+              <div style={{
+                width:16, height:16, borderRadius:3,
+                background: isSelected ? "#22d3ee" : "transparent",
+                border:`2px solid ${isSelected ? "#22d3ee" : "rgba(51,65,85,0.6)"}`,
+                display:"flex", alignItems:"center", justifyContent:"center",
+                fontSize:9, color:"#fff", flexShrink:0,
+              }}>{isSelected ? "✓" : ""}</div>
+              <div style={{flex:1, fontSize:11, color: isSelected ? "#22d3ee" : "#cbd5e1"}}>
+                <div style={{fontWeight:700}}>{mo.label}</div>
+                <div style={{fontSize:9, color:"#64748b"}}>데이터 {monthDates.length}일</div>
+              </div>
+            </div>
+          );
+        })}
+      </div>
+    );
+  };
+
+  const renderCalendar = () => {
+    const { y, m } = calMonth;
+    const firstDay = new Date(y, m, 1);
+    const lastDay = new Date(y, m + 1, 0);
+    const startDayOfWeek = firstDay.getDay(); // 일=0, 월=1, ..., 토=6 기준
+    const daysInMonth = lastDay.getDate();
+    const cells = [];
+    // 앞 빈 칸 (일요일 시작 기준)
+    for (let i = 0; i < startDayOfWeek; i++) cells.push(null);
+    for (let d = 1; d <= daysInMonth; d++) {
+      const dStr = `${String(y).slice(-2)}/${m + 1}/${d}`;
+      cells.push(dStr);
+    }
+    const isInRange = (dStr) => {
+      if (!dStr || !start) return false;
+      if (!end) return dStr === start;
+      // ★ 영역 12-BJ: 문자열 비교는 일자 자릿수 차이로 잘못된 결과 (예: "26/5/5" > "26/5/11")
+      // Date 객체 비교로 변경 — 5월 10일+ 포함 구간 정상 작동
+      const d = dateStrToDate(dStr);
+      const s = dateStrToDate(start);
+      const e = dateStrToDate(end);
+      return d >= s && d <= e;
+    };
+    const isEndpoint = (dStr) => dStr === start || dStr === end;
+    const isAvailable = (dStr) => dStr && availableDates.includes(dStr);
+
+    const prevMonth = () => setCalMonth({ y: m === 0 ? y - 1 : y, m: m === 0 ? 11 : m - 1 });
+    const nextMonth = () => setCalMonth({ y: m === 11 ? y + 1 : y, m: m === 11 ? 0 : m + 1 });
+
+    return (
+      <div>
+        {/* 캘린더 헤더 */}
+        <div style={{display:"flex",alignItems:"center",justifyContent:"space-between",marginBottom:8}}>
+          <button onClick={prevMonth} style={{
+            padding:"4px 10px", background:"rgba(51,65,85,0.3)", border:"1px solid rgba(51,65,85,0.5)",
+            borderRadius:5, color:"#cbd5e1", cursor:"pointer", fontSize:11,
+          }}>‹</button>
+          <div style={{fontSize:13,fontWeight:700,color:"#22d3ee"}}>{y}년 {m + 1}월</div>
+          <button onClick={nextMonth} style={{
+            padding:"4px 10px", background:"rgba(51,65,85,0.3)", border:"1px solid rgba(51,65,85,0.5)",
+            borderRadius:5, color:"#cbd5e1", cursor:"pointer", fontSize:11,
+          }}>›</button>
+        </div>
+        {/* 요일 헤더 */}
+        <div style={{display:"grid",gridTemplateColumns:"repeat(7,1fr)",gap:2,marginBottom:4}}>
+          {["일","월","화","수","목","금","토"].map((w,i) => (
+            <div key={w} style={{
+              textAlign:"center", fontSize:10, fontWeight:700, padding:"4px 0",
+              color: i === 0 ? "#f87171" : i === 6 ? "#60a5fa" : "#94a3b8",
+            }}>{w}</div>
+          ))}
+        </div>
+        {/* 날짜 셀 */}
+        <div style={{display:"grid",gridTemplateColumns:"repeat(7,1fr)",gap:2}}>
+          {cells.map((dStr, i) => {
+            if (!dStr) return <div key={`e-${i}`} style={{height:34}}/>;
+            const inRange = isInRange(dStr);
+            const isEnd = isEndpoint(dStr);
+            const avail = isAvailable(dStr);
+            return (
+              <button key={dStr}
+                onClick={()=>handleDayClick(dStr)}
+                disabled={!avail}
+                style={{
+                  height:34, padding:0, fontSize:11,
+                  background: isEnd ? "#22d3ee" : (inRange ? "rgba(34,211,238,0.15)" : "transparent"),
+                  border:`1px solid ${isEnd ? "#22d3ee" : (inRange ? "rgba(34,211,238,0.3)" : "rgba(51,65,85,0.2)")}`,
+                  borderRadius:5,
+                  color: isEnd ? "#0c1220" : (inRange ? "#22d3ee" : (avail ? "#cbd5e1" : "#475569")),
+                  fontWeight: isEnd ? 800 : (avail ? 600 : 400),
+                  cursor: avail ? "pointer" : "not-allowed",
+                  opacity: avail ? 1 : 0.4,
+                }}
+                title={avail ? `${dStr} (데이터 있음)` : `${dStr} (데이터 없음)`}
+              >
+                {parseInt(dStr.split("/")[2], 10)}
+              </button>
+            );
+          })}
+        </div>
+        <div style={{fontSize:9, color:"#64748b", marginTop:6, textAlign:"center"}}>
+          ※ 첫 클릭=시작, 두번째 클릭=끝 / 데이터 있는 날짜만 선택 가능
+        </div>
+      </div>
+    );
+  };
+
+  const presets = [
+    { id: "today",     label: "오늘" },
+    { id: "yesterday", label: "어제" },
+    { id: "thisWeek",  label: "이번 주" },
+    { id: "lastWeek",  label: "지난 주" },
+    { id: "thisMonth", label: "이번 달" },
+    { id: "lastMonth", label: "지난 달" },
+    { id: "last7",     label: "최근 7일" },
+    { id: "last30",    label: "최근 30일" },
+  ];
+
+  return (
+    <div>
+      {/* 빠른 선택 */}
+      <div style={{marginBottom:10}}>
+        <div style={{fontSize:10,color:"#94a3b8",fontWeight:700,marginBottom:6}}>빠른 선택</div>
+        <div style={{display:"flex",flexWrap:"wrap",gap:5}}>
+          {presets.map(p => (
+            <button key={p.id} onClick={()=>applyQuick(p.id)} style={{
+              padding:"5px 10px", borderRadius:5,
+              background:"rgba(34,211,238,0.06)", border:"1px solid rgba(34,211,238,0.2)",
+              color:"#22d3ee", fontSize:10, fontWeight:700, cursor:"pointer",
+            }}>{p.label}</button>
+          ))}
+        </div>
+      </div>
+
+      {/* 단위 토글 */}
+      <div style={{marginBottom:10}}>
+        <div style={{fontSize:10,color:"#94a3b8",fontWeight:700,marginBottom:6}}>보기 단위</div>
+        <div style={{display:"flex",gap:4, background:"rgba(15,23,42,0.5)", padding:3, borderRadius:6}}>
+          {[
+            {v:"day",   l:"일"},
+            {v:"week",  l:"주"},
+            {v:"month", l:"월"},
+          ].map(opt => (
+            <button key={opt.v} onClick={()=>handleUnitChange(opt.v)} style={{
+              flex:1, padding:"6px 10px", borderRadius:4,
+              background: unit === opt.v ? "linear-gradient(135deg,#3b82f6,#22d3ee)" : "transparent",
+              border:"none", color: unit === opt.v ? "#fff" : "#94a3b8",
+              fontSize:11, fontWeight:700, cursor:"pointer",
+            }}>{opt.l}</button>
+          ))}
+        </div>
+      </div>
+
+      {/* 단위에 따라 다른 UI */}
+      <div style={{
+        background:"rgba(4,8,16,0.6)", border:"1px solid rgba(51,65,85,0.3)",
+        borderRadius:8, padding:"12px", marginBottom:10,
+      }}>
+        {unit === "day"   && renderCalendar()}
+        {unit === "week"  && renderWeekList()}
+        {unit === "month" && renderMonthList()}
+      </div>
+
+      {/* 선택 결과 표시 */}
+      {start && end ? (
+        <div style={{
+          fontSize:11, color:"#22d3ee", padding:"8px 12px",
+          background:"rgba(34,211,238,0.08)", border:"1px solid rgba(34,211,238,0.25)",
+          borderRadius:6, fontWeight:700,
+        }}>
+          ✓ {buildRangeLabel({ start, end, unit })}
+        </div>
+      ) : start ? (
+        <div style={{fontSize:11, color:"#f59e0b", padding:"8px 12px"}}>
+          ⏳ 시작 일자: {start} (끝 일자를 선택하세요)
+        </div>
+      ) : (
+        <div style={{fontSize:11, color:"#64748b", padding:"8px 12px"}}>
+          기간을 선택하세요
+        </div>
+      )}
+    </div>
+  );
+}
+
+// ─── ★ 영역 9-E: 간단모드 보고서 컴포넌트 (명세서 §6 표 형태) ──────────────────
+// ─── ★ 영역 11-D + 11-K: 이슈 브리핑 표시 컴포넌트 (HTML 레포트 1~5번 + 인라인 체크박스) ──────────
+// props:
+//   curation: PE 큐레이션 결과 (영역 11-C 스키마)
+//   allIssues: taggedIssues.issues (체크 매칭에 사용)
+//   selectedIds: 현재 체크된 이슈 ID 배열
+//   autoSelectedIds: 자동 선정 ID (⭐ 표시용)
+//   onToggle: (issueId) => void
+//   onToggleMany: (issueIds[], shouldCheck) => void  (그룹 일괄)
+function BriefingDisplay({ curation, allIssues = [], selectedIds = [], autoSelectedIds = [], onToggle, onToggleMany, discussions = [] }) {
+  if (!curation) return null;
+
+  const sectionStyle = {
+    background:"rgba(15,23,42,0.6)", border:"1px solid rgba(100,116,139,0.25)",
+    borderRadius:10, padding:"14px 16px", marginBottom:14,
+  };
+  const headingStyle = {
+    fontSize:13, fontWeight:800, marginBottom:10,
+    paddingBottom:6, borderBottom:"1px solid rgba(51,65,85,0.4)",
+  };
+  const tableStyle = { width:"100%", fontSize:10.5, color:"#cbd5e1", borderCollapse:"collapse" };
+  const thStyle = {
+    padding:"5px 8px", background:"rgba(51,65,85,0.4)",
+    color:"#94a3b8", fontWeight:700, textAlign:"left",
+    border:"1px solid rgba(51,65,85,0.4)",
+  };
+  const tdStyle = { padding:"5px 8px", border:"1px solid rgba(51,65,85,0.3)", verticalAlign:"top" };
+  const empty = (msg) => <div style={{fontSize:10,color:"#64748b",padding:"8px 0"}}>{msg}</div>;
+
+  // ─── 영역 11-K: 매칭/체크박스 헬퍼 ─────────────────────────────────────────
+  // 큐레이션 longDowntime[i] → 실제 allIssues에서 매칭되는 이슈 찾기
+  // 매칭 룰: equipment + (분 또는 시간 ±10분)
+  const findMatchingIssue = (curationItem) => {
+    if (!curationItem.equipment) return null;
+    const candidates = allIssues.filter(i => i.eq === curationItem.equipment);
+    if (candidates.length === 0) return null;
+    if (candidates.length === 1) return candidates[0];
+    // 부동시간으로 좁히기
+    if (curationItem.durationMin) {
+      const byDur = candidates.find(i => Math.abs((i.durMin || 0) - curationItem.durationMin) < 5);
+      if (byDur) return byDur;
+    }
+    // 가장 긴 부동 선택
+    return candidates.sort((a, b) => (b.durMin || 0) - (a.durMin || 0))[0];
+  };
+  // 카테고리/설비별 이슈 묶음 추출 — equipments 배열에서 STK 코드 파싱
+  const findIssuesByEquipmentList = (equipmentsList) => {
+    if (!Array.isArray(equipmentsList)) return [];
+    const eqCodes = equipmentsList.map(s => {
+      // "STK-1-A4(×2)" 또는 "STK-1-A4 (관련)" → "STK-1-A4"
+      const m = (s || "").match(/(STK[-\d\w]+|Cutter[\s\d\w()+\-]+)/i);
+      return m ? m[1].trim() : (s || "").split(/[\s(×]/)[0].trim();
+    }).filter(Boolean);
+    return allIssues.filter(i => i.eq && eqCodes.some(eq => i.eq.includes(eq) || eq.includes(i.eq)));
+  };
+  const findIssuesByEquipment = (equipment) => {
+    if (!equipment) return [];
+    return allIssues.filter(i => i.eq === equipment);
+  };
+  // 그룹 체크 상태 계산 (all/none/partial)
+  const groupCheckState = (issueIds) => {
+    if (issueIds.length === 0) return "none";
+    const checked = issueIds.filter(id => selectedIds.includes(id)).length;
+    if (checked === 0) return "none";
+    if (checked === issueIds.length) return "all";
+    return "partial";
+  };
+
+  // ─── Phase 2: 페르소나 논의 매칭 헬퍼 ───
+  // 큐레이션 이슈 → 매칭되는 페르소나 논의 (discussions)
+  const findMatchingDiscussion = (curationItem) => {
+    if (!discussions || discussions.length === 0) return null;
+    if (!curationItem || !curationItem.equipment) return null;
+    // 1순위: equipment + durMin 일치
+    let match = discussions.find(d =>
+      d.issue?.eq === curationItem.equipment &&
+      curationItem.durationMin &&
+      Math.abs((d.issue?.durMin || 0) - curationItem.durationMin) < 5
+    );
+    if (match) return match;
+    // 2순위: equipment 일치 (가장 부동시간 긴 것)
+    match = discussions
+      .filter(d => d.issue?.eq === curationItem.equipment)
+      .sort((a, b) => (b.issue?.durMin || 0) - (a.issue?.durMin || 0))[0];
+    return match || null;
+  };
+  // 매칭된 모든 discussion id 모음 (Appendix에서 매칭 안 된 것 식별용)
+  const matchedDiscussionKeys = new Set();
+  const markMatched = (d) => { if (d && d.issue) matchedDiscussionKeys.add(getIssueId(d.issue)); };
+
+  // 일반 이슈 → 매칭되는 discussion (allIssues에서 사용)
+  const findMatchingDiscussionByIssue = (issue) => {
+    if (!discussions || !issue) return null;
+    return discussions.find(d => getIssueId(d.issue) === getIssueId(issue)) || null;
+  };
+  // 인라인 체크박스 렌더 (이슈 1건)
+  const IssueCheckbox = ({ issue, label = null, compact = false }) => {
+    if (!issue || !onToggle) return null;
+    const id = getIssueId(issue);
+    const checked = selectedIds.includes(id);
+    const isAuto = autoSelectedIds.includes(id);
+    return (
+      <label style={{
+        display:"inline-flex", alignItems:"center", gap:6, cursor:"pointer",
+        padding: compact ? "0" : "2px 4px", borderRadius:4,
+        background: checked ? "rgba(34,211,238,0.08)" : "transparent",
+      }}>
+        <input type="checkbox" checked={checked}
+          onChange={() => onToggle(id)}
+          style={{cursor:"pointer", accentColor:"#22d3ee", margin:0}}/>
+        {isAuto && <span style={{fontSize:10,color:"#fbbf24",fontWeight:700}}>⭐</span>}
+        {label && <span style={{fontSize:10,color: checked ? "#22d3ee" : "#94a3b8"}}>{label}</span>}
+      </label>
+    );
+  };
+  // 그룹 헤더 체크박스 (3-state)
+  const GroupCheckbox = ({ issueIds, label = null }) => {
+    if (issueIds.length === 0 || !onToggleMany) return null;
+    const state = groupCheckState(issueIds);
+    return (
+      <label style={{display:"inline-flex", alignItems:"center", gap:6, cursor:"pointer"}}>
+        <input
+          type="checkbox"
+          checked={state === "all"}
+          ref={el => { if (el) el.indeterminate = state === "partial"; }}
+          onChange={() => onToggleMany(issueIds, state !== "all")}
+          style={{cursor:"pointer", accentColor:"#22d3ee", margin:0}}/>
+        {label && <span style={{fontSize:10,color: state === "all" ? "#22d3ee" : "#94a3b8"}}>{label}</span>}
+      </label>
+    );
+  };
+  // 펼침 토글 state
+  const [expandedGroups, setExpandedGroups] = useState({});
+  const [showShortDowntime, setShowShortDowntime] = useState(false);
+  const toggleGroup = (key) => setExpandedGroups(prev => ({ ...prev, [key]: !prev[key] }));
+
+  // 1번에 표시되지 않은 짧은 부동 이슈 (펼침 영역용)
+  const longDowntimeMatched = (curation.longDowntime || []).map(findMatchingIssue).filter(Boolean);
+  const longDowntimeIds = longDowntimeMatched.map(getIssueId);
+  const shortDowntimeIssues = allIssues.filter(i => !longDowntimeIds.includes(getIssueId(i)));
+
+  return (
+    <div>
+      {/* 0. 핵심 요약 박스 (TL;DR) */}
+      {(curation.criticalSummary?.length > 0 || curation.summary_text) && (
+        <div style={{
+          background:"rgba(167,139,250,0.06)",
+          border:"2px solid rgba(167,139,250,0.3)",
+          borderRadius:10, padding:"14px 18px", marginBottom:14,
+        }}>
+          <div style={{fontSize:13,fontWeight:800,color:"#a78bfa",marginBottom:8}}>
+            📋 핵심 요약
+          </div>
+          {/* ★ 12-Y1: 레코드 분류 */}
+          {curation.recordBreakdown && (curation.recordBreakdown.bmDowntime || curation.recordBreakdown.ubm || curation.recordBreakdown.pdDowntime || curation.recordBreakdown.other) > 0 && (
+            <div style={{
+              fontSize:10, color:"#94a3b8", marginBottom:8,
+              padding:"5px 10px", background:"rgba(0,0,0,0.2)", borderRadius:5,
+            }}>
+              <span style={{fontWeight:700,color:"#cbd5e1"}}>레코드:</span>
+              {curation.recordBreakdown.bmDowntime > 0 && <span> BM Downtime Bot {curation.recordBreakdown.bmDowntime}건</span>}
+              {curation.recordBreakdown.ubm > 0 && <span> · UBM {curation.recordBreakdown.ubm}건</span>}
+              {curation.recordBreakdown.pdDowntime > 0 && <span> · PD Downtime {curation.recordBreakdown.pdDowntime}건</span>}
+              {curation.recordBreakdown.other > 0 && <span> · 기타 {curation.recordBreakdown.other}건</span>}
+            </div>
+          )}
+          {curation.summary_text && (
+            <div style={{fontSize:11,color:"#cbd5e1",marginBottom:8,fontStyle:"italic",lineHeight:1.6}}>
+              {curation.summary_text}
+            </div>
+          )}
+          {curation.criticalSummary?.length > 0 && (
+            <ul style={{margin:"6px 0 0 0",paddingLeft:18,fontSize:11,color:"#cbd5e1",lineHeight:1.7}}>
+              {curation.criticalSummary.map((item, i) => (
+                <li key={i} style={{marginBottom:3}}>{item}</li>
+              ))}
+            </ul>
+          )}
+        </div>
+      )}
+
+      {/* 1. 장기부동 상세 */}
+      <div style={sectionStyle}>
+        <div style={{...headingStyle,color:"#ef4444"}}>🚨 1. 장기부동 건 — 상세</div>
+        {(!curation.longDowntime || curation.longDowntime.length === 0) ? empty("장기부동 이슈 없음") : (
+          <div>
+            {curation.longDowntime.map((d, idx) => {
+              const isTop = d.isTop;
+              const matchedIssue = findMatchingIssue(d);
+              return (
+                <div key={idx} style={{
+                  background: isTop ? "rgba(239,68,68,0.08)" : "rgba(245,158,11,0.06)",
+                  border:`1px solid ${isTop ? "#ef4444" : "#f59e0b"}33`,
+                  borderLeft:`5px solid ${isTop ? "#ef4444" : "#f59e0b"}`,
+                  borderRadius:6, padding:"10px 14px", marginBottom:10,
+                }}>
+                  <div style={{
+                    display:"flex", alignItems:"center", gap:10,
+                    marginBottom:6,
+                  }}>
+                    {matchedIssue && (
+                      <IssueCheckbox issue={matchedIssue} compact={true}/>
+                    )}
+                    <div style={{fontSize:12,fontWeight:800,color:isTop?"#ef4444":"#f59e0b",flex:1}}>
+                      {isTop ? "🔴 [TOP] " : "🔴 "}{d.title || `${d.equipment} (${d.durationMin}분)`}
+                    </div>
+                    {matchedIssue && autoSelectedIds.includes(getIssueId(matchedIssue)) && (
+                      <span style={{fontSize:9,padding:"1px 6px",borderRadius:3,
+                        background:"rgba(245,158,11,0.15)",color:"#fbbf24",fontWeight:700}}>⭐ 자동선정</span>
+                    )}
+                  </div>
+                  <table style={{...tableStyle, fontSize:10.5}}>
+                    <tbody>
+                      {d.occurrence && <tr><th style={{...thStyle,width:"22%"}}>발생</th><td style={tdStyle}>{d.occurrence}</td></tr>}
+                      {d.alarm && <tr><th style={thStyle}>알람</th><td style={{...tdStyle,fontFamily:"monospace",fontSize:9.5}}>{d.alarm}</td></tr>}
+                      {d.splitNote && <tr><th style={thStyle}>보고 형태</th><td style={{...tdStyle,color:"#fcd34d"}}>{d.splitNote}</td></tr>}
+                      {d.rootCause && <tr><th style={thStyle}>근본 원인</th><td style={{...tdStyle,fontWeight:700,color:"#fca5a5"}}>{d.rootCause}</td></tr>}
+                      {d.partReplaced && <tr><th style={thStyle}>부품 교체</th><td style={{...tdStyle,fontWeight:700}}>{d.partReplaced}</td></tr>}
+                      {d.collateralDamage && <tr><th style={thStyle}>부수 피해</th><td style={{...tdStyle,fontWeight:700,color:"#fbbf24"}}>{d.collateralDamage}</td></tr>}
+                      {d.pic && <tr><th style={thStyle}>PIC</th><td style={tdStyle}>{d.pic}</td></tr>}
+                      {d.result && <tr><th style={thStyle}>결과</th><td style={{...tdStyle,color:d.result.toLowerCase().includes("solved")?"#34d399":"#fbbf24"}}>{d.result}</td></tr>}
+                    </tbody>
+                  </table>
+                  {/* ★ 12-Y1 → 12-BB2: 분할 보고 정밀 분석 (방어 코드 — 다양한 필드명 자동 매핑) */}
+                  {d.splitDetail?.length > 0 && (
+                    <div style={{marginTop:8, padding:"8px 10px", background:"rgba(252,211,77,0.06)", borderLeft:"3px solid #fcd34d", borderRadius:4}}>
+                      <div style={{fontSize:10.5,fontWeight:700,color:"#fcd34d",marginBottom:4}}>📊 분할 보고 분석</div>
+                      {d.splitDetail.map((rawSd, sdi) => {
+                        const sd = {
+                          order: rawSd.order ?? rawSd.차수 ?? rawSd.idx ?? rawSd.no ?? rawSd.seq ?? "?",
+                          duration: rawSd.duration ?? rawSd.분 ?? rawSd.durationMin ?? rawSd.dur ?? rawSd.minutes ?? "?",
+                          time: rawSd.time ?? rawSd.시간 ?? rawSd.timeRange ?? rawSd.startTime ?? "",
+                          gapMin: rawSd.gapMin ?? rawSd.gap ?? rawSd.간격 ?? null,
+                          description: rawSd.description ?? rawSd.desc ?? rawSd.설명 ?? rawSd.note ?? "",
+                        };
+                        return (
+                          <div key={sdi} style={{fontSize:10,color:"#cbd5e1",marginBottom:3,paddingLeft:8}}>
+                            <span style={{fontWeight:700,color:"#fbbf24"}}>{sd.order}차</span> — <b>{sd.duration}분</b> ({sd.time})
+                            {sd.gapMin && <span style={{color:"#fca5a5",marginLeft:6,fontWeight:700}}>· 1차 후 {sd.gapMin}분만에 재발</span>}
+                            {sd.description && <div style={{marginTop:1,color:"#94a3b8"}}>→ {sd.description}</div>}
+                          </div>
+                        );
+                      })}
+                    </div>
+                  )}
+                  {/* ★ 12-Y1: 재발 간격 (splitDetail 없는 경우 단독 표시) */}
+                  {d.recurrenceGap && !d.splitDetail?.length && (
+                    <div style={{marginTop:6, padding:"6px 10px", background:"rgba(252,211,77,0.06)", borderLeft:"3px solid #fcd34d", borderRadius:4, fontSize:10, color:"#fcd34d", fontWeight:700}}>
+                      ⏱️ {d.recurrenceGap}
+                    </div>
+                  )}
+                  {/* ★ 12-Y1: 이력 패턴 */}
+                  {d.historyPattern && (
+                    <div style={{marginTop:6, padding:"6px 10px", background:"rgba(167,139,250,0.06)", borderLeft:"3px solid #a78bfa", borderRadius:4, fontSize:10, color:"#cbd5e1"}}>
+                      <span style={{fontWeight:700,color:"#c4b5fd"}}>🔍 이력 패턴:</span> {d.historyPattern}
+                    </div>
+                  )}
+                  {d.actionSequence?.length > 0 && (
+                    <div style={{marginTop:10}}>
+                      <div style={{fontSize:11,fontWeight:700,color:"#94a3b8",marginBottom:4}}>
+                        적용 조치 ({d.actionSequence.length}단계)
+                      </div>
+                      <ol style={{margin:0,paddingLeft:18,fontSize:10,color:"#cbd5e1",lineHeight:1.6}}>
+                        {d.actionSequence.map((step, si) => (
+                          <li key={si} style={{marginBottom:2}}>{step}</li>
+                        ))}
+                      </ol>
+                    </div>
+                  )}
+                  {/* ★ 12-Y1: 조치 분석 */}
+                  {d.actionAnalysis && (
+                    <div style={{marginTop:6, padding:"6px 10px", background:"rgba(239,68,68,0.06)", borderLeft:"3px solid #ef4444", borderRadius:4, fontSize:10, color:"#fca5a5", fontStyle:"italic"}}>
+                      ⚠️ {d.actionAnalysis}
+                    </div>
+                  )}
+                  {/* ★ Phase 2: 매칭되는 페르소나 논의 표시 */}
+                  {(() => {
+                    const matched = findMatchingDiscussion(d);
+                    if (!matched) return null;
+                    markMatched(matched);
+                    return <PersonaConversation discussion={matched}/>;
+                  })()}
+                </div>
+              );
+            })}
+          </div>
+        )}
+
+        {/* 영역 11-K: 짧은 부동 이슈 펼침 영역 (1번 섹션 안) */}
+        {shortDowntimeIssues.length > 0 && (
+          <div style={{marginTop:10, paddingTop:10, borderTop:"1px dashed rgba(100,116,139,0.3)"}}>
+            <button onClick={() => setShowShortDowntime(!showShortDowntime)} style={{
+              fontSize:10, padding:"5px 10px", borderRadius:5,
+              background:"rgba(100,116,139,0.1)", border:"1px solid rgba(100,116,139,0.3)",
+              color:"#94a3b8", cursor:"pointer", fontWeight:700,
+            }}>
+              {showShortDowntime ? "▼" : "▶"} 기타 짧은 부동 이슈 ({shortDowntimeIssues.length}건) — 추가 논의 후보
+            </button>
+            {showShortDowntime && (
+              <div style={{marginTop:8, maxHeight:600, overflowY:"auto"}}>
+                {shortDowntimeIssues.map((i) => {
+                  const id = getIssueId(i);
+                  const checked = selectedIds.includes(id);
+                  const matched = findMatchingDiscussionByIssue(i);
+                  if (matched) markMatched(matched);
+                  return (
+                    <div key={id} style={{marginBottom: 6}}>
+                      <label style={{
+                        display:"flex", alignItems:"flex-start", gap:8,
+                        padding:"6px 8px", borderRadius:5,
+                        background: checked ? "rgba(34,211,238,0.05)" : "rgba(15,23,42,0.3)",
+                        border:`1px solid ${checked ? "rgba(34,211,238,0.25)" : "rgba(51,65,85,0.25)"}`,
+                        cursor:"pointer", fontSize:10,
+                      }}>
+                        <input type="checkbox" checked={checked}
+                          onChange={() => onToggle(id)}
+                          style={{marginTop:2, cursor:"pointer", accentColor:"#22d3ee"}}/>
+                        <div style={{flex:1, lineHeight:1.5}}>
+                          <span style={{color:"#94a3b8"}}>{i.date} {i.time}</span>
+                          {" · "}
+                          <span style={{color:"#cbd5e1",fontWeight:700,fontFamily:"monospace"}}>{i.eq || "-"}</span>
+                          {" · "}
+                          <span style={{color:"#94a3b8"}}>{i.durMin}분</span>
+                          {i.prob && <div style={{color:"#cbd5e1",fontSize:9.5}}>{i.prob.slice(0, 80)}</div>}
+                        </div>
+                      </label>
+                      {/* ★ Phase 2: 매칭되는 페르소나 논의 (체크박스 카드 아래) */}
+                      {matched && <PersonaConversation discussion={matched}/>}
+                    </div>
+                  );
+                })}
+              </div>
+            )}
+          </div>
+        )}
+      </div>
+
+      {/* ★ 영역 12-Y4: 만성 이슈 추적 (24h+ open 또는 cross-day 반복) */}
+      {curation.chronicIssues?.length > 0 && (
+        <div style={sectionStyle}>
+          <div style={{...headingStyle, color:"#dc2626"}}>🔥 만성 이슈 추적 (별도)</div>
+          <div style={{fontSize:10, color:"#94a3b8", marginBottom:10, fontStyle:"italic"}}>
+            24시간 이상 open 상태이거나 여러 일자에 걸쳐 반복되는 만성 이슈입니다.
+          </div>
+          {curation.chronicIssues.map((c, idx) => (
+            <div key={idx} style={{
+              background:"rgba(220,38,38,0.06)",
+              border:"1px solid rgba(220,38,38,0.3)",
+              borderLeft:"5px solid #dc2626",
+              borderRadius:6, padding:"10px 14px", marginBottom:10,
+            }}>
+              <div style={{fontSize:12, fontWeight:800, color:"#fca5a5", marginBottom:6}}>
+                ⚠️ {c.title || c.equipment}
+              </div>
+              <table style={{...tableStyle, fontSize:10.5}}>
+                <tbody>
+                  {c.startedAt && <tr><th style={{...thStyle,width:"22%"}}>시작</th><td style={tdStyle}>{c.startedAt}</td></tr>}
+                  {c.currentStatus && <tr><th style={thStyle}>현재 상태</th><td style={{...tdStyle,fontWeight:700,color:"#fbbf24"}}>{c.currentStatus}</td></tr>}
+                  {c.managerInvolved && <tr><th style={thStyle}>관련 관리</th><td style={{...tdStyle,color:"#fca5a5",fontWeight:700}}>{c.managerInvolved}</td></tr>}
+                </tbody>
+              </table>
+              {c.history?.length > 0 && (
+                <div style={{marginTop:8}}>
+                  <div style={{fontSize:10.5, fontWeight:700, color:"#94a3b8", marginBottom:4}}>이력</div>
+                  <ul style={{margin:0, paddingLeft:18, fontSize:10, color:"#cbd5e1", lineHeight:1.6}}>
+                    {c.history.map((h, hi) => <li key={hi} style={{marginBottom:2}}>{h}</li>)}
+                  </ul>
+                </div>
+              )}
+            </div>
+          ))}
+        </div>
+      )}
+
+      {/* 2. 발생빈도 — 영역 11-K: 그룹 헤더 체크박스 + 펼침 시 개별 체크박스 */}
+      <div style={sectionStyle}>
+        <div style={{...headingStyle,color:"#f59e0b"}}>🔁 2. 발생빈도 높은 이슈</div>
+
+        {/* 카테고리별 */}
+        <div style={{marginBottom:14}}>
+          <div style={{fontSize:11,fontWeight:700,color:"#fcd34d",marginBottom:6}}>카테고리별</div>
+          {(!curation.recurringByCategory || curation.recurringByCategory.length === 0) ? empty("반복 카테고리 없음") : (
+            <div>
+              {curation.recurringByCategory.map((c, i) => {
+                const groupKey = `cat-${i}`;
+                const groupIssues = findIssuesByEquipmentList(c.equipments);
+                const groupIds = groupIssues.map(getIssueId);
+                const expanded = expandedGroups[groupKey];
+                const state = groupCheckState(groupIds);
+                return (
+                  <div key={i} style={{
+                    marginBottom:4,
+                    border:"1px solid rgba(51,65,85,0.3)", borderRadius:5,
+                    background: state === "all" ? "rgba(34,211,238,0.04)" : "rgba(15,23,42,0.4)",
+                  }}>
+                    {/* 헤더 행 */}
+                    <div style={{
+                      display:"flex", alignItems:"center", gap:8,
+                      padding:"6px 10px",
+                    }}>
+                      <GroupCheckbox issueIds={groupIds}/>
+                      <button onClick={() => toggleGroup(groupKey)} style={{
+                        background:"transparent", border:"none", cursor:"pointer",
+                        color:"#94a3b8", fontSize:10, padding:"0 4px",
+                      }}>{expanded ? "▼" : "▶"}</button>
+                      <div style={{flex:1, fontSize:10.5, fontWeight:700, color:"#cbd5e1"}}>
+                        {c.category}
+                      </div>
+                      <span style={{
+                        fontSize:10, fontWeight:700,
+                        color:c.count>=3?"#ef4444":"#f59e0b",
+                      }}>{c.count}건</span>
+                      <span style={{fontSize:9, color:"#64748b", fontFamily:"monospace", maxWidth:280, overflow:"hidden", textOverflow:"ellipsis", whiteSpace:"nowrap"}}>
+                        {(c.equipments || []).join(", ")}
+                      </span>
+                    </div>
+                    {/* 펼침 시 개별 이슈 */}
+                    {expanded && groupIssues.length > 0 && (
+                      <div style={{padding:"4px 10px 8px 32px"}}>
+                        {groupIssues.map(iss => {
+                          const id = getIssueId(iss);
+                          const checked = selectedIds.includes(id);
+                          const isAuto = autoSelectedIds.includes(id);
+                          const matched = findMatchingDiscussionByIssue(iss);
+                          if (matched) markMatched(matched);
+                          return (
+                            <div key={id} style={{marginBottom: 4}}>
+                              <label style={{
+                                display:"flex", alignItems:"flex-start", gap:6,
+                                padding:"3px 4px", fontSize:9.5,
+                                color:checked ? "#cbd5e1" : "#94a3b8",
+                                cursor:"pointer",
+                              }}>
+                                <input type="checkbox" checked={checked}
+                                  onChange={() => onToggle(id)}
+                                  style={{cursor:"pointer", accentColor:"#22d3ee", margin:"2px 0"}}/>
+                                {isAuto && <span style={{color:"#fbbf24",fontWeight:700}}>⭐</span>}
+                                <span style={{flex:1}}>
+                                  <span style={{fontFamily:"monospace",fontWeight:700}}>{iss.eq || "-"}</span>
+                                  {" · "}{iss.date} {iss.time}
+                                  {" · "}{iss.durMin}분
+                                  {iss.prob && <span style={{color:"#64748b"}}> — {iss.prob.slice(0, 50)}</span>}
+                                </span>
+                              </label>
+                              {/* ★ Phase 2: 매칭 논의 */}
+                              {matched && <PersonaConversation discussion={matched}/>}
+                            </div>
+                          );
+                        })}
+                      </div>
+                    )}
+                  </div>
+                );
+              })}
+            </div>
+          )}
+        </div>
+
+        {/* 동일 설비 다발 */}
+        {curation.recurringSameEquipment?.length > 0 && (
+          <div>
+            <div style={{fontSize:11,fontWeight:700,color:"#fcd34d",marginBottom:6}}>동일 설비 다발</div>
+            <div>
+              {curation.recurringSameEquipment.map((e, i) => {
+                const groupKey = `eq-${i}`;
+                const groupIssues = findIssuesByEquipment(e.equipment);
+                const groupIds = groupIssues.map(getIssueId);
+                const expanded = expandedGroups[groupKey];
+                const state = groupCheckState(groupIds);
+                return (
+                  <div key={i} style={{
+                    marginBottom:4,
+                    border:"1px solid rgba(51,65,85,0.3)", borderRadius:5,
+                    background: state === "all" ? "rgba(34,211,238,0.04)" : "rgba(15,23,42,0.4)",
+                  }}>
+                    <div style={{display:"flex", alignItems:"center", gap:8, padding:"6px 10px"}}>
+                      <GroupCheckbox issueIds={groupIds}/>
+                      <button onClick={() => toggleGroup(groupKey)} style={{
+                        background:"transparent", border:"none", cursor:"pointer",
+                        color:"#94a3b8", fontSize:10, padding:"0 4px",
+                      }}>{expanded ? "▼" : "▶"}</button>
+                      <span style={{fontFamily:"monospace",fontWeight:700,color:"#fcd34d", fontSize:10.5}}>{e.equipment}</span>
+                      <span style={{fontSize:10, color:"#cbd5e1", flex:1}}>
+                        {": "}{e.count}건{e.detail ? ` — ${e.detail}` : ""}
+                      </span>
+                    </div>
+                    {/* ★ 12-Y2: 재발 간격 분석 */}
+                    {(e.gapAnalysis || e.totalDuration || e.partsReplaced) && (
+                      <div style={{padding:"4px 12px 6px 32px", fontSize:9.5, color:"#fcd34d", lineHeight:1.6}}>
+                        {e.gapAnalysis && <div>⏱️ {e.gapAnalysis}</div>}
+                        {e.totalDuration && <div style={{color:"#fbbf24",fontWeight:700}}>📊 누적: {e.totalDuration}</div>}
+                        {e.partsReplaced && <div style={{color:"#94a3b8"}}>🔧 교체: {e.partsReplaced}</div>}
+                      </div>
+                    )}
+                    {expanded && groupIssues.length > 0 && (
+                      <div style={{padding:"4px 10px 8px 32px"}}>
+                        {groupIssues.map(iss => {
+                          const id = getIssueId(iss);
+                          const checked = selectedIds.includes(id);
+                          const isAuto = autoSelectedIds.includes(id);
+                          const matched = findMatchingDiscussionByIssue(iss);
+                          if (matched) markMatched(matched);
+                          return (
+                            <div key={id} style={{marginBottom: 4}}>
+                              <label style={{
+                                display:"flex", alignItems:"flex-start", gap:6,
+                                padding:"3px 4px", fontSize:9.5,
+                                color:checked ? "#cbd5e1" : "#94a3b8", cursor:"pointer",
+                              }}>
+                                <input type="checkbox" checked={checked}
+                                  onChange={() => onToggle(id)}
+                                  style={{cursor:"pointer", accentColor:"#22d3ee", margin:"2px 0"}}/>
+                                {isAuto && <span style={{color:"#fbbf24",fontWeight:700}}>⭐</span>}
+                                <span style={{flex:1}}>
+                                  {iss.date} {iss.time} · {iss.durMin}분
+                                  {iss.prob && <span style={{color:"#64748b"}}> — {iss.prob.slice(0, 60)}</span>}
+                                </span>
+                              </label>
+                              {matched && <PersonaConversation discussion={matched}/>}
+                            </div>
+                          );
+                        })}
+                      </div>
+                    )}
+                  </div>
+                );
+              })}
+            </div>
+          </div>
+        )}
+      </div>
+
+      {/* 3. 조건 변경 */}
+      <div style={sectionStyle}>
+        <div style={{...headingStyle,color:"#34d399"}}>⚙️ 3. 설비/공정 조건 변경</div>
+
+        {/* ★ 12-Y2: 호기별 통합 그룹 (사용자 레포트 양식) */}
+        {curation.conditionChangeGroups?.length > 0 && (
+          <div style={{marginBottom:14}}>
+            {curation.conditionChangeGroups.map((g, gi) => (
+              <div key={gi} style={{
+                background:"rgba(52,211,153,0.05)",
+                border:"1px solid rgba(52,211,153,0.25)",
+                borderLeft:"4px solid #34d399",
+                borderRadius:6, padding:"10px 14px", marginBottom:10,
+              }}>
+                <div style={{fontSize:11.5, fontWeight:800, color:"#86efac", marginBottom:4}}>
+                  {g.title || g.equipment}
+                  {g.timeRange && <span style={{color:"#94a3b8",fontWeight:400,marginLeft:6,fontSize:10}}>({g.timeRange}{g.shift ? `, ${g.shift}` : ""})</span>}
+                </div>
+                {g.picReason && (
+                  <div style={{fontSize:10, color:"#94a3b8", marginBottom:6, fontStyle:"italic"}}>
+                    {g.picReason}
+                  </div>
+                )}
+                {g.parameters?.length > 0 && (
+                  <table style={{...tableStyle, fontSize:10, marginBottom:6}}>
+                    <thead><tr><th style={thStyle}>파라미터</th><th style={thStyle}>Before → After</th></tr></thead>
+                    <tbody>
+                      {g.parameters.map((p, pi) => (
+                        <tr key={pi}>
+                          <td style={tdStyle}>{p.parameter}</td>
+                          <td style={{...tdStyle,fontWeight:700,color:"#86efac"}}>
+                            {p.before} → <span style={{color:"#34d399"}}>{p.after}</span>
+                          </td>
+                        </tr>
+                      ))}
+                    </tbody>
+                  </table>
+                )}
+                {g.verification && (
+                  <div style={{fontSize:10, color:"#34d399", padding:"4px 8px", background:"rgba(52,211,153,0.08)", borderRadius:4}}>
+                    ✅ {g.verification}
+                  </div>
+                )}
+              </div>
+            ))}
+          </div>
+        )}
+
+        {curation.conditionChanges?.visionOffset?.length > 0 && (
+          <div style={{marginBottom:10}}>
+            <div style={{fontSize:11,fontWeight:700,color:"#86efac",marginBottom:6}}>Vision Offset 적용</div>
+            <table style={tableStyle}>
+              <thead><tr><th style={thStyle}>시간</th><th style={thStyle}>설비</th><th style={thStyle}>변경 내용</th><th style={thStyle}>사유</th></tr></thead>
+              <tbody>
+                {curation.conditionChanges.visionOffset.map((c, i) => (
+                  <tr key={i}>
+                    <td style={tdStyle}>{c.date} {c.time}</td>
+                    <td style={{...tdStyle,fontWeight:700,fontFamily:"monospace"}}>{c.equipment}</td>
+                    <td style={tdStyle}>{c.change}</td>
+                    <td style={tdStyle}>{c.reason || "-"}</td>
+                  </tr>
+                ))}
+              </tbody>
+            </table>
+          </div>
+        )}
+
+        {curation.conditionChanges?.settingChange?.length > 0 && (
+          <div style={{marginBottom:10}}>
+            <div style={{fontSize:11,fontWeight:700,color:"#86efac",marginBottom:6}}>Setting 변경 (Before → After)</div>
+            <table style={tableStyle}>
+              <thead><tr><th style={thStyle}>설비</th><th style={thStyle}>파라미터</th><th style={thStyle}>Before → After</th></tr></thead>
+              <tbody>
+                {curation.conditionChanges.settingChange.map((s, i) => (
+                  <tr key={i}>
+                    <td style={{...tdStyle,fontFamily:"monospace"}}>{s.equipment || "-"}</td>
+                    <td style={tdStyle}>{s.parameter}</td>
+                    <td style={tdStyle}>{s.before} → <strong style={{color:"#34d399"}}>{s.after}</strong></td>
+                  </tr>
+                ))}
+              </tbody>
+            </table>
+          </div>
+        )}
+
+        {curation.conditionChanges?.cutter?.length > 0 && (
+          <div style={{marginBottom:10}}>
+            <div style={{fontSize:11,fontWeight:700,color:"#86efac",marginBottom:6}}>Cutter 조정</div>
+            <table style={tableStyle}>
+              <thead><tr><th style={thStyle}>시간</th><th style={thStyle}>설비</th><th style={thStyle}>변경 내용</th></tr></thead>
+              <tbody>
+                {curation.conditionChanges.cutter.map((c, i) => (
+                  <tr key={i}>
+                    <td style={tdStyle}>{c.date} {c.time}</td>
+                    <td style={{...tdStyle,fontFamily:"monospace"}}>{c.equipment}</td>
+                    <td style={tdStyle}>{c.change}</td>
+                  </tr>
+                ))}
+              </tbody>
+            </table>
+          </div>
+        )}
+
+        {curation.conditionChanges?.other?.length > 0 && (
+          <div>
+            <div style={{fontSize:11,fontWeight:700,color:"#86efac",marginBottom:6}}>기타</div>
+            <table style={tableStyle}>
+              <thead><tr><th style={thStyle}>날짜</th><th style={thStyle}>설비</th><th style={thStyle}>변경 내용</th><th style={thStyle}>담당</th></tr></thead>
+              <tbody>
+                {curation.conditionChanges.other.map((c, i) => (
+                  <tr key={i}>
+                    <td style={tdStyle}>{c.date}</td>
+                    <td style={{...tdStyle,fontFamily:"monospace"}}>{c.equipment}</td>
+                    <td style={tdStyle}>{c.change}</td>
+                    <td style={tdStyle}>{c.pic || "-"}</td>
+                  </tr>
+                ))}
+              </tbody>
+            </table>
+          </div>
+        )}
+
+        {(!curation.conditionChanges ||
+          (!curation.conditionChanges.visionOffset?.length &&
+           !curation.conditionChanges.settingChange?.length &&
+           !curation.conditionChanges.cutter?.length &&
+           !curation.conditionChanges.other?.length)) && empty("조건 변경 없음")}
+      </div>
+
+      {/* 4. 테스트/PM */}
+      <div style={sectionStyle}>
+        <div style={{...headingStyle,color:"#22d3ee"}}>🧪 4. 테스트 / PM 활동</div>
+
+        {curation.testPm?.linePM?.length > 0 && (
+          <div style={{marginBottom:10}}>
+            <div style={{fontSize:11,fontWeight:700,color:"#7dd3fc",marginBottom:6}}>Line PM 계획</div>
+            <table style={tableStyle}>
+              <thead><tr><th style={thStyle}>일자</th><th style={thStyle}>라인</th><th style={thStyle}>상태</th></tr></thead>
+              <tbody>
+                {curation.testPm.linePM.map((p, i) => (
+                  <tr key={i}>
+                    <td style={tdStyle}>{p.date}</td>
+                    <td style={{...tdStyle,fontWeight:700}}>{p.line}</td>
+                    <td style={tdStyle}>{p.status}</td>
+                  </tr>
+                ))}
+              </tbody>
+            </table>
+          </div>
+        )}
+
+        {curation.testPm?.fmvs?.length > 0 && (
+          <div style={{marginBottom:10}}>
+            <div style={{fontSize:11,fontWeight:700,color:"#7dd3fc",marginBottom:6}}>FMVS (Vision Camera)</div>
+            <table style={tableStyle}>
+              <thead><tr><th style={thStyle}>일자</th><th style={thStyle}>작업</th><th style={thStyle}>대상 설비</th></tr></thead>
+              <tbody>
+                {curation.testPm.fmvs.map((f, i) => (
+                  <tr key={i}>
+                    <td style={tdStyle}>{f.date}</td>
+                    <td style={tdStyle}>{f.action}</td>
+                    <td style={{...tdStyle,fontSize:9.5}}>{f.equipments}</td>
+                  </tr>
+                ))}
+              </tbody>
+            </table>
+          </div>
+        )}
+
+        {curation.testPm?.cutter?.length > 0 && (
+          <div style={{marginBottom:10}}>
+            <div style={{fontSize:11,fontWeight:700,color:"#7dd3fc",marginBottom:6}}>Cutter 테스트</div>
+            <table style={tableStyle}>
+              <thead><tr><th style={thStyle}>시간</th><th style={thStyle}>항목</th><th style={thStyle}>결과</th></tr></thead>
+              <tbody>
+                {curation.testPm.cutter.map((c, i) => (
+                  <tr key={i}>
+                    <td style={tdStyle}>{c.date} {c.time}</td>
+                    <td style={tdStyle}>{c.item}</td>
+                    <td style={tdStyle}>
+                      <span style={{
+                        fontSize:14,
+                        color: c.resultIcon === "✅" ? "#34d399" :
+                               c.resultIcon === "❌" ? "#ef4444" : "#fbbf24",
+                      }}>{c.resultIcon}</span>
+                      {" "}{c.note}
+                    </td>
+                  </tr>
+                ))}
+              </tbody>
+            </table>
+          </div>
+        )}
+
+        {curation.testPm?.stackingSepa?.length > 0 && (
+          <div>
+            <div style={{fontSize:11,fontWeight:700,color:"#7dd3fc",marginBottom:6}}>Stacking Sepa Run 문제</div>
+            <ul style={{margin:0,paddingLeft:18,fontSize:10.5,color:"#cbd5e1",lineHeight:1.7}}>
+              {curation.testPm.stackingSepa.map((s, i) => (
+                <li key={i} style={{marginBottom:2}}>
+                  <span style={{fontWeight:700,fontFamily:"monospace"}}>{s.date} {s.equipment}</span>
+                  {": "}{s.issue}{" "}
+                  <span style={{color:"#ef4444"}}>{s.resultIcon}</span>
+                </li>
+              ))}
+            </ul>
+          </div>
+        )}
+
+        {(!curation.testPm ||
+          (!curation.testPm.linePM?.length &&
+           !curation.testPm.fmvs?.length &&
+           !curation.testPm.cutter?.length &&
+           !curation.testPm.stackingSepa?.length)) && empty("테스트/PM 활동 없음")}
+
+        {/* ★ 12-Y3: Line 3D Cutter CPC 모니터링 */}
+        {curation.line3DCutterCpc && curation.line3DCutterCpc.status && (
+          <div style={{
+            marginTop:10, padding:"8px 12px",
+            background:"rgba(34,211,238,0.06)",
+            border:"1px solid rgba(34,211,238,0.25)",
+            borderRadius:5,
+          }}>
+            <div style={{fontSize:11, fontWeight:700, color:"#22d3ee", marginBottom:4}}>
+              📡 Line 3D Cutter CPC 이상 (모니터링)
+            </div>
+            <div style={{fontSize:10, color:"#cbd5e1", marginBottom:4}}>{curation.line3DCutterCpc.status}</div>
+            {curation.line3DCutterCpc.details?.length > 0 && (
+              <ul style={{margin:0, paddingLeft:16, fontSize:9.5, color:"#94a3b8", lineHeight:1.6}}>
+                {curation.line3DCutterCpc.details.map((d, di) => <li key={di}>{d}</li>)}
+              </ul>
+            )}
+          </div>
+        )}
+
+        {/* ★ 12-Y3: Stacking 1-AB Sepa Run Issues (만성 라인) */}
+        {curation.chronic1AB && (curation.chronic1AB.title || curation.chronic1AB.byEquipment?.length) && (
+          <div style={{
+            marginTop:10, padding:"10px 12px",
+            background:"rgba(239,68,68,0.06)",
+            border:"1px solid rgba(239,68,68,0.25)",
+            borderLeft:"4px solid #ef4444",
+            borderRadius:5,
+          }}>
+            <div style={{fontSize:11.5, fontWeight:800, color:"#fca5a5", marginBottom:4}}>
+              🔥 {curation.chronic1AB.title || "Stacking 1-AB Sepa Run Issues (지속 모니터링)"}
+            </div>
+            {curation.chronic1AB.patternSummary && (
+              <div style={{fontSize:10, color:"#cbd5e1", marginBottom:6, fontStyle:"italic"}}>
+                → {curation.chronic1AB.patternSummary}
+              </div>
+            )}
+            {curation.chronic1AB.byEquipment?.length > 0 && (
+              <table style={{...tableStyle, fontSize:10}}>
+                <thead><tr><th style={thStyle}>호기</th><th style={thStyle}>다발 NG</th></tr></thead>
+                <tbody>
+                  {curation.chronic1AB.byEquipment.map((e, ei) => (
+                    <tr key={ei}>
+                      <td style={{...tdStyle,fontWeight:700,fontFamily:"monospace"}}>{e.equipment}</td>
+                      <td style={{...tdStyle,color:"#fca5a5"}}>{e.ngList}</td>
+                    </tr>
+                  ))}
+                </tbody>
+              </table>
+            )}
+          </div>
+        )}
+      </div>
+
+      {/* 5. NG 품질 실적 */}
+      <div style={sectionStyle}>
+        <div style={{...headingStyle,color:"#a78bfa"}}>📊 5. 일일 NG 품질 실적</div>
+
+        {(!curation.qualityNg?.table || curation.qualityNg.table.length === 0) ? empty("NG 품질 데이터 없음") : (
+          <>
+            <table style={tableStyle}>
+              <thead><tr>
+                <th style={thStyle}>일자</th>
+                <th style={{...thStyle,textAlign:"right"}}>Sepa Fold</th>
+                <th style={{...thStyle,textAlign:"right"}}>Electrode Expose</th>
+                <th style={{...thStyle,textAlign:"right"}}>Non Response</th>
+                <th style={{...thStyle,textAlign:"right"}}>Dim Overkill</th>
+                <th style={{...thStyle,textAlign:"right"}}>Contact NG</th>
+              </tr></thead>
+              <tbody>
+                {curation.qualityNg.table.map((row, i) => (
+                  <tr key={i}>
+                    <td style={tdStyle}>{row.date}</td>
+                    <td style={{...tdStyle,textAlign:"right",fontWeight:row.sepaFold>=20?700:400,color:row.sepaFold>=20?"#ef4444":"#cbd5e1"}}>{row.sepaFold ?? "-"}</td>
+                    <td style={{...tdStyle,textAlign:"right"}}>{row.electrodeExpose ?? "-"}</td>
+                    <td style={{...tdStyle,textAlign:"right"}}>{row.nonResponse ?? "-"}</td>
+                    <td style={{...tdStyle,textAlign:"right"}}>{row.dimOverkill ?? "-"}</td>
+                    <td style={{...tdStyle,textAlign:"right"}}>{row.contactNg ?? "-"}</td>
+                  </tr>
+                ))}
+              </tbody>
+            </table>
+            {curation.qualityNg.trend && curation.qualityNg.trend !== "데이터 없음" && (
+              <div style={{
+                marginTop:10, padding:"10px 14px",
+                background:"rgba(41,128,185,0.08)", border:"1px solid rgba(41,128,185,0.25)",
+                borderLeft:"4px solid #2980b9", borderRadius:6,
+                fontSize:10.5, color:"#cbd5e1", lineHeight:1.6,
+              }}>
+                <strong style={{color:"#60a5fa"}}>추세:</strong> {curation.qualityNg.trend}
+              </div>
+            )}
+          </>
+        )}
+      </div>
+    </div>
+  );
+}
+
+// ─── ★ 영역 11-F: STEP 4 메인 페이지 (사용자 레포트 1~7번 형태) ──────────────
+// 1~5번: BriefingDisplay 재사용 (체크박스 props 미전달 = 정보 표시 전용)
+// 6번: 가장 주목할 사항 (LLM 생성 인사이트)
+// 7번: 액션 후속 사항 (P0/P1/P2 표)
+function MainReportPage({ minutes }) {
+  if (!minutes) return null;
+  const sectionStyle = {
+    background:"rgba(15,23,42,0.6)", border:"1px solid rgba(100,116,139,0.25)",
+    borderRadius:10, padding:"14px 16px", marginBottom:14,
+  };
+  const headingStyle = {
+    fontSize:13, fontWeight:800, marginBottom:10,
+    paddingBottom:6, borderBottom:"1px solid rgba(51,65,85,0.4)",
+  };
+  const tableStyle = { width:"100%", fontSize:10.5, color:"#cbd5e1", borderCollapse:"collapse" };
+  const thStyle = {
+    padding:"5px 8px", background:"rgba(51,65,85,0.4)",
+    color:"#94a3b8", fontWeight:700, textAlign:"left",
+    border:"1px solid rgba(51,65,85,0.4)",
+  };
+  const tdStyle = { padding:"5px 8px", border:"1px solid rgba(51,65,85,0.3)", verticalAlign:"top" };
+
+  // 분석 기간 라벨
+  const periodLabel = (() => {
+    if (minutes.range && minutes.range.start && minutes.range.end) {
+      // selRange 활용 — buildRangeLabel 결과는 minutes.date에 이미 들어있을 가능성
+      return minutes.date;
+    }
+    return minutes.date || "";
+  })();
+
+  // 6번 confidence 라벨 색상
+  const confColor = (conf) => conf?.includes("가설") ? "#f59e0b" : "#34d399";
+  const confLabel = (conf) => conf?.includes("가설") ? "🔬 가설 — 검증필요" : "✅ 확실";
+
+  // 7번 P0/P1/P2 색상
+  const pColor = (p) => p === "P0" ? "#c0392b" : p === "P1" ? "#e67e22" : "#d4ac0d";
+  const pIcon = (p) => p === "P0" ? "🚨" : p === "P1" ? "🔴" : "🟡";
+
+  return (
+    <div>
+      {/* 헤더 */}
+      <div style={{
+        background:"rgba(29,78,216,0.08)", borderTop:"4px solid #1d4ed8",
+        borderRadius:"0 0 10px 10px",
+        padding:"18px 20px", marginBottom:16,
+      }}>
+        <div style={{fontSize:18,fontWeight:900,color:"#dbeafe",marginBottom:6}}>
+          AZS Factory 일일 이슈 레포트
+        </div>
+        <div style={{fontSize:11,color:"#cbd5e1",lineHeight:1.7}}>
+          <strong>분석 기간:</strong> {periodLabel}<br/>
+          <strong>출처:</strong> AZS Status Reports WhatsApp 그룹<br/>
+          <strong>레코드:</strong> {(() => {
+            const rb = minutes.curation?.recordBreakdown || {};
+            const parts = [];
+            if (rb.bmDowntime > 0) parts.push(`BM Downtime Bot ${rb.bmDowntime}건`);
+            if (rb.ubm > 0) parts.push(`UBM ${rb.ubm}건`);
+            if (rb.pdDowntime > 0) parts.push(`PD Downtime ${rb.pdDowntime}건`);
+            if (rb.other > 0) parts.push(`기타 ${rb.other}건`);
+            return parts.length > 0 ? parts.join(" + ") : `부동 이슈 ${(minutes.tagged?.issues || []).length}건`;
+          })()}
+          {minutes.curation?.summary_text && (
+            <>
+              <br/>
+              <strong>요약:</strong> {minutes.curation.summary_text}
+            </>
+          )}
+        </div>
+      </div>
+
+      {/* 1~5번: BriefingDisplay (정보 표시 전용 — 체크박스 props 미전달) */}
+      <BriefingDisplay
+        curation={minutes.curation}
+        allIssues={minutes.tagged?.issues || []}
+        discussions={minutes.discussions || []}
+      />
+
+      {/* 6번: 가장 주목할 사항 */}
+      <div style={sectionStyle}>
+        <div style={{...headingStyle,color:"#e67e22"}}>⚠️ 6. 가장 주목할 사항</div>
+        {(!minutes.insights || minutes.insights.length === 0) ? (
+          <div style={{fontSize:10,color:"#64748b",padding:"8px 0"}}>인사이트 없음</div>
+        ) : (
+          <div>
+            {minutes.insights.map((ins, idx) => (
+              <div key={idx} style={{
+                padding:"10px 14px", marginBottom:8,
+                background:"rgba(15,23,42,0.4)", border:"1px solid rgba(51,65,85,0.3)",
+                borderLeft:`4px solid ${confColor(ins.confidence)}`,
+                borderRadius:6,
+              }}>
+                <div style={{
+                  display:"flex", alignItems:"center", gap:10,
+                  marginBottom:6,
+                }}>
+                  <span style={{fontSize:11,fontWeight:800,color:"#fcd34d",flex:1}}>
+                    {ins.title}
+                  </span>
+                  <span style={{
+                    fontSize:9, padding:"2px 8px", borderRadius:10,
+                    background:`${confColor(ins.confidence)}22`,
+                    color:confColor(ins.confidence),
+                    fontWeight:700,
+                  }}>{confLabel(ins.confidence)}</span>
+                </div>
+                {ins.bulletPoints?.length > 0 && (
+                  <ul style={{margin:0,paddingLeft:18,fontSize:10.5,color:"#cbd5e1",lineHeight:1.6}}>
+                    {ins.bulletPoints.map((bp, bi) => (
+                      <li key={bi} style={{marginBottom:2}}>{bp}</li>
+                    ))}
+                  </ul>
+                )}
+                {ins.evidence && (
+                  <div style={{
+                    fontSize:9, color:"#64748b", marginTop:6, paddingTop:4,
+                    borderTop:"1px dashed rgba(100,116,139,0.3)",
+                  }}>
+                    📎 근거: <span style={{color:"#94a3b8"}}>{ins.evidence}</span>
+                  </div>
+                )}
+              </div>
+            ))}
+          </div>
+        )}
+      </div>
+
+      {/* 7번: 액션 후속 사항 */}
+      <div style={sectionStyle}>
+        <div style={{...headingStyle,color:"#a78bfa"}}>📌 7. 액션 후속 사항</div>
+        {(!minutes.actions || minutes.actions.length === 0) ? (
+          <div style={{fontSize:10,color:"#64748b",padding:"8px 0"}}>액션 항목 없음</div>
+        ) : (
+          <table style={tableStyle}>
+            <thead>
+              <tr>
+                <th style={{...thStyle,width:"10%",textAlign:"center"}}>우선순위</th>
+                <th style={thStyle}>항목</th>
+                <th style={thStyle}>비고</th>
+                <th style={{...thStyle,width:"18%"}}>근거</th>
+              </tr>
+            </thead>
+            <tbody>
+              {minutes.actions.map((a, idx) => (
+                <tr key={idx}>
+                  <td style={{...tdStyle,textAlign:"center"}}>
+                    <span style={{
+                      fontSize:10, fontWeight:800, color:pColor(a.priority),
+                    }}>{pIcon(a.priority)} {a.priority}</span>
+                  </td>
+                  <td style={tdStyle}>
+                    <strong>{a.action}</strong>
+                    {a._ruleAdjusted && (
+                      <div style={{fontSize:8,color:"#94a3b8",marginTop:2}}>
+                        ※ {a._ruleAdjusted}
+                      </div>
+                    )}
+                  </td>
+                  <td style={{...tdStyle,fontSize:10}}>
+                    {a.context}
+                    {a.confidence?.includes("가설") && (
+                      <span style={{
+                        marginLeft:6, fontSize:8, padding:"1px 5px", borderRadius:3,
+                        background:"rgba(245,158,11,0.15)", color:"#fbbf24", fontWeight:700,
+                      }}>🔬 검증필요</span>
+                    )}
+                  </td>
+                  <td style={{...tdStyle,fontSize:9,color:"#94a3b8"}}>{a.evidence}</td>
+                </tr>
+              ))}
+            </tbody>
+          </table>
+        )}
+      </div>
+
+      {/* 푸터 */}
+      <div style={{
+        textAlign:"center", fontSize:9, color:"#64748b", marginTop:20,
+        paddingTop:12, borderTop:"1px solid rgba(51,65,85,0.3)",
+      }}>
+        — 메인 레포트 종료 —<br/>
+        AZS Status Reports WhatsApp 데이터 기반
+      </div>
+    </div>
+  );
+}
+
+// ─── ★ 영역 12 Phase 2: 페르소나 대화형 표시 컴포넌트 ──────────────────────────
+// 좌우 번갈아 정렬 + 말풍선 (페르소나 색상 배경) + 사회자 종합
+// props:
+//   discussion: { issue, modeInfo, opinions, moderator } — runIssueDiscussion 결과
+//   defaultExpanded: boolean (기본 false = 접힘)
+function PersonaConversation({ discussion, defaultExpanded = false }) {
+  const [expanded, setExpanded] = useState(defaultExpanded);
+  if (!discussion) return null;
+  const { opinions = [], moderator = {}, modeInfo } = discussion;
+
+  // 입장 → 색상
+  const stanceStyle = {
+    "동의": { bg: "rgba(52,211,153,0.2)", color: "#34d399" },
+    "부분동의": { bg: "rgba(251,191,36,0.2)", color: "#fbbf24" },
+    "반대": { bg: "rgba(239,68,68,0.2)", color: "#ef4444" },
+    "추가의견": { bg: "rgba(167,139,250,0.2)", color: "#a78bfa" },
+    "초기분석": { bg: "rgba(96,165,250,0.2)", color: "#60a5fa" },
+  };
+  const sStyle = (s) => stanceStyle[s] || { bg: "rgba(100,116,139,0.2)", color: "#94a3b8" };
+
+  return (
+    <div style={{
+      marginTop: 12, paddingTop: 12,
+      borderTop: "1px dashed rgba(100,116,139,0.5)",
+    }}>
+      {/* 헤더 (토글) */}
+      <div onClick={() => setExpanded(!expanded)} style={{
+        display: "flex", justifyContent: "space-between", alignItems: "center",
+        cursor: "pointer", padding: "6px 10px",
+        background: "rgba(167,139,250,0.1)",
+        border: "1px solid rgba(167,139,250,0.3)",
+        borderRadius: 6, fontSize: 11, fontWeight: 700, color: "#a78bfa",
+      }}>
+        <span>💬 페르소나 논의 ({opinions.length}명 발언) · {modeInfo?.mode || "?"} 모드 · 사회자 종합 포함</span>
+        <span>{expanded ? "▼ 접기" : "▶ 펼치기"}</span>
+      </div>
+
+      {expanded && (
+        <>
+          {/* 메시지 리스트 (좌우 번갈아) */}
+          <div style={{ padding: "14px 4px" }}>
+            {opinions.map((o, idx) => {
+              const p = PERSONAS[o.persona] || {};
+              const op = o.opinion || {};
+              const isLeft = idx % 2 === 0;
+              const stance = op.stance || "초기분석";
+              const sty = sStyle(stance);
+              const sayText = op.say || op.근본원인 || "(발언 데이터 없음)";
+              const quote = op.quote || op.previous_reference || "";
+              const replyTo = op.reply_to || "";
+
+              return (
+                <div key={idx} style={{
+                  display: "flex",
+                  flexDirection: isLeft ? "row" : "row-reverse",
+                  marginBottom: 14, gap: 8,
+                  animation: "fadeUp 0.3s",
+                }}>
+                  {/* 아바타 */}
+                  <div style={{
+                    flexShrink: 0, width: 38, height: 38,
+                    borderRadius: "50%", display: "flex",
+                    alignItems: "center", justifyContent: "center",
+                    fontSize: 18, fontWeight: 700,
+                    background: p.bg || "rgba(100,116,139,0.25)",
+                    color: p.color || "#94a3b8",
+                  }}>
+                    {p.icon || "?"}
+                  </div>
+
+                  {/* 메시지 영역 */}
+                  <div style={{ maxWidth: "70%", textAlign: isLeft ? "left" : "right" }}>
+                    {/* 이름 + 입장 + 답변 대상 */}
+                    <div style={{
+                      fontSize: 9.5, fontWeight: 700, marginBottom: 4,
+                      display: "flex", gap: 6, alignItems: "center",
+                      justifyContent: isLeft ? "flex-start" : "flex-end",
+                      color: p.color || "#94a3b8",
+                    }}>
+                      {!isLeft && replyTo && (
+                        <span style={{
+                          fontSize: 9, padding: "1px 6px", borderRadius: 8,
+                          background: "rgba(100,116,139,0.2)", color: "#94a3b8", fontWeight: 600,
+                        }}>↩ {replyTo}</span>
+                      )}
+                      {!isLeft && (
+                        <span style={{
+                          fontSize: 9, padding: "1px 6px", borderRadius: 8,
+                          background: sty.bg, color: sty.color, fontWeight: 700,
+                        }}>{stance}</span>
+                      )}
+                      <span>{p.label || o.persona}</span>
+                      {isLeft && (
+                        <span style={{
+                          fontSize: 9, padding: "1px 6px", borderRadius: 8,
+                          background: sty.bg, color: sty.color, fontWeight: 700,
+                        }}>{stance}</span>
+                      )}
+                      {isLeft && replyTo && (
+                        <span style={{
+                          fontSize: 9, padding: "1px 6px", borderRadius: 8,
+                          background: "rgba(100,116,139,0.2)", color: "#94a3b8", fontWeight: 600,
+                        }}>↩ {replyTo}</span>
+                      )}
+                    </div>
+
+                    {/* 말풍선 (페르소나 색상 배경) */}
+                    <div style={{
+                      padding: "10px 14px",
+                      borderRadius: 14,
+                      borderTopLeftRadius: isLeft ? 4 : 14,
+                      borderTopRightRadius: isLeft ? 14 : 4,
+                      fontSize: 11, lineHeight: 1.6, wordWrap: "break-word",
+                      background: p.color || "#475569",
+                      color: "#fff",
+                      textAlign: "left",
+                    }}>
+                      {/* 인용구 */}
+                      {quote && (
+                        <div style={{
+                          fontSize: 10, fontStyle: "italic",
+                          padding: "4px 10px", marginBottom: 6,
+                          borderLeft: "3px solid rgba(0,0,0,0.3)",
+                          background: "rgba(0,0,0,0.18)",
+                          borderRadius: "0 8px 8px 0",
+                          color: "rgba(255,255,255,0.85)",
+                        }}>
+                          "{quote}"
+                        </div>
+                      )}
+                      {/* 발언 본문 */}
+                      <div>{sayText}</div>
+                    </div>
+                  </div>
+                </div>
+              );
+            })}
+          </div>
+
+          {/* 사회자 종합 (대화 끝, 옵션 ¬) */}
+          <div style={{
+            marginTop: 12, padding: "12px 16px",
+            background: "rgba(167,139,250,0.08)",
+            border: "1px solid rgba(167,139,250,0.3)",
+            borderLeft: "5px solid #a78bfa",
+            borderRadius: 8, fontSize: 11, color: "#e2e8f0", lineHeight: 1.6,
+          }}>
+            <div style={{ color: "#c4b5fd", fontWeight: 700, marginBottom: 8 }}>
+              📋 사회자 종합 ({modeInfo?.mode || "?"})
+            </div>
+
+            {moderator["근본원인_합의"] && (
+              <div style={{ margin: "5px 0" }}>
+                <b style={{ color: "#fca5a5", display: "inline-block", minWidth: 130 }}>🎯 근본원인 합의:</b>
+                {moderator["근본원인_합의"]}
+              </div>
+            )}
+            {moderator["조치안_평가_합의"] && (
+              <div style={{ margin: "5px 0" }}>
+                <b style={{ color: "#fdba74", display: "inline-block", minWidth: 130 }}>⚖️ 조치안 평가:</b>
+                {moderator["조치안_평가_합의"]}
+              </div>
+            )}
+            {moderator["개선안_합의"] && (
+              <div style={{ margin: "5px 0" }}>
+                <b style={{ color: "#93c5fd", display: "inline-block", minWidth: 130 }}>💡 개선안 합의:</b>
+                {moderator["개선안_합의"]}
+              </div>
+            )}
+            {moderator["재발방지책_합의"] && (
+              <div style={{ margin: "5px 0" }}>
+                <b style={{ color: "#86efac", display: "inline-block", minWidth: 130 }}>🛡️ 재발방지책:</b>
+                {moderator["재발방지책_합의"]}
+              </div>
+            )}
+            {moderator["충돌점"] && moderator["충돌점"] !== "없음" && (
+              <div style={{ margin: "5px 0" }}>
+                <b style={{ color: "#ef4444", display: "inline-block", minWidth: 130 }}>⚠️ 충돌점:</b>
+                {moderator["충돌점"]}
+              </div>
+            )}
+            {moderator["추가_논의_필요"] && moderator["추가_논의_필요"] !== "없음" && (
+              <div style={{ margin: "5px 0" }}>
+                <b style={{ color: "#fbbf24", display: "inline-block", minWidth: 130 }}>🔍 추가 논의:</b>
+                {moderator["추가_논의_필요"]}
+              </div>
+            )}
+
+            {/* STANDARD 모드 actions */}
+            {Array.isArray(moderator.actions) && moderator.actions.length > 0 && (
+              <div style={{ marginTop: 8 }}>
+                <b style={{ color: "#93c5fd" }}>📋 액션 플랜:</b>
+                <ul style={{ margin: "4px 0", paddingLeft: 20 }}>
+                  {moderator.actions.map((a, ai) => (
+                    <li key={ai} style={{ marginBottom: 2 }}>
+                      <b>[{a.priority}]</b> {a.action}
+                      <span style={{ color: "#94a3b8", fontSize: 10 }}> (담당:{a.owner}, {a.duration}{a.type ? `, ${a.type}` : ""})</span>
+                    </li>
+                  ))}
+                </ul>
+              </div>
+            )}
+
+            {/* LITE 모드 */}
+            {moderator.supplement && (
+              <div style={{ margin: "5px 0" }}>✅ 보완: {moderator.supplement}</div>
+            )}
+            {moderator.recurRisk && (
+              <div style={{ margin: "5px 0" }}>🔁 재발우려: {moderator.recurRisk}</div>
+            )}
+            {moderator.prevention && (
+              <div style={{ margin: "5px 0" }}>🛡️ 방지책: {moderator.prevention}</div>
+            )}
+
+            {/* 한 줄 요약 */}
+            {moderator.consensus && (
+              <div style={{
+                marginTop: 10, paddingTop: 8,
+                borderTop: "1px solid rgba(167,139,250,0.2)",
+                fontStyle: "italic", color: "#c4b5fd",
+              }}>
+                💬 {moderator.consensus.slice(0, 200)}
+              </div>
+            )}
+          </div>
+        </>
+      )}
+    </div>
+  );
+}
+
+// §7-A: 과거 조치이력 패널 — 화면 표시용 (dark theme, DiscussionCard 내 삽입)
+// 근본조치(재발없이 종결) / 임시조치(재발함) 구분이 핵심. 임시만 있으면 "미확립 답습 주의".
+function HistoryPanel({ history }) {
+  if (!history || !history.matched || !Array.isArray(history.results) || history.results.length === 0) return null;
+  return (
+    <div style={{
+      marginTop: 8, padding: "10px 12px",
+      background: "rgba(41,128,185,0.08)",
+      border: "1px solid rgba(41,128,185,0.35)",
+      borderLeft: "4px solid #2980b9",
+      borderRadius: 6, fontSize: 11, color: "#e2e8f0", lineHeight: 1.6,
+    }}>
+      <div style={{ color: "#93c5fd", fontWeight: 800, marginBottom: 6 }}>🔧 과거 동일이슈 조치이력</div>
+      {history.results.map((r, ri) => {
+        const root = Array.isArray(r.근본조치) ? r.근본조치 : [];
+        const temp = Array.isArray(r.임시조치) ? r.임시조치 : [];
+        return (
+          <div key={ri} style={{
+            marginBottom: 8, paddingBottom: 6,
+            borderBottom: ri < history.results.length - 1 ? "1px dashed rgba(148,163,184,0.25)" : "none",
+          }}>
+            <div style={{ fontSize: 10, color: "#cbd5e1", fontWeight: 700 }}>
+              {r.호기}{r.증상유형 ? ` · ${r.증상유형}` : ""} · 발생 {r.발생횟수}회 ({r.최초}~{r.최근})
+              {r.상습도 ? <span style={{ color: "#fca5a5" }}> · 상습도 {r.상습도}</span> : null}
+              {r._fallback ? <span style={{ color: "#c4b5fd", fontWeight: 700 }}> · 동일 라인 참고</span> : null}
+            </div>
+            {root.length > 0 && (
+              <div style={{ marginTop: 5 }}>
+                <div style={{ color: "#86efac", fontWeight: 700 }}>✅ 근본조치 (재발 없이 종결)</div>
+                {root.map((a, ai) => (
+                  <div key={ai} style={{ marginTop: 2, paddingLeft: 8 }}>
+                    ▸ <b>{a.조치}</b> — 적용 {a.적용일} · <span style={{ color: "#34d399", fontWeight: 700 }}>이후 {a.이후무재발일수}일 무재발</span>
+                    {a.부품 ? ` · 부품:${a.부품}` : ""}{a.신뢰 ? ` · 신뢰:${a.신뢰}` : ""}
+                  </div>
+                ))}
+              </div>
+            )}
+            {temp.length > 0 && (
+              <div style={{ marginTop: 5 }}>
+                <div style={{ color: "#fdba74", fontWeight: 700 }}>⚠️ 임시조치 (재발함 — 답습 주의)</div>
+                {temp.map((a, ai) => (
+                  <div key={ai} style={{ marginTop: 2, paddingLeft: 8 }}>
+                    ▸ <b>{a.조치}</b> — 적용 {a.적용일} · <span style={{ color: "#fb923c", fontWeight: 700 }}>{a.N일후재발}일 후 재발</span>
+                  </div>
+                ))}
+              </div>
+            )}
+            {root.length === 0 && temp.length > 0 && (
+              <div style={{
+                marginTop: 5, padding: "5px 8px",
+                background: "rgba(192,57,43,0.15)", border: "1px solid rgba(192,57,43,0.4)",
+                borderRadius: 4, color: "#fca5a5", fontWeight: 700,
+              }}>
+                🚫 아직 근본조치 미확립 — 임시조치 답습 주의
+              </div>
+            )}
+            {r.대표원인 ? <div style={{ marginTop: 4, color: "#94a3b8", fontSize: 10 }}>대표원인: {r.대표원인}</div> : null}
+            {r.경고 ? <div style={{ marginTop: 4, color: "#fca5a5", fontSize: 10 }}>⚠️ {r.경고}</div> : null}
+          </div>
+        );
+      })}
+    </div>
+  );
+}
+
+function DiscussionCard({ discussion }) {
+  const [expanded, setExpanded] = useState(false);  // 영역 12-C: 카드 전체 접힘 (기본 접힘)
+  const [showOpinions, setShowOpinions] = useState(false);
+  const [showDetailCard, setShowDetailCard] = useState(false);
+  const { issue, modeInfo, isPostAction, router, opinions, moderator } = discussion;
+  const mStyle = MODE_STYLE[modeInfo.mode];
+  const fallbackLevel = moderator?._fallback_level || "primary";
+  const detailCard = buildIssueDetailCard(discussion);
+
+  // 폴백 배지
+  const fbBadge = fallbackLevel === "primary" ? null
+    : fallbackLevel === "retry" ? { label: "🔁 재시도 성공", color: "#f59e0b", bg: "rgba(245,158,11,0.15)" }
+    : { label: "⚠️ 코드 폴백", color: "#ef4444", bg: "rgba(239,68,68,0.15)" };
+
+  // 사회자 종합 한 줄 미리보기 (헤더용)
+  const consensusPreview = (
+    moderator?.["근본원인_합의"] ||
+    moderator?.consensus ||
+    moderator?.summary ||
+    moderator?.supplement ||
+    "사회자 합의 미수립"
+  ).slice(0, 80);
+
+  return (
+    <div style={{
+      background:"rgba(15,23,42,0.7)",
+      border:`1px solid ${mStyle.border}`,
+      borderRadius:10, padding:"14px 16px", marginBottom:8,
+    }}>
+      {/* 헤더 — 영역 12-C: 클릭으로 카드 전체 토글 */}
+      <div onClick={() => setExpanded(!expanded)} style={{
+        display:"flex",justifyContent:"space-between",alignItems:"flex-start",
+        gap:8, flexWrap:"wrap", cursor:"pointer",
+        marginBottom: expanded ? 8 : 0,
+      }}>
+        <div style={{flex:1,minWidth:0}}>
+          <div style={{fontSize:11,fontWeight:800,color:mStyle.color,display:"flex",alignItems:"center",gap:6}}>
+            <span style={{fontSize:11,color:mStyle.color}}>{expanded ? "▼" : "▶"}</span>
+            [{issue.time}] {issue.eq}
+            {isPostAction && (
+              <span style={{
+                fontSize:9, padding:"1px 6px",
+                background:"rgba(52,211,153,0.15)", color:"#34d399",
+                borderRadius:8, fontWeight:700,
+              }}>✓ 기조치</span>
+            )}
+          </div>
+          <div style={{fontSize:10,color:"#94a3b8",marginTop:2}}>
+            {issue.durMin}분 · {issue.prob}
+          </div>
+          {/* 접힌 상태일 때 사회자 합의 미리보기 */}
+          {!expanded && (
+            <div style={{fontSize:10,color:"#cbd5e1",marginTop:4,fontStyle:"italic",paddingLeft:14}}>
+              {consensusPreview}
+            </div>
+          )}
+        </div>
+        <div style={{display:"flex",gap:4,alignItems:"center",flexShrink:0}}>
+          {fbBadge && (
+            <span style={{
+              fontSize:9, padding:"2px 6px",
+              background:fbBadge.bg, color:fbBadge.color,
+              borderRadius:8, fontWeight:700,
+            }}>{fbBadge.label}</span>
+          )}
+          <span style={{fontSize:9,color:mStyle.color}}>{modeInfo.source}</span>
+        </div>
+      </div>
+
+      {/* 본문 — expanded 시에만 표시 */}
+      {expanded && (
+      <>
+      {/* 분류 사유 */}
+      <div style={{
+        fontSize:10, color:"#cbd5e1", padding:"6px 10px",
+        background:"rgba(0,0,0,0.2)", borderRadius:5, marginBottom:8,
+      }}>
+        📌 {modeInfo.reason}
+        {router && <span style={{color:"#94a3b8"}}> | 발언순서: {router.order.map(o => PERSONAS[o]?.icon).join(" → ")}</span>}
+      </div>
+
+      {/* 사회자 종합 (메인) — 영역 12-C: 새 4축 필드 */}
+      <div style={{
+        padding:"10px 12px", background:mStyle.bg, borderRadius:6,
+        fontSize:11, color:"#e2e8f0", lineHeight:1.7,
+      }}>
+        {moderator.type === "deep" && (
+          <>
+            {/* 영역 12: 새 4축 합의 표시 (있으면 우선) */}
+            {moderator["근본원인_합의"] ? (
+              <>
+                <div><b style={{color:"#fca5a5"}}>🎯 근본원인:</b> {moderator["근본원인_합의"]}</div>
+                {moderator["조치안_평가_합의"] && (
+                  <div style={{marginTop:4}}><b style={{color:"#fdba74"}}>⚖️ 조치안 평가:</b> {moderator["조치안_평가_합의"]}</div>
+                )}
+                {moderator["개선안_합의"] && (
+                  <div style={{marginTop:4}}><b style={{color:"#93c5fd"}}>💡 개선안:</b> {moderator["개선안_합의"]}</div>
+                )}
+                {moderator["재발방지책_합의"] && (
+                  <div style={{marginTop:4}}><b style={{color:"#86efac"}}>🛡️ 재발방지책:</b> {moderator["재발방지책_합의"]}</div>
+                )}
+                {moderator["충돌점"] && moderator["충돌점"] !== "없음" && (
+                  <div style={{marginTop:4}}><b style={{color:"#ef4444"}}>⚠️ 충돌점:</b> {moderator["충돌점"]}</div>
+                )}
+                {moderator["추가_논의_필요"] && moderator["추가_논의_필요"] !== "없음" && (
+                  <div style={{marginTop:4}}><b style={{color:"#fbbf24"}}>🔍 추가 논의:</b> {moderator["추가_논의_필요"]}</div>
+                )}
+                {moderator.consensus && (
+                  <div style={{marginTop:6, fontStyle:"italic", color:"#94a3b8", fontSize:10}}>
+                    {moderator.consensus}
+                  </div>
+                )}
+              </>
+            ) : (
+              // 옛 필드 호환 (consensus/differences/conflicts/recommendation)
+              <>
+                <div><b style={{color:mStyle.color}}>【합의】</b> {moderator.consensus}</div>
+                {moderator.differences && <div style={{marginTop:4}}><b style={{color:mStyle.color}}>【차이】</b> {moderator.differences}</div>}
+                {moderator.conflicts && <div style={{marginTop:4}}><b style={{color:mStyle.color}}>【충돌】</b> {moderator.conflicts}</div>}
+                {moderator.recommendation && <div style={{marginTop:4}}><b style={{color:mStyle.color}}>【권고】</b> {moderator.recommendation}</div>}
+                {moderator.needsMore && moderator.needsMore !== "없음" && (
+                  <div style={{marginTop:4}}><b style={{color:mStyle.color}}>【추가논의】</b> {moderator.needsMore}</div>
+                )}
+              </>
+            )}
+          </>
+        )}
+        {moderator.type === "standard" && (
+          <>
+            {moderator["근본원인_합의"] && (
+              <div><b style={{color:"#fca5a5"}}>🎯 근본원인:</b> {moderator["근본원인_합의"]}</div>
+            )}
+            {moderator["조치안_평가_합의"] && (
+              <div style={{marginTop:4}}><b style={{color:"#fdba74"}}>⚖️ 조치안 평가:</b> {moderator["조치안_평가_합의"]}</div>
+            )}
+            {moderator.summary && (
+              <div style={{marginTop:moderator["근본원인_합의"] ? 6 : 0}}><b style={{color:mStyle.color}}>요약:</b> {moderator.summary}</div>
+            )}
+            {(moderator.actions || []).map((a, ai) => (
+              <div key={ai} style={{marginTop:4,paddingLeft:8}}>
+                ▸ <b style={{color:mStyle.color}}>[{a.priority}]</b> {a.action}
+                <span style={{color:"#94a3b8",fontSize:10}}> (담당:{a.owner}, {a.duration}{a.type ? `, ${a.type}` : ""})</span>
+              </div>
+            ))}
+          </>
+        )}
+        {moderator.type === "lite" && (
+          <>
+            <div>✅ 보완점: {moderator.supplement}</div>
+            <div style={{marginTop:4}}>🔁 재발우려: {moderator.recurRisk}</div>
+            <div style={{marginTop:4}}>🛡️ 재발방지: {moderator.prevention}</div>
+          </>
+        )}
+      </div>
+
+      {/* ★ §7-A: 과거 동일이슈 조치이력 패널 (근본/임시 구분) — 페르소나 논의 아래 별도 섹션 */}
+      <HistoryPanel history={discussion.__history} />
+
+      {/* ★ 상세 카드 펼치기 (모드별 차등) */}
+      <button onClick={()=>setShowDetailCard(!showDetailCard)} style={{
+        marginTop:8, marginRight:6, padding:"4px 10px", fontSize:10,
+        background:"rgba(167,139,250,0.1)", border:"1px solid rgba(167,139,250,0.4)",
+        borderRadius:4, color:"#a78bfa", cursor:"pointer", fontWeight:700,
+      }}>
+        {showDetailCard ? "▲ 상세 카드 접기" : `▼ 상세 카드 (${detailCard.mode === "DEEP" ? "8필드" : "3필드"})`}
+      </button>
+
+      {showDetailCard && (
+        <div style={{
+          marginTop:8, padding:"12px 14px",
+          background:"rgba(167,139,250,0.06)",
+          border:"1px solid rgba(167,139,250,0.2)",
+          borderRadius:6, fontSize:11, color:"#e2e8f0", lineHeight:1.7,
+        }}>
+          <div style={{fontSize:10,color:"#a78bfa",fontWeight:800,marginBottom:8}}>
+            📋 이슈 상세 분석 카드
+          </div>
+
+          <DetailRow label="현상" value={detailCard["현상"]} />
+          <DetailRow label="원인" value={detailCard["원인"]} />
+
+          {detailCard.mode === "DEEP" ? (
+            <>
+              <DetailRow label="즉시 조치" value={detailCard["즉시조치"]} />
+              <DetailRow
+                label="기존 조치 적절성"
+                value={detailCard["기존조치_적절성"]}
+                highlight={isPostAction}
+              />
+              <DetailRow label="재발 방지책" value={detailCard["재발방지책"]} />
+              <DetailRow label="보완책" value={detailCard["보완책"]} />
+
+              {/* 발언자별 의견 */}
+              <div style={{marginTop:8}}>
+                <div style={{fontSize:10,color:"#a78bfa",fontWeight:700,marginBottom:5}}>발언자별 의견</div>
+                {detailCard["발언자별의견"].map((v, vi) => (
+                  <div key={vi} style={{
+                    fontSize:10, padding:"5px 8px", marginBottom:3,
+                    background:"rgba(0,0,0,0.2)", borderRadius:4,
+                  }}>
+                    <span style={{color:PERSONAS[v.code]?.color,fontWeight:700}}>{v.icon} {v.label}</span>
+                    <span style={{color:"#94a3b8",fontSize:9,marginLeft:6}}>[{v.stance}]</span>
+                    <div style={{color:"#cbd5e1",marginTop:2}}>{v.summary}</div>
+                  </div>
+                ))}
+              </div>
+
+              <DetailRow label="합의/반대 지점" value={detailCard["합의반대지점"]} />
+            </>
+          ) : (
+            <DetailRow label="대책" value={detailCard["대책"]} />
+          )}
+        </div>
+      )}
+
+      {/* 페르소나 의견 펼치기 (대화체 + 새 6필드) */}
+      {opinions.length > 0 && (
+        <>
+          <button onClick={()=>setShowOpinions(!showOpinions)} style={{
+            marginTop:8, padding:"4px 10px", fontSize:10,
+            background:"transparent", border:"1px solid rgba(51,65,85,0.5)",
+            borderRadius:4, color:"#94a3b8", cursor:"pointer",
+          }}>
+            {showOpinions ? "▲ 페르소나 의견 접기" : `▼ 페르소나 의견 펼치기 (${opinions.length}명)`}
+          </button>
+          {showOpinions && (
+            <div style={{marginTop:8}}>
+              {opinions.map((o, i) => {
+                const p = PERSONAS[o.persona];
+                const op = o.opinion || {};
+                return (
+                  <div key={i} style={{
+                    background:p.bg, padding:"8px 10px", borderRadius:6, marginBottom:5,
+                  }}>
+                    <div style={{display:"flex",justifyContent:"space-between",alignItems:"center",marginBottom:4}}>
+                      <div style={{fontSize:10,color:p.color,fontWeight:800}}>
+                        {p.icon} {p.label} ({o.persona})
+                      </div>
+                      {op.stance && (
+                        <span style={{
+                          fontSize:9,padding:"1px 6px",
+                          background:"rgba(0,0,0,0.3)",color:"#cbd5e1",
+                          borderRadius:8,
+                        }}>{op.stance}</span>
+                      )}
+                    </div>
+                    {/* 이전 발언 인용 (대화체 표시) */}
+                    {op.previous_reference && op.previous_reference !== "" && (
+                      <div style={{
+                        fontSize:9,color:"#94a3b8",fontStyle:"italic",
+                        padding:"4px 8px",background:"rgba(0,0,0,0.25)",
+                        borderLeft:`2px solid ${p.color}`,marginBottom:5,borderRadius:3,
+                      }}>
+                        💬 {op.previous_reference}
+                      </div>
+                    )}
+                    {/* 6필드 출력 */}
+                    <div style={{fontSize:10,color:"#cbd5e1",lineHeight:1.6}}>
+                      📌 <b>현상:</b> {op["현상"] || "-"}<br/>
+                      🔍 <b>원인:</b> {op["원인"] || "-"}<br/>
+                      ⚡ <b>대책:</b> {op["대책"] || "-"}<br/>
+                      {op["기존조치_평가"] && op["기존조치_평가"] !== "해당없음" && op["기존조치_평가"] !== "-" && (
+                        <>🔁 <b>기조치 평가:</b> {op["기존조치_평가"]}</>
+                      )}
+                    </div>
+                  </div>
+                );
+              })}
+            </div>
+          )}
+        </>
+      )}
+      </>
+      )}
+
+    </div>
+  );
+}
+
+// 상세 카드 한 행
+function DetailRow({ label, value, highlight }) {
+  return (
+    <div style={{
+      marginBottom:6, paddingBottom:6,
+      borderBottom:"1px solid rgba(51,65,85,0.3)",
+    }}>
+      <span style={{
+        fontSize:9, fontWeight:800,
+        color: highlight ? "#34d399" : "#a78bfa",
+        marginRight:6,
+      }}>
+        {highlight && "★ "}{label}
+      </span>
+      <span style={{fontSize:10,color:"#cbd5e1"}}>{value || "-"}</span>
+    </div>
+  );
+}
+
+// ─── 큐 #22 Phase B-1: 로그인 화면 ────────────────────────────────────────────
+// Google Identity Services(GIS) 동적 로드 (index.html 수정 불필요).
+// 컴포넌트 마운트 시 자동으로 https://accounts.google.com/gsi/client 스크립트 추가.
+// OAuth Client ID는 plc-drive(-poc) 프로젝트 (학습앱과 공유):
+//   830951335500-mr71tivgr98at2ovvqcv16rdd8gvbi9n.apps.googleusercontent.com
+function LoginScreen({ authError }) {
+  const btnRef = useRef(null);
+  const [gisLoaded, setGisLoaded] = useState(false);
+  const [renderError, setRenderError] = useState("");
+
+  useEffect(() => {
+    const t0 = Date.now();
+    // ★ 큐 #22 핫픽스: 진단 정보 (실패 시 화면에 표시)
+    const diag = { scriptAdded: false, scriptLoaded: false, scriptError: false };
+
+    const tryRender = () => {
+      if (!window.google || !window.google.accounts || !window.google.accounts.id) {
+        return false;
+      }
+      try {
+        window.google.accounts.id.initialize({
+          client_id: "830951335500-mr71tivgr98at2ovvqcv16rdd8gvbi9n.apps.googleusercontent.com",
+          callback: (resp) => window.handleGoogleLogin && window.handleGoogleLogin(resp),
+          auto_select: false,
+          cancel_on_tap_outside: false,
+        });
+        if (btnRef.current) {
+          window.google.accounts.id.renderButton(btnRef.current, {
+            theme: "filled_black",
+            size: "large",
+            type: "standard",
+            text: "signin_with",
+            shape: "rectangular",
+            logo_alignment: "left",
+            width: 280,
+          });
+        }
+        setGisLoaded(true);
+        return true;
+      } catch (e) {
+        setRenderError("GIS 초기화 실패: " + (e?.message || "(unknown)"));
+        return false;
+      }
+    };
+
+    // 이미 로드돼 있으면 즉시 렌더
+    if (tryRender()) return;
+
+    // ★ 큐 #22 핫픽스: 스크립트 태그 + onload/onerror 이벤트 핸들러
+    let script = document.querySelector('script[src*="accounts.google.com/gsi/client"]');
+    if (!script) {
+      script = document.createElement("script");
+      script.src = "https://accounts.google.com/gsi/client";
+      script.async = true;
+      script.defer = true;
+      document.head.appendChild(script);
+    }
+    diag.scriptAdded = true;
+
+    const onLoadHandler = () => {
+      diag.scriptLoaded = true;
+      // onload 직후 google.accounts.id 준비 시간 100ms 여유 (드물게 race condition)
+      setTimeout(() => {
+        if (!tryRender()) {
+          const sec = Math.round((Date.now() - t0) / 1000);
+          setRenderError(
+            "GIS 스크립트는 로드됐지만 google.accounts.id 사용 불가 — " +
+            "브라우저 호환성 문제일 수 있습니다 (경과 " + sec + "초). " +
+            "Chrome 모바일 또는 PC 브라우저로 다시 시도해보세요."
+          );
+        }
+      }, 150);
+    };
+    const onErrorHandler = () => {
+      diag.scriptError = true;
+      const sec = Math.round((Date.now() - t0) / 1000);
+      setRenderError(
+        "GIS 스크립트 로드 실패 (경과 " + sec + "초) — " +
+        "광고 차단기, VPN, 또는 브라우저 보안 설정이 accounts.google.com을 차단했을 가능성. " +
+        "다른 브라우저(Chrome 등)로 시도해보세요."
+      );
+    };
+    script.addEventListener("load", onLoadHandler);
+    script.addEventListener("error", onErrorHandler);
+
+    // 폴링 (백업) — onload 이벤트가 발동 안 한 경우 대비
+    const interval = setInterval(() => {
+      if (tryRender()) clearInterval(interval);
+    }, 300);
+    // ★ 큐 #22 핫픽스: timeout 10초 → 30초 (모바일 느린 환경 대응)
+    const timeout = setTimeout(() => {
+      clearInterval(interval);
+      if (!window.google && !diag.scriptError) {
+        setRenderError(
+          "Google Identity Services 로드 시간 초과 (30초) — " +
+          "script태그=" + (diag.scriptAdded ? "✓" : "✗") + " " +
+          "로드=" + (diag.scriptLoaded ? "✓" : "✗") + " " +
+          "google객체=✗. 네트워크 또는 브라우저 차단 가능성."
+        );
+      }
+    }, 30000);
+
+    return () => {
+      clearInterval(interval);
+      clearTimeout(timeout);
+      if (script) {
+        script.removeEventListener("load", onLoadHandler);
+        script.removeEventListener("error", onErrorHandler);
+      }
+    };
+  }, []);
+
+  return (
+    <div style={{
+      minHeight:"100vh", display:"flex", alignItems:"center", justifyContent:"center",
+      background:"linear-gradient(150deg,#03060d,#060d1c 55%,#040810)",
+      fontFamily:"'Noto Sans KR','Malgun Gothic',sans-serif", color:"#e2e8f0",
+      padding:"20px",
+    }}>
+      <div style={{
+        maxWidth:420, width:"100%",
+        background:"rgba(15,23,42,0.6)", border:"1px solid rgba(34,211,238,0.18)",
+        borderRadius:12, padding:"32px 28px", textAlign:"center",
+      }}>
+        {/* 로고 */}
+        <div style={{
+          width:60, height:60, margin:"0 auto 18px", borderRadius:14,
+          background:"linear-gradient(135deg,#3b82f6,#22d3ee)",
+          display:"flex", alignItems:"center", justifyContent:"center", fontSize:30,
+        }}>🏭</div>
+
+        <div style={{fontSize:18, fontWeight:800, color:"#f1f5f9", marginBottom:6}}>
+          AZS 논의 시스템
+        </div>
+        <div style={{fontSize:11, color:"#22d3ee", letterSpacing:2, fontWeight:700, marginBottom:24}}>
+          Cell · Elec · FA · Vision
+        </div>
+
+        <div style={{fontSize:12, color:"#94a3b8", marginBottom:20, lineHeight:1.6}}>
+          접속하려면 Google 계정으로 로그인하세요.<br/>
+          <span style={{fontSize:10, color:"#64748b"}}>등록되지 않은 계정은 접근이 차단됩니다.</span>
+        </div>
+
+        {/* GIS 로그인 버튼이 여기에 렌더됨 */}
+        <div ref={btnRef} style={{display:"flex", justifyContent:"center", minHeight:50}}></div>
+
+        {!gisLoaded && !renderError && (
+          <div style={{fontSize:10, color:"#64748b", marginTop:14}}>
+            <Spinner/> Google 로그인 모듈 로드 중...
+          </div>
+        )}
+
+        {renderError && (
+          <div style={{
+            fontSize:10, color:"#fca5a5",
+            background:"rgba(239,68,68,0.08)", border:"1px solid rgba(239,68,68,0.3)",
+            borderRadius:6, padding:"8px 12px", marginTop:14,
+          }}>⚠️ {renderError}</div>
+        )}
+
+        {authError && (
+          <div style={{
+            fontSize:10, color:"#fbbf24",
+            background:"rgba(251,191,36,0.08)", border:"1px solid rgba(251,191,36,0.3)",
+            borderRadius:6, padding:"8px 12px", marginTop:14,
+          }}>{authError}</div>
+        )}
+
+        <div style={{fontSize:9, color:"#475569", marginTop:24, lineHeight:1.5}}>
+          HLI Green Power Indonesia · AZS Cell PE 도구<br/>
+          문의: 김지호 (potato2509@gmail.com)
+        </div>
+      </div>
+    </div>
+  );
+}
+
+// ─── 큐 #22 Phase B-1: 접근 거부 화면 (forbidden — 미등록 또는 apps 미허용) ──
+function ForbiddenScreen({ email, reason, onLogout }) {
+  const reasonText = {
+    "not_registered": "이 계정은 등록되지 않았습니다.",
+    "inactive": "이 계정은 비활성화 상태입니다.",
+    "discussion_not_allowed": "이 계정은 학습앱은 가능하지만 논의앱 접근 권한이 없습니다.",
+  }[reason] || reason || "접근 권한 없음";
+
+  return (
+    <div style={{
+      minHeight:"100vh", display:"flex", alignItems:"center", justifyContent:"center",
+      background:"linear-gradient(150deg,#03060d,#060d1c 55%,#040810)",
+      fontFamily:"'Noto Sans KR','Malgun Gothic',sans-serif", color:"#e2e8f0",
+      padding:"20px",
+    }}>
+      <div style={{
+        maxWidth:420, width:"100%",
+        background:"rgba(15,23,42,0.6)", border:"1px solid rgba(239,68,68,0.3)",
+        borderRadius:12, padding:"32px 28px", textAlign:"center",
+      }}>
+        <div style={{fontSize:38, marginBottom:16}}>🚫</div>
+        <div style={{fontSize:16, fontWeight:800, color:"#fca5a5", marginBottom:6}}>
+          접근 권한이 없습니다
+        </div>
+        <div style={{fontSize:11, color:"#94a3b8", marginBottom:18, fontFamily:"monospace"}}>
+          {email}
+        </div>
+        <div style={{
+          fontSize:12, color:"#cbd5e1", marginBottom:20, lineHeight:1.6,
+          background:"rgba(239,68,68,0.08)", border:"1px solid rgba(239,68,68,0.2)",
+          borderRadius:6, padding:"12px 16px",
+        }}>
+          {reasonText}
+        </div>
+        <div style={{fontSize:11, color:"#94a3b8", marginBottom:18, lineHeight:1.7}}>
+          이 시스템 사용을 원하시면 관리자에게 등록을 요청하세요.<br/>
+          <b style={{color:"#cbd5e1"}}>김지호 (potato2509@gmail.com)</b>
+        </div>
+        <button onClick={onLogout} style={{
+          padding:"8px 20px", fontSize:11,
+          background:"rgba(100,116,139,0.2)", border:"1px solid rgba(100,116,139,0.4)",
+          borderRadius:6, color:"#cbd5e1", cursor:"pointer", fontWeight:700,
+        }}>다른 계정으로 로그인</button>
+      </div>
+    </div>
+  );
+}
